@@ -85,6 +85,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `whoop_logout` clears it back to unresolved. This is a shape change,
   not a feature -- no database, no session store -- so that a second user
   (#29) becomes a change to one resolver rather than a rewrite of every tool.
+- `Config` gains `transport` (`stdio`/`streamable-http`), `http_host` and
+  `http_port`, configurable via `WHOOPMCP_TRANSPORT`/`WHOOPMCP_HTTP_HOST`/
+  `WHOOPMCP_HTTP_PORT` and overridable per invocation with `__main__.py`'s
+  new `--host`/`--port` flags. `/health` and `/ready` are now registered on
+  the streamable-http ASGI app (`server.py`'s `_register_health_routes`,
+  via the SDK's own `custom_route`): liveness always answers `200`, never
+  touching the lifespan, so a downstream problem can't take it down too;
+  readiness runs a small, extensible list of named checks (today: is the
+  configured token store readable) and reports `503` with per-check detail
+  when one fails -- verified to disagree with liveness in a real request
+  against the actual ASGI app, not just in theory. A new
+  `create_streamable_http_app()` factory lets an operator run more than one
+  worker via `uvicorn ... --factory --workers N` instead of the single-
+  process default. The same 16 tools are proven to answer identically over
+  both transports, including a real MCP JSON-RPC exchange against the
+  streamable-HTTP app, not just the existing in-process test path.
+
+  **Known limitation, not resolved in this change and reported on #27
+  rather than guessed at:** a token refresh is not yet safe across more
+  than one worker process. A cross-process lock was built and then removed
+  before merge -- `Authenticator.refresh()` releases its lock before the
+  network call completes (coordinating within one process via a private
+  future with no cross-process equivalent), so a lock alone cannot stop
+  two workers from each completing a refresh with the same about-to-rotate
+  token, which destroys the credential. Fixing this needs either a change
+  to `Authenticator` (which conflicts with this issue's own "don't change
+  Authenticator" requirement) or a compare-and-swap against a shared store
+  (needs #13, not yet merged). Run one worker for token refresh, or accept
+  that a concurrent refresh under multiple workers can force a re-login,
+  until this is resolved.
 - `analysis.Summary`/`summarize_period` now report `median` (a better centre
   than the mean for the skewed distributions recovery and sleep produce)
   and `days_missing` -- the requested period's length in days minus the

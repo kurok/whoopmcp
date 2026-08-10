@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 TokenBackend = Literal["file", "keyring"]
+Transport = Literal["stdio", "streamable-http"]
 
 #: Scopes requested during authorisation. ``offline`` is what makes WHOOP
 #: return a refresh token; without it the grant dies after one hour and the
@@ -59,6 +60,10 @@ class Config:
             WHOOP's documented default.
         rate_limit_per_day: Local budget for requests/day, mirroring WHOOP's
             documented default.
+        transport: "stdio" (default, what MCP clients launch) or
+            "streamable-http" (#27).
+        http_host: Bind host for the streamable-http transport.
+        http_port: Bind port for the streamable-http transport.
     """
 
     client_id: str
@@ -71,6 +76,9 @@ class Config:
     request_timeout: float = 30.0
     rate_limit_per_minute: int = 100
     rate_limit_per_day: int = 10_000
+    transport: Transport = "stdio"
+    http_host: str = "127.0.0.1"
+    http_port: int = 8000
 
     @property
     def token_path(self) -> Path:
@@ -119,6 +127,12 @@ class Config:
             tuple(src["WHOOPMCP_SCOPES"].split()) if src.get("WHOOPMCP_SCOPES") else DEFAULT_SCOPES
         )
 
+        transport = src.get("WHOOPMCP_TRANSPORT", "stdio")
+        if transport not in ("stdio", "streamable-http"):
+            raise ConfigError(
+                f"WHOOPMCP_TRANSPORT must be 'stdio' or 'streamable-http', got {transport!r}"
+            )
+
         state_dir = (
             Path(src["WHOOPMCP_STATE_DIR"]).expanduser()
             if src.get("WHOOPMCP_STATE_DIR")
@@ -136,6 +150,9 @@ class Config:
             request_timeout=float(src.get("WHOOPMCP_TIMEOUT", "30")),
             rate_limit_per_minute=int(src.get("WHOOPMCP_RATE_LIMIT_PER_MINUTE", "100")),
             rate_limit_per_day=int(src.get("WHOOPMCP_RATE_LIMIT_PER_DAY", "10000")),
+            transport=transport,  # type: ignore[arg-type]
+            http_host=src.get("WHOOPMCP_HTTP_HOST", "127.0.0.1"),
+            http_port=int(src.get("WHOOPMCP_HTTP_PORT", "8000")),
         )
 
 
