@@ -15,10 +15,26 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 #: Below this many paired observations a correlation is not worth reporting.
 MIN_CORRELATION_SAMPLES = 8
+
+#: Friendly metric name -> key within record["score"].
+_METRIC_PATHS: dict[str, str] = {
+    "recovery_score": "recovery_score",
+    "hrv": "hrv_rmssd_milli",
+    "resting_heart_rate": "resting_heart_rate",
+    "sleep_performance": "sleep_performance_percentage",
+    "sleep_efficiency": "sleep_efficiency_percentage",
+    "strain": "strain",
+}
+
+#: Metrics whose records are Cycle objects: a Cycle identifies itself via
+#: "id" and never carries a "cycle_id" (that field is a foreign key that
+#: Recovery/Sleep records use to point *at* the cycle they belong to).
+_CYCLE_SOURCED_METRICS = frozenset({"strain"})
 
 
 class InsufficientDataError(ValueError):
@@ -133,34 +149,92 @@ def linear_slope(xs: Sequence[float], ys: Sequence[float]) -> float:
 # changes -- keep the schema knowledge concentrated here.
 
 
-def extract_metric(records: Sequence[dict[str, Any]], metric: str) -> list[float]:
-    """Pull one named metric out of a list of records, skipping nulls.
+def _metric_key(metric: str) -> str:
+    """Resolve a friendly metric name to its key within record["score"]."""
+    try:
+        return _METRIC_PATHS[metric]
+    except KeyError:
+        raise ValueError(f"unknown metric: {metric!r}") from None
 
-    TODO(#3): map friendly names onto WHOOP's nested paths, e.g.
-    "recovery_score" -> record["score"]["recovery_score"], "hrv" ->
-    record["score"]["hrv_rmssd_milli"], "strain" -> record["score"]["strain"].
-    Records with score_state != "SCORED" carry no score and must be dropped
-    rather than read as zero.
+
+def _filtered_records(
+    records: Sequence[dict[str, Any]], metric: str
+) -> list[tuple[dict[str, Any], float]]:
+    """Pair each SCORED record carrying ``metric`` with its extracted value.
+
+    Shared by every function below so the SCORED-and-key-present filter is
+    defined in exactly one place.
     """
-    raise NotImplementedError("extract_metric is not implemented yet -- see issue #3")
+    key = _metric_key(metric)
+    pairs: list[tuple[dict[str, Any], float]] = []
+    for record in records:
+        if record.get("score_state") != "SCORED":
+            continue
+        score = record.get("score")
+        if not score or key not in score:
+            continue
+        pairs.append((record, float(score[key])))
+    return pairs
+
+
+def _join_key(record: dict[str, Any], metric: str) -> Any:
+    """The record's cycle_id if it has one, else its own id if it is a Cycle,
+    else its UTC calendar date.
+
+    A Recovery or Sleep record carries ``cycle_id`` as a foreign key to the
+    cycle it belongs to, so that always wins. A Cycle record (e.g. the
+    source of ``strain``) has no ``cycle_id`` of its own -- it identifies
+    itself via ``id`` -- so metrics sourced from Cycle records join on their
+    own ``id`` instead of falling through to calendar-day matching.
+    """
+    cycle_id = record.get("cycle_id")
+    if cycle_id is not None:
+        return cycle_id
+    if metric in _CYCLE_SOURCED_METRICS:
+        own_id = record.get("id")
+        if own_id is not None:
+            return own_id
+    timestamp = datetime.fromisoformat(record["created_at"])
+    return timestamp.astimezone(UTC).date().isoformat()
+
+
+def _grouped_values(records: Sequence[dict[str, Any]], metric: str) -> dict[Any, list[float]]:
+    """Filtered values for ``metric``, grouped by join key in encounter order."""
+    groups: dict[Any, list[float]] = {}
+    for record, value in _filtered_records(records, metric):
+        groups.setdefault(_join_key(record, metric), []).append(value)
+    return groups
+
+
+def extract_metric(records: Sequence[dict[str, Any]], metric: str) -> list[float]:
+    """Pull one named metric out of a list of records, skipping nulls."""
+    return [value for _, value in _filtered_records(records, metric)]
 
 
 def summarize(records: Sequence[dict[str, Any]], metric: str) -> Summary:
-    """Descriptive statistics for one metric across ``records``.
-
-    TODO(#3): extract_metric, then fold into a Summary.
-    """
-    raise NotImplementedError("summarize is not implemented yet -- see issue #3")
+    """Descriptive statistics for one metric across ``records``."""
+    values = extract_metric(records, metric)
+    return Summary(
+        metric=metric,
+        count=len(values),
+        mean=mean(values),
+        stdev=stdev(values),
+        minimum=min(values),
+        maximum=max(values),
+    )
 
 
 def trend(records: Sequence[dict[str, Any]], metric: str) -> Trend:
-    """Direction and rate of change for one metric over time.
-
-    TODO(#3): pair each value with its record timestamp expressed in days,
-    then linear_slope. Use the record's own timestamp, not its index --
-    WHOOP records are not evenly spaced once a strap is taken off.
-    """
-    raise NotImplementedError("trend is not implemented yet -- see issue #3")
+    """Direction and rate of change for one metric over time."""
+    pairs = [
+        (datetime.fromisoformat(record["created_at"]).timestamp() / 86_400.0, value)
+        for record, value in _filtered_records(records, metric)
+    ]
+    pairs.sort(key=lambda pair: pair[0])
+    xs = [day for day, _ in pairs]
+    ys = [value for _, value in pairs]
+    slope = linear_slope(xs, ys)
+    return Trend(metric=metric, count=len(ys), slope_per_day=slope, first=ys[0], last=ys[-1])
 
 
 def correlate(
@@ -169,9 +243,22 @@ def correlate(
     records_b: Sequence[dict[str, Any]],
     metric_b: str,
 ) -> Correlation:
-    """Correlate two metrics that may come from different collections.
+    """Correlate two metrics that may come from different collections."""
+    groups_a = _grouped_values(records_a, metric_a)
+    groups_b = _grouped_values(records_b, metric_b)
 
-    TODO(#3): join on cycle_id where both sides have one, otherwise on
-    calendar day, before correlating. Refuse below MIN_CORRELATION_SAMPLES.
-    """
-    raise NotImplementedError("correlate is not implemented yet -- see issue #3")
+    pairs: list[tuple[float, float]] = []
+    for key, values_a in groups_a.items():
+        values_b = groups_b.get(key)
+        if values_b is None:
+            continue
+        pairs.extend(zip(values_a, values_b, strict=False))
+
+    if len(pairs) < MIN_CORRELATION_SAMPLES:
+        raise InsufficientDataError(
+            f"correlate needs at least {MIN_CORRELATION_SAMPLES} matched pairs, got {len(pairs)}"
+        )
+
+    xs = [a for a, _ in pairs]
+    ys = [b for _, b in pairs]
+    return Correlation(metric_a=metric_a, metric_b=metric_b, count=len(pairs), r=pearson(xs, ys))
