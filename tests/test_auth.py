@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 import stat
 import time
 from pathlib import Path
@@ -123,6 +125,7 @@ def test_file_store_is_empty_before_first_save(tmp_path: Path) -> None:
     assert FileTokenStore(tmp_path / "token.json").load() is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
 def test_saved_token_is_not_readable_by_other_users(tmp_path: Path) -> None:
     path = tmp_path / "token.json"
     FileTokenStore(path).save(Token("a", expires_at=1234.0))
@@ -130,6 +133,25 @@ def test_saved_token_is_not_readable_by_other_users(tmp_path: Path) -> None:
     mode = stat.S_IMODE(path.stat().st_mode)
 
     assert mode & (stat.S_IRWXG | stat.S_IRWXO) == 0, f"token file is mode {mode:o}"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the gap being warned about is Windows-only")
+def test_windows_save_warns_that_permissions_are_not_enforced(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # `Path.touch(mode=0o600)` is a no-op on Windows -- the file lands at 0666.
+    # The mode cannot be fixed here, so the user has to be told, and pointed at
+    # the keyring backend that does protect it.
+    store = FileTokenStore(tmp_path / "token.json")
+
+    with caplog.at_level(logging.WARNING, logger="whoopmcp.auth"):
+        store.save(Token("a", expires_at=1234.0))
+        store.save(Token("b", expires_at=1234.0))
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    assert len(warnings) == 1, "the warning should fire once, not on every refresh"
+    assert "keyring" in warnings[0].getMessage()
 
 
 def test_file_store_reports_a_corrupt_token_file(tmp_path: Path) -> None:

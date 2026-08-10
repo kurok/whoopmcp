@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The file token store advertised mode `0600` on every platform, but Windows
+  does not enforce POSIX modes and the token was landing at `0666`. The
+  guarantee is now scoped to macOS and Linux in the docs, and on Windows the
+  store logs a one-time warning pointing at the keyring backend, which does
+  protect the token there.
+
 ## [0.1.0] - 2026-08-10
 
 Initial scaffold. The structure, tool surface, configuration and test harness

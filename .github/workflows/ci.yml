@@ -36,8 +36,10 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
         os: [ubuntu-latest]
-        # File permission assertions behave differently off Linux, so the
-        # other platforms are checked once rather than across every version.
+        # macOS and Windows are checked once rather than across every version.
+        # The token-permission tests are split by platform: POSIX modes are
+        # asserted off Windows, and the warning that replaces them is asserted
+        # on it.
         include:
           - python-version: "3.12"
             os: macos-latest

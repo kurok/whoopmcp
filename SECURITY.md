@@ -65,6 +65,10 @@ Deliberate choices, so you can tell a decision from an oversight:
   any check this code could perform on itself.
 - **Tokens at `0600`, written then renamed,** so a crash mid-write cannot
   truncate a good token and the secret is never briefly world-readable.
+  **This does not hold on Windows**, where POSIX modes are not enforced; the
+  token file lands at `0666` and the server warns about it on first write.
+  The keyring backend is the answer there, and the known gap is documented in
+  [PRIVACY.md](PRIVACY.md) rather than treated as a vulnerability report.
 - **`state` is compared with `secrets.compare_digest`** against a
   `token_urlsafe(32)` value generated per login.
 - **Logs go to stderr,** never stdout: on stdio transport stdout carries the

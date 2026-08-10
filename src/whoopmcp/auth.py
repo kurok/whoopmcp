@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 import time
 from dataclasses import dataclass
@@ -107,10 +108,20 @@ class FileTokenStore:
     The directory is created 0700. This is the default because it works with
     no extra dependencies, but it does mean a plaintext refresh token on disk
     -- see PRIVACY.md, and prefer ``KeyringTokenStore`` where available.
+
+    **On Windows this offers no protection.** Windows uses ACLs, not POSIX
+    modes, and ``Path.touch(mode=...)`` is effectively ignored there -- the
+    file lands at 0666. Use ``WHOOPMCP_TOKEN_BACKEND=keyring`` on Windows;
+    ``save`` warns once if you do not.
     """
+
+    #: POSIX modes are advisory at best on Windows, so the 0600 promise below
+    #: holds only off it.
+    _MODES_ENFORCED = os.name != "nt"
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._warned = False
 
     def load(self) -> Token | None:
         try:
@@ -123,6 +134,15 @@ class FileTokenStore:
             raise AuthError(f"token file at {self._path} is unreadable: {exc}") from exc
 
     def save(self, token: Token) -> None:
+        if not self._MODES_ENFORCED and not self._warned:
+            self._warned = True
+            logger.warning(
+                "%s cannot be protected by file permissions on Windows; the refresh token "
+                "is readable by any process running as you. Set WHOOPMCP_TOKEN_BACKEND=keyring "
+                "(pip install 'whoopmcp[keyring]') to store it in the Windows Credential Manager.",
+                self._path,
+            )
+
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Write-then-rename so a crash mid-write cannot truncate a good token,
         # and create the temp file 0600 so the secret is never world-readable

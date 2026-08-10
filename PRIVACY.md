@@ -58,8 +58,14 @@ URLs are the only ones in the source, in `auth.py` and `client.py`.
 
 | Item | Location | Protection |
 | --- | --- | --- |
-| Access + refresh token | `$WHOOPMCP_STATE_DIR/token.json`, default `~/.local/state/whoopmcp/` | File mode `0600`, directory `0700` |
+| Access + refresh token | `$WHOOPMCP_STATE_DIR/token.json`, default `~/.local/state/whoopmcp/` | File mode `0600`, directory `0700` — **macOS and Linux only** |
 | Access + refresh token (alternative) | OS keychain | Whatever your OS provides |
+
+> **Windows:** file modes are not enforced — Windows uses ACLs, and the token
+> file ends up readable by any process running as you. The server logs a
+> warning when it first writes one. Use the keychain backend instead:
+> `pip install 'whoopmcp[keyring]'` and `WHOOPMCP_TOKEN_BACKEND=keyring`,
+> which stores the token in the Windows Credential Manager.
 | Cached responses | `$WHOOPMCP_STATE_DIR/cache.sqlite3` | **Off by default**; only written if you set `WHOOPMCP_CACHE=true` |
 | Logs | stderr only | Never written to a file by this software |
 

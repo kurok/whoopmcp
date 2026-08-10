@@ -117,6 +117,11 @@ pip install 'whoopmcp[keyring]'
 export WHOOPMCP_TOKEN_BACKEND=keyring
 ```
 
+**Recommended on Windows**, where the default file backend cannot protect the
+token: Windows uses ACLs rather than POSIX modes, so the `0600` the file
+backend requests is ignored and the token lands world-readable. The server
+warns when it first writes one.
+
 ---
 
 ## Privacy
@@ -132,7 +137,8 @@ points:
   OpenAI, a local model — under *that provider's* terms, not this project's.
   This is inherent to how MCP works, and it is health data. Know where it is
   going.
-- Tokens are stored locally, mode `0600`, or in your OS keychain.
+- Tokens are stored locally at mode `0600`, or in your OS keychain. **On
+  Windows file modes are not enforced** — use the keychain backend there.
 - Delete everything with `whoop_logout`, then remove `WHOOPMCP_STATE_DIR`,
   then revoke the app in the WHOOP app under Settings.
 
