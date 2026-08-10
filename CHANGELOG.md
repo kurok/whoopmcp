@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Support narrowed to the two newest stable Python releases, 3.13 and
+  3.14.** `requires-python` was `>=3.10` while CI is the thing that decides
+  what actually works, so the floor now matches the matrix instead of
+  advertising four versions and vouching for them by inference. Python has no
+  LTS track; these two are supported upstream until 2029 and 2030. Users on
+  3.10–3.12 should stay on a release made before this change.
+
 ### Fixed
 
 - The file token store advertised mode `0600` on every platform, but Windows

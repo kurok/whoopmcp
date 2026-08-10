@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Read-only MCP server for the WHOOP API v2 — query and analyse your own recovery, sleep, strain and workout data from any MCP client"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+# The two newest stable Python releases, which is what CI tests. Python has
+# no LTS track; 3.13 and 3.14 are supported upstream until 2029 and 2030.
+requires-python = ">=3.13"
 authors = [
     { name = "whoopmcp contributors" },
 ]
@@ -19,10 +21,8 @@ classifiers = [
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Information Analysis",
     "Typing :: Typed",
 ]
@@ -70,7 +70,7 @@ filterwarnings = ["error"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py313"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
@@ -82,7 +82,7 @@ ignore = ["S105", "S106"]
 "tests/*" = ["S101"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.13"
 packages = ["whoopmcp"]
 warn_unused_configs = true
 disallow_untyped_defs = true

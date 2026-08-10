@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/kurok/whoopmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/kurok/whoopmcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13%20%7C%203.14-blue.svg)](https://www.python.org/downloads/)
 
 A read-only [MCP](https://modelcontextprotocol.io) server for the
 [WHOOP API v2](https://developer.whoop.com/api/). It lets an MCP client —
@@ -52,6 +52,9 @@ own data is not a causal finding. Talk to a clinician about health decisions.
 ---
 
 ## Install
+
+Requires **Python 3.13 or 3.14** — the two newest stable releases, which are
+the two CI tests.
 
 ```bash
 uvx whoopmcp          # run without installing

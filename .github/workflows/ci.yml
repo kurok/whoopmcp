@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv pip install --system -e '.[dev,lint]'
       - run: ruff check --output-format=github .
@@ -34,16 +34,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # The two newest stable Python releases, matching requires-python.
+        # Python has no LTS track; 3.13 and 3.14 are supported upstream until
+        # 2029 and 2030 respectively.
+        python-version: ["3.13", "3.14"]
         os: [ubuntu-latest]
-        # macOS and Windows are checked once rather than across every version.
-        # The token-permission tests are split by platform: POSIX modes are
-        # asserted off Windows, and the warning that replaces them is asserted
-        # on it.
+        # macOS and Windows are checked on the newest version only rather than
+        # across the matrix. The token-permission tests are split by platform:
+        # POSIX modes are asserted off Windows, and the warning that stands in
+        # for them is asserted on it.
         include:
-          - python-version: "3.12"
+          - python-version: "3.14"
             os: macos-latest
-          - python-version: "3.12"
+          - python-version: "3.14"
             os: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -61,7 +64,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - run: pipx run build
       - run: pipx run twine check dist/*
       - uses: actions/upload-artifact@v6
@@ -76,5 +79,5 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - run: pipx run pip-audit .

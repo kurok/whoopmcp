@@ -7,10 +7,14 @@ Security issues go through [SECURITY.md](SECURITY.md), not a public issue.
 
 ## Setup
 
+Python 3.13 or 3.14. The project tracks the two newest stable releases rather
+than a long tail of old ones, so `requires-python`, the CI matrix, the ruff
+target and the mypy target all move together — change one, change all four.
+
 ```bash
 git clone https://github.com/kurok/whoopmcp
 cd whoopmcp
-uv venv && uv pip install -e '.[dev,lint]'
+uv venv --python 3.14 && uv pip install -e '.[dev,lint]'
 pre-commit install     # optional, runs the checks below on commit
 ```
 

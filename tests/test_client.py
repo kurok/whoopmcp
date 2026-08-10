@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -13,8 +13,8 @@ def test_no_parameters_yields_an_empty_query() -> None:
 
 def test_datetimes_are_serialised_as_iso8601() -> None:
     params = build_collection_params(
-        start=datetime(2026, 7, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        start=datetime(2026, 7, 1, tzinfo=UTC),
+        end=datetime(2026, 8, 1, tzinfo=UTC),
     )
 
     assert params == {"start": "2026-07-01T00:00:00+00:00", "end": "2026-08-01T00:00:00+00:00"}
