@@ -1,0 +1,81 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste WHOOP data, tokens, client IDs or client secrets.**
+        Issues are public. Redact response bodies before pasting them.
+
+        For a security vulnerability, use
+        [private reporting](https://github.com/kurok/whoopmcp/security/advisories/new)
+        instead of this form.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I checked the [roadmap](https://github.com/kurok/whoopmcp#roadmap) — a `NotImplementedError` in 0.1.x is expected, not a bug.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure with ...
+        2. Ask the client to ...
+        3. See error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output
+      description: Server stderr. Redact tokens and personal data.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: whoopmcp version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: "Claude Desktop 1.2.3 / Claude Code / Cursor"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [macOS, Linux, Windows, Other]
+    validations:
+      required: true

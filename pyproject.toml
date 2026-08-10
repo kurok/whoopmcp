@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whoopmcp"
+version = "0.1.0"
+description = "Read-only MCP server for the WHOOP API v2 — query and analyse your own recovery, sleep, strain and workout data from any MCP client"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "whoopmcp contributors" },
+]
+keywords = ["whoop", "mcp", "model-context-protocol", "health", "fitness", "hrv", "sleep", "quantified-self"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+dependencies = [
+    "mcp>=2.0,<3",
+    "httpx>=0.28,<1",
+    "pydantic>=2.9,<3",
+]
+
+[project.optional-dependencies]
+# Store the refresh token in the OS keychain instead of a file on disk.
+keyring = ["keyring>=25.0"]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "respx>=0.22",
+]
+lint = ["ruff>=0.16", "mypy>=1.13"]
+security = ["bandit>=1.7", "pip-audit>=2.7"]
+
+[project.scripts]
+whoopmcp = "whoopmcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/kurok/whoopmcp"
+Repository = "https://github.com/kurok/whoopmcp"
+Issues = "https://github.com/kurok/whoopmcp/issues"
+Changelog = "https://github.com/kurok/whoopmcp/blob/main/CHANGELOG.md"
+"Privacy Policy" = "https://github.com/kurok/whoopmcp/blob/main/PRIVACY.md"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"whoopmcp" = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF", "S"]
+# S101 (assert) is the point of a test file; the rest are noise in a scaffold.
+ignore = ["S105", "S106"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["whoopmcp"]
+warn_unused_configs = true
+disallow_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+# Only installed with the `keyring` extra; the import is guarded at runtime.
+module = ["keyring"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["src/whoopmcp"]
+branch = true

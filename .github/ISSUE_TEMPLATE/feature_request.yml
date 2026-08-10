@@ -1,0 +1,42 @@
+name: Feature request
+description: Suggest a tool, a metric, or a change in behaviour
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This server is **read-only** by design. Proposals that write to a
+        WHOOP account will be declined — see the design notes in
+        [SECURITY.md](https://github.com/kurok/whoopmcp/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The question you want to ask your data, or the workflow that is awkward today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: If it is a new tool, sketch its name, arguments and return shape.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including whether an existing tool nearly does it.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This is read-only — it does not modify anything in a WHOOP account.
+          required: true
+        - label: The data it needs is available from the [WHOOP v2 API](https://developer.whoop.com/api/).
+          required: true
