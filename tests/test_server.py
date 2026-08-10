@@ -7,6 +7,7 @@ a tool a client may stop asking permission for.
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -18,8 +19,9 @@ import pytest
 import respx
 from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
-from whoopmcp.auth import Authenticator, FileTokenStore, Token
+from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.server import AppContext, build_server
@@ -303,6 +305,213 @@ async def test_server_carries_usage_instructions() -> None:
 
     assert "cycle" in instructions.lower()
     assert "not clinical" in instructions.lower()
+
+
+# -- auth tool tests (issue #4) -----------------------------------------------
+
+
+async def test_whoop_auth_status_never_logged_in(
+    server: object, config: Config, app_context: AppContext
+) -> None:
+    """Test whoop_auth_status when no token has ever been saved."""
+    # The autouse _seed_valid_token fixture (added for the data tools' tests,
+    # which need a working token to make an authenticated call) seeds one
+    # before every test in this file -- clear it to genuinely test "never
+    # logged in" rather than "logged in, then somehow logged out again".
+    FileTokenStore(config.token_path).clear()
+
+    status_dict = await call_tool(server, "whoop_auth_status", {}, app_context)
+
+    # Must clearly distinguish this state from "token expired" or "token valid".
+    assert status_dict == {"logged_in": False}, status_dict
+
+
+async def test_whoop_auth_status_token_expired(
+    server: object, config: Config, app_context: AppContext
+) -> None:
+    """Test whoop_auth_status when a token has expired but a refresh_token exists."""
+    # Pre-save an expired token with a refresh token
+    expired_token = Token(
+        "fake-expired-access",
+        expires_at=time.time() - 1000,  # well in the past
+        refresh_token="fake-refresh",
+        scopes=("read:sleep", "offline"),
+    )
+    FileTokenStore(config.token_path).save(expired_token)
+
+    status_dict = await call_tool(server, "whoop_auth_status", {}, app_context)
+
+    # Must distinguish "expired" from both "never logged in" and "valid" --
+    # logged_in True (there IS a token) but expired True (it can't be used
+    # as-is), with the granted scopes still visible.
+    assert status_dict["logged_in"] is True, status_dict
+    assert status_dict["expired"] is True, status_dict
+    assert set(status_dict["scopes"]) == {"read:sleep", "offline"}
+    # And never the never-logged-in shape.
+    assert status_dict != {"logged_in": False}
+
+
+async def test_whoop_auth_status_valid_token_with_scopes(
+    server: object, config: Config, app_context: AppContext
+) -> None:
+    """Test whoop_auth_status with a valid, non-expired token and scopes."""
+    # Pre-save a non-expired token with specific scopes
+    valid_token = Token(
+        "fake-access-token",
+        expires_at=time.time() + 3600,  # expires in 1 hour
+        refresh_token="fake-refresh-token",
+        scopes=("read:sleep", "offline"),
+    )
+    FileTokenStore(config.token_path).save(valid_token)
+
+    status_dict = await call_tool(server, "whoop_auth_status", {}, app_context)
+
+    assert status_dict["logged_in"] is True
+    assert status_dict["expired"] is False
+    assert set(status_dict["scopes"]) == {"read:sleep", "offline"}
+    # The literal token values must never appear anywhere in the response.
+    result_str = str(status_dict)
+    assert "fake-access-token" not in result_str, "Result must not expose the access token"
+    assert "fake-refresh-token" not in result_str, "Result must not expose the refresh token"
+
+
+async def test_whoop_login(server: object, app_context: AppContext) -> None:
+    """Test whoop_login returns a URL with the expected structure."""
+    result = await call_tool(server, "whoop_login", {}, app_context)
+    # whoop_login returns a str; a scalar return's structured_content is
+    # {"result": <the string>} (this SDK's auto-structured-output convention).
+    url_text = str(result["result"])
+
+    # Result should contain the authorize URL, hosted at the real WHOOP host --
+    # parse it out and check the actual hostname rather than a raw substring
+    # search over the whole message (CodeQL flags that as incomplete URL
+    # sanitization: "https://evil.example/api.prod.whoop.com" would also
+    # contain the substring without actually being the WHOOP host).
+    # Anchored to the real host, not a bare "https://\S+" -- this message's
+    # prose itself mentions "https://" in a parenthetical earlier on
+    # ("...other than https://)..."), which a loose pattern would match first.
+    url_match = re.search(r"https://api\.prod\.whoop\.com\S+", url_text)
+    assert url_match, f"Expected an authorization URL in the response, got: {url_text}"
+    assert urlparse(url_match.group(0)).hostname == "api.prod.whoop.com", (
+        f"Expected the authorization URL's host to be api.prod.whoop.com, got: {url_text}"
+    )
+    # Result should mention the custom-scheme redirect (whoopmcp://)
+    # and indicate that an error page is expected
+    assert "error" in url_text.lower() or "browser" in url_text.lower(), (
+        f"Expected result to mention browser/error page for custom-scheme redirect, got: {url_text}"
+    )
+
+
+async def test_whoop_complete_login_happy_path(
+    server: object, config: Config, app_context: AppContext
+) -> None:
+    """Test whoop_complete_login succeeds with valid code and state."""
+    # Step 1: Call whoop_login to set up the pending state
+    login_result = await call_tool(server, "whoop_login", {}, app_context)
+    login_text = str(login_result["result"])
+
+    # Pull the URL out of the surrounding instructional prose -- whoop_login's
+    # response is a message, not a bare URL, so extract the substring rather
+    # than urlparse-ing the whole text (which only works by accident if the
+    # URL happens to be the last thing in the string).
+    url_match = re.search(r"https://api\.prod\.whoop\.com\S+", login_text)
+    assert url_match, f"Expected an authorize URL in the response, got: {login_text}"
+    query = parse_qs(urlparse(url_match.group(0)).query)
+    assert "state" in query, f"Expected 'state' in URL, got: {login_text}"
+    state = query["state"][0]
+
+    # Step 2: Mock TOKEN_URL to return a successful token response
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(
+            return_value=respx.MockResponse(
+                200,
+                json={
+                    "access_token": "fake-access-token",
+                    "expires_in": 3600,
+                    "refresh_token": "fake-refresh-token",
+                    "scope": "read:sleep offline",
+                },
+            )
+        )
+
+        # Step 3: Call whoop_complete_login with the code and state
+        complete_result = await call_tool(
+            server,
+            "whoop_complete_login",
+            {"code": "fake-auth-code", "state": state},
+            app_context,
+        )
+
+    result_str = str(complete_result["result"])
+
+    # Result should NOT contain the literal token values
+    assert "fake-access-token" not in result_str, "Result must not expose the access token"
+    assert "fake-refresh-token" not in result_str, "Result must not expose the refresh token"
+
+    # Result should report the granted scopes
+    assert "read:sleep" in result_str.lower() or "scopes" in result_str.lower(), (
+        f"Expected result to mention granted scopes, got: {result_str}"
+    )
+
+
+async def test_whoop_complete_login_state_mismatch(
+    server: object, config: Config, app_context: AppContext
+) -> None:
+    """Test whoop_complete_login fails when state doesn't match.
+
+    MCPServer.call_tool() (Tool.run(), specifically) catches any exception
+    raised by a tool body and re-raises it wrapped as ToolError -- it does
+    NOT surface as a CallToolResult with is_error=True. That conversion
+    happens one layer up, in the protocol-level request handler, which this
+    test harness bypasses entirely. So the mismatch (Authenticator.verify_state
+    raising AuthError) must be asserted as a raised ToolError here.
+    """
+    # Step 1: Call whoop_login to set up a pending state
+    await call_tool(server, "whoop_login", {}, app_context)
+
+    # Step 2: Call whoop_complete_login with a WRONG state
+    # This should fail because the state won't match the one set by start_login
+    with pytest.raises(ToolError, match="state mismatch"):
+        await call_tool(
+            server,
+            "whoop_complete_login",
+            {"code": "fake-auth-code", "state": "attacker-supplied-wrong-state"},
+            app_context,
+        )
+
+
+async def test_whoop_logout(server: object, config: Config, app_context: AppContext) -> None:
+    """Test whoop_logout clears the token and reports success."""
+    # Step 1: Pre-save a token
+    token = Token(
+        "fake-access-token",
+        expires_at=time.time() + 3600,
+        refresh_token="fake-refresh-token",
+        scopes=("read:sleep", "offline"),
+    )
+    FileTokenStore(config.token_path).save(token)
+
+    # Verify the token is there
+    assert FileTokenStore(config.token_path).load() is not None
+
+    # Step 2: Call whoop_logout
+    result = await call_tool(server, "whoop_logout", {}, app_context)
+
+    # Step 3: Verify the token is now gone
+    assert FileTokenStore(config.token_path).load() is None, "Token should be cleared after logout"
+
+    # Step 4: Check response mentions "whoop" and grant NOT being revoked
+    logout_text = str(result["result"])
+    assert "whoop" in logout_text.lower(), (
+        f"Expected response to mention 'whoop', got: {logout_text}"
+    )
+    # Response should indicate grant is NOT revoked on WHOOP's servers.
+    # Common patterns: "revoke", "still", "server", etc.
+    assert (
+        "revoke" in logout_text.lower()
+        or "still" in logout_text.lower()
+        or "server" in logout_text.lower()
+    ), f"Expected response to indicate grant is NOT revoked server-side, got: {logout_text}"
 
 
 # -- data tool tests -------------------------------------------------------

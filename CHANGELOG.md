@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both `start` and `end` are omitted (skipped on a continuation call, so a
   `next_token` isn't paired with a freshly-generated date window). A
   `RateLimitedError` now returns a retry hint instead of a raw traceback.
+- The four auth tools (`whoop_auth_status`, `whoop_login`, `whoop_complete_login`,
+  `whoop_logout`) are now wired to `Authenticator`. `whoop_auth_status` reads the
+  token store directly rather than through `access_token()`, so checking status
+  never triggers a side-effect refresh; `whoop_complete_login` verifies `state`
+  before exchanging the code and reports the scopes WHOOP actually granted. No
+  tool returns an access or refresh token value in any field.
 
 ### Changed
 

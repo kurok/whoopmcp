@@ -23,7 +23,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
 from whoopmcp.analysis import InsufficientDataError, correlate, summarize, trend
-from whoopmcp.auth import Authenticator
+from whoopmcp.auth import Authenticator, build_store
 from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_params
 from whoopmcp.config import Config
 
@@ -92,32 +92,48 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
         title="Check WHOOP authentication",
         annotations=READ_ONLY,
     )
-    async def whoop_auth_status() -> dict[str, Any]:
+    async def whoop_auth_status(ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Report whether a valid WHOOP token is held, its scopes and its expiry.
 
         Call this first when a data tool fails; it distinguishes "never logged
         in" from "token expired" from "scope not granted".
-
-        TODO(#4): read the token store and return status, scopes, expires_at.
         """
-        raise NotImplementedError("whoop_auth_status is not implemented yet -- see issue #4")
+        app = ctx.request_context.lifespan_context
+        token = build_store(app.config).load()
+        if token is None:
+            return {"logged_in": False}
+        return {
+            "logged_in": True,
+            "expired": token.expired,
+            "scopes": list(token.scopes),
+            "expires_at": datetime.fromtimestamp(token.expires_at, tz=UTC).isoformat(),
+        }
 
     @server.tool(
         name="whoop_login",
         title="Start WHOOP login",
         annotations=READ_ONLY,
     )
-    async def whoop_login() -> str:
+    async def whoop_login(ctx: Context[AppContext, Any]) -> str:
         """Return a URL the user must open in a browser to authorise this server.
 
         The user completes the WHOOP consent screen, is redirected to the
         configured redirect URI, and then passes the ``code`` and ``state``
         query parameters back via whoop_complete_login.
-
-        TODO(#4): delegate to Authenticator.start_login and return the URL
-        with a short instruction for the user.
         """
-        raise NotImplementedError("whoop_login is not implemented yet -- see issue #4")
+        app = ctx.request_context.lifespan_context
+        url = app.auth.start_login()
+        return (
+            "Open this URL in a browser to authorise whoopmcp with WHOOP. "
+            "After you approve access, WHOOP redirects you to this server's "
+            "configured redirect URI. If that redirect URI uses a custom scheme "
+            "(anything other than https://), the browser will show what looks "
+            "like an error page once it gets there -- that is expected, not a "
+            "bug, because nothing on your machine is listening on that scheme. "
+            "Copy the `code` and `state` query parameters from that page's "
+            "address bar and pass them to whoop_complete_login.\n\n"
+            f"{url}"
+        )
 
     @server.tool(
         name="whoop_complete_login",
@@ -126,17 +142,19 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
             read_only_hint=False, destructive_hint=False, open_world_hint=True
         ),
     )
-    async def whoop_complete_login(code: str, state: str) -> str:
+    async def whoop_complete_login(code: str, state: str, ctx: Context[AppContext, Any]) -> str:
         """Finish a login using the code and state from the redirect URL.
 
         Args:
             code: The ``code`` query parameter from the redirect.
             state: The ``state`` query parameter from the redirect. It is
                 verified against the pending login before the code is used.
-
-        TODO(#4): verify_state, then exchange_code, then confirm granted scopes.
         """
-        raise NotImplementedError("whoop_complete_login is not implemented yet -- see issue #4")
+        app = ctx.request_context.lifespan_context
+        app.auth.verify_state(state)
+        token = await app.auth.exchange_code(code)
+        granted = ", ".join(token.scopes) if token.scopes else "(none)"
+        return f"Login complete. Granted scopes: {granted}"
 
     @server.tool(
         name="whoop_logout",
@@ -145,15 +163,19 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
             read_only_hint=False, destructive_hint=True, open_world_hint=False
         ),
     )
-    async def whoop_logout() -> str:
+    async def whoop_logout(ctx: Context[AppContext, Any]) -> str:
         """Delete the locally stored WHOOP token.
 
         This does not revoke the grant at WHOOP; do that from the WHOOP app
         under Settings if you want the authorisation itself withdrawn.
-
-        TODO(#4): call Authenticator.logout and say what was removed.
         """
-        raise NotImplementedError("whoop_logout is not implemented yet -- see issue #4")
+        app = ctx.request_context.lifespan_context
+        app.auth.logout()
+        return (
+            "Local WHOOP credentials removed. This does not revoke the "
+            "authorization at WHOOP -- do that from the WHOOP app under "
+            "Settings if you want the grant itself withdrawn."
+        )
 
 
 # -- raw data --------------------------------------------------------------
