@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from whoopmcp.auth import Authenticator
+from whoopmcp.auth import Authenticator, AuthError, build_store
 from whoopmcp.config import Config
 
 BASE_URL = "https://api.prod.whoop.com/developer"
@@ -94,6 +94,24 @@ def _iso(value: datetime | str) -> str:
     return value.isoformat() if isinstance(value, datetime) else value
 
 
+def _error_message(response: httpx.Response) -> str:
+    """Build a human-readable error message from a failed response body.
+
+    Only WHOOP's own ``error``/``message`` JSON fields are echoed back --
+    never the request or response headers/body verbatim, since that is where
+    a bearer token would end up in a bug report.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return f"HTTP {response.status_code}"
+    if isinstance(payload, dict):
+        detail = payload.get("error") or payload.get("message")
+        if detail:
+            return str(detail)
+    return f"HTTP {response.status_code}"
+
+
 class WhoopClient:
     """Async WHOOP v2 client. One instance per server process.
 
@@ -122,34 +140,83 @@ class WhoopClient:
 
     # -- transport ---------------------------------------------------------
 
-    async def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
-        """GET a path, with a bearer token attached and errors normalised.
+    async def _request(
+        self, path: str, params: dict[str, str] | None, token: str
+    ) -> httpx.Response:
+        """Issue one GET with the given bearer token attached."""
+        if self._http is None:
+            raise RuntimeError("WhoopClient must be used as an async context manager")
+        return await self._http.get(
+            path, params=params, headers={"Authorization": f"Bearer {token}"}
+        )
 
-        TODO(#2): attach `Authorization: Bearer {await self._auth.access_token()}`,
-        raise RateLimitedError on 429 honouring X-RateLimit-Reset, retry once
-        on 401 after a forced refresh, and map every other 4xx/5xx onto
-        WhoopAPIError.
+    async def _force_refresh(self) -> str:
+        """Refresh regardless of the cached token's apparent expiry.
+
+        access_token() only refreshes when its own clock says expired; a 401
+        means WHOOP revoked the grant, which the clock can't know. Loading the
+        persisted token and calling Authenticator.refresh() on it directly
+        forces a real network refresh -- and refresh() already updates
+        Authenticator's own cache, so the next ordinary access_token() call
+        sees the result too.
         """
-        raise NotImplementedError("_get is not implemented yet -- see issue #2")
+        store = build_store(self._config)
+        token = store.load()
+        if token is None or token.refresh_token is None:
+            raise AuthError("no refresh token available to retry with; run whoop_login")
+        new_token = await self._auth.refresh(token)
+        return new_token.access_token
+
+    async def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+        """GET a path, with a bearer token attached and errors normalised."""
+        token = await self._auth.access_token()
+        response = await self._request(path, params, token)
+
+        if response.status_code == 401:
+            token = await self._force_refresh()
+            response = await self._request(path, params, token)
+
+        if response.status_code == 429:
+            retry_after: float | None = None
+            reset_header = response.headers.get("X-RateLimit-Reset")
+            if reset_header is not None:
+                try:
+                    retry_after = float(reset_header)
+                except ValueError:
+                    retry_after = None
+            raise RateLimitedError(_error_message(response), retry_after=retry_after)
+
+        if not response.is_success:
+            raise WhoopAPIError(response.status_code, _error_message(response))
+
+        return response.json()
 
     async def _get_page(self, path: str, params: dict[str, str]) -> Page:
-        """GET one page of a collection.
-
-        TODO(#2): unwrap the `{"records": [...], "next_token": ...}` envelope.
-        """
-        raise NotImplementedError("_get_page is not implemented yet -- see issue #2")
+        """GET one page of a collection."""
+        data = await self._get(path, params)
+        return Page(records=data.get("records", []), next_token=data.get("next_token"))
 
     async def paginate(
-        self, path: str, params: dict[str, str], *, max_records: int | None = None
+        self, path: str, params: dict[str, str], *, max_records: int = 1000
     ) -> AsyncIterator[dict[str, Any]]:
         """Walk a collection, following ``nextToken`` until it runs out.
 
-        TODO(#2): loop on _get_page, stop at max_records or a null next_token.
-        Bound this -- an unbounded walk over years of data will blow both the
-        rate limit and the model's context window.
+        Default cap of 1000: at MAX_PAGE_SIZE (25) records/page that's 40
+        requests, comfortably inside the 100/minute budget for a single tool
+        call.
         """
-        raise NotImplementedError("paginate is not implemented yet -- see issue #2")
-        yield {}  # pragma: no cover - makes this an async generator for mypy
+        fetched = 0
+        current_params = dict(params)
+        while True:
+            page = await self._get_page(path, current_params)
+            for record in page.records:
+                if fetched >= max_records:
+                    return
+                yield record
+                fetched += 1
+            if page.next_token is None or fetched >= max_records:
+                return
+            current_params = {**params, "nextToken": page.next_token}
 
     # -- user --------------------------------------------------------------
 

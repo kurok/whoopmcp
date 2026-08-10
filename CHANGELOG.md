@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as zero, `trend` orders by each record's own timestamp rather than list
   position, and `correlate` joins on `cycle_id` (falling back to a Cycle
   record's own `id`, and then to calendar day) before computing Pearson's r.
+- `WhoopClient._get`, `._get_page`, and `.paginate` now talk to WHOOP's v2 API:
+  bearer auth attached per request, a single forced-refresh retry on a 401,
+  `RateLimitedError` on 429 (carrying `X-RateLimit-Reset` as `retry_after` when
+  present), and `.paginate` walks `nextToken` bounded by a `max_records` default
+  of 1000 rather than an unbounded default that could exhaust the daily quota.
 - The four auth tools (`whoop_auth_status`, `whoop_login`, `whoop_complete_login`,
   `whoop_logout`) are now wired to `Authenticator`. `whoop_auth_status` reads the
   token store directly rather than through `access_token()`, so checking status
