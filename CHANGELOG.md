@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as zero, `trend` orders by each record's own timestamp rather than list
   position, and `correlate` joins on `cycle_id` (falling back to a Cycle
   record's own `id`, and then to calendar day) before computing Pearson's r.
+- The four auth tools (`whoop_auth_status`, `whoop_login`, `whoop_complete_login`,
+  `whoop_logout`) are now wired to `Authenticator`. `whoop_auth_status` reads the
+  token store directly rather than through `access_token()`, so checking status
+  never triggers a side-effect refresh; `whoop_complete_login` verifies `state`
+  before exchanging the code and reports the scopes WHOOP actually granted. No
+  tool returns an access or refresh token value in any field.
 
 ### Changed
 
