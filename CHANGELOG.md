@@ -71,6 +71,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `whoop_logout` clears it back to unresolved. This is a shape change,
   not a feature -- no database, no session store -- so that a second user
   (#29) becomes a change to one resolver rather than a rewrite of every tool.
+- `analysis.Summary`/`summarize_period` now report `median` (a better centre
+  than the mean for the skewed distributions recovery and sleep produce)
+  and `days_missing` -- the requested period's length in days minus the
+  number of *unique calendar dates* actually covered, not minus the raw
+  record count, so a metric with two scored records on the same day
+  doesn't look more complete than it is. `compare_periods` adds a
+  standardised effect size (Cohen's d, via pooled standard deviation) per
+  metric alongside the existing delta, falling back to `None` rather than
+  raising when it's undefined (fewer than two observations on either
+  side, or both periods perfectly constant), and a `coverage_asymmetric`
+  flag per metric when the two periods' day-coverage fractions differ by
+  more than 0.5 -- coverage asymmetry is usually the real explanation for
+  a delta, not the thing being measured. A new top-level
+  `period_length_note` on `compare_periods` names when either period's
+  length isn't a multiple of seven, since a Monday-to-Friday window and
+  one spanning a weekend aren't like-for-like. No p-value anywhere: these
+  are small, autocorrelated daily samples, and an effect size with an
+  explicit `n` is honest where a p-value would be a false credential.
 - `correlate_metrics` now sweeps a range of day-offsets instead of reporting
   one correlation, and every point in the sweep carries both Pearson's r
   and Spearman's rho (`analysis.spearman`, ranks-based, ties resolved by
