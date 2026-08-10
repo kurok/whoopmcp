@@ -231,6 +231,13 @@ def _analysis_recovery_records() -> list[dict[str, Any]]:
         record = _dense_recovery(i)
         record["created_at"] = _spread_timestamp(i)
         record["cycle_id"] = i  # matches _analysis_cycle_records' "id" for the join
+        # _dense_recovery's recovery_score is a constant 65.0, fine for the
+        # single-page data-tool fixtures above but not here: trend()/pearson()
+        # refuse a zero-variance series (#22, #23), so a constant series
+        # trivially short-circuits metric_trend/correlate_metrics into their
+        # small insufficient-data/refused response instead of exercising the
+        # real worst case these ceilings are meant to measure.
+        record["score"]["recovery_score"] = 50.0 + (i % 40)
         records.append(record)
     return records
 
@@ -256,6 +263,11 @@ def _analysis_cycle_records() -> list[dict[str, Any]]:
         record["created_at"] = timestamp
         record["start"] = timestamp
         record["end"] = timestamp
+        # Same reasoning as _analysis_recovery_records' recovery_score override:
+        # _dense_cycle's strain is a constant 12.0, which makes correlate_metrics
+        # refuse every lag (a constant series has no correlation) instead of
+        # exercising its real worst-case response.
+        record["score"]["strain"] = 5.0 + (i % 15)
         records.append(record)
     return records
 

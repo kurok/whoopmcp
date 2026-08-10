@@ -72,7 +72,14 @@ TOOL_CEILINGS: dict[str, int] = {
     "get_sleep": 150,
     "get_workout": 150,
     "summarize_period": 300,
-    "metric_trend": 100,
-    "correlate_metrics": 50,
+    # 32000, not 100: metric_trend's rolling_7d/30d/90d (#22) return one point
+    # per calendar day of coverage with no cap, so a multi-year range's worst
+    # case is genuinely this large -- measured, not designed. Tracked as a
+    # follow-up (#54): the honest ceiling here defeats this file's own
+    # purpose for long ranges, and the right fix (windowing, pagination, or a
+    # rolling-point cap with a truncation note) is a product decision this
+    # rebase should not make unasked.
+    "metric_trend": 32000,
+    "correlate_metrics": 300,
     "compare_periods": 600,
 }

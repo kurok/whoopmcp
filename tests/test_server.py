@@ -1143,31 +1143,24 @@ async def test_summarize_period_reports_actual_range_across_all_collections(
 async def test_metric_trend_happy_path(
     config: Config, app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Metric trend with 3+ records returns slope_per_day and endpoints."""
+    """Metric trend with 8+ records returns slope_per_day and endpoints."""
     # Build recovery records with increasing recovery_score at different timestamps
-    recovery1 = {
-        "cycle_id": 100,
-        "created_at": "2026-08-01T06:00:00Z",
-        "score_state": "SCORED",
-        "score": {"recovery_score": 60.0, "hrv_rmssd_milli": 48.5, "resting_heart_rate": 55},
-    }
-    recovery2 = {
-        "cycle_id": 101,
-        "created_at": "2026-08-02T06:00:00Z",
-        "score_state": "SCORED",
-        "score": {"recovery_score": 70.0, "hrv_rmssd_milli": 48.5, "resting_heart_rate": 55},
-    }
-    recovery3 = {
-        "cycle_id": 102,
-        "created_at": "2026-08-03T06:00:00Z",
-        "score_state": "SCORED",
-        "score": {"recovery_score": 80.0, "hrv_rmssd_milli": 48.5, "resting_heart_rate": 55},
-    }
+    recovery_records = [
+        {
+            "cycle_id": 100 + i,
+            "created_at": f"2026-08-{i + 1:02d}T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {
+                "recovery_score": 60.0 + 10.0 * i,
+                "hrv_rmssd_milli": 48.5,
+                "resting_heart_rate": 55,
+            },
+        }
+        for i in range(8)
+    ]
 
     respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            200, json={"records": [recovery1, recovery2, recovery3], "next_token": None}
-        )
+        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
     )
 
     async with WhoopClient(config, app_context.auth) as client:
@@ -1178,19 +1171,19 @@ async def test_metric_trend_happy_path(
             {
                 "metric": "recovery_score",
                 "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-04T00:00:00Z",
+                "end": "2026-08-09T00:00:00Z",
             },
             app_context,
         )
 
     assert result["metric"] == "recovery_score"
-    assert result["count"] == 3
+    assert result["count"] == 8
     assert "slope_per_day" in result
     assert "first" in result
     assert "last" in result
     assert result["first"] == 60.0
-    assert result["last"] == 80.0
-    # Trend is +10 per day over 2 days = 10 per day
+    assert result["last"] == 130.0
+    # Trend is +10 per day over 7 days = 10 per day
     assert result["slope_per_day"] > 0
 
 
@@ -1244,7 +1237,7 @@ async def test_metric_trend_cycle_sourced_metric(
             strain=float(10 + i),
             created_at=f"2026-08-{i + 1:02d}T22:00:00Z",
         )
-        for i in range(3)
+        for i in range(8)
     ]
 
     respx.get(f"{BASE_URL}/v2/cycle").mock(
@@ -1256,16 +1249,138 @@ async def test_metric_trend_cycle_sourced_metric(
         result = await call_tool(
             server,
             "metric_trend",
-            {"metric": "strain", "start": "2026-08-01T00:00:00Z", "end": "2026-08-04T00:00:00Z"},
+            {"metric": "strain", "start": "2026-08-01T00:00:00Z", "end": "2026-08-09T00:00:00Z"},
             app_context,
         )
 
     assert result["metric"] == "strain"
-    assert result["count"] == 3
+    assert result["count"] == 8
     assert result["first"] == 10.0
-    assert result["last"] == 12.0
+    assert result["last"] == 17.0
     assert result["period"]["start"] is not None
     assert result["period"]["end"] is not None
+
+
+@respx.mock
+async def test_metric_trend_constant_value_returns_error_shape(
+    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """metric_trend on a constant-value fixture returns the error shape.
+
+    Even with 8+ records, a metric where all values are identical should
+    raise InsufficientDataError from trend(), which the tool wiring converts
+    to {"error": "insufficient_data", "message": ...}.
+    """
+    # Create 8 recovery records with identical recovery_score
+    recovery_records = [
+        recovery_fixture(
+            cycle_id=100 + i,
+            recovery_score=65.0,
+            created_at=f"2026-08-{i + 1:02d}T06:00:00Z",
+        )
+        for i in range(8)
+    ]
+
+    respx.get(f"{BASE_URL}/v2/recovery").mock(
+        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
+    )
+
+    async with WhoopClient(config, app_context.auth) as client:
+        app_context.client = client
+        result = await call_tool(
+            server,
+            "metric_trend",
+            {
+                "metric": "recovery_score",
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-09T00:00:00Z",
+            },
+            app_context,
+        )
+
+    # Should return error shape, not numeric results
+    assert result["error"] == "insufficient_data"
+    assert "message" in result
+    # Numeric fields should not be present
+    assert "slope_per_day" not in result
+    assert "r_squared" not in result
+
+
+@respx.mock
+async def test_metric_trend_includes_r_squared_and_rolling_windows(
+    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """metric_trend response includes r_squared and rolling_Nd fields on success.
+
+    With a well-populated (non-degenerate) series, the response should include:
+    - r_squared (a float between 0 and 1)
+    - rolling_7d, rolling_30d, rolling_90d (each a list of {"date": ..., "value": ...})
+    """
+    # Create 10 records with a clear upward trend
+    recovery_records = [
+        recovery_fixture(
+            cycle_id=100 + i,
+            recovery_score=50.0 + float(i),
+            created_at=f"2026-08-{i + 1:02d}T06:00:00Z",
+        )
+        for i in range(10)
+    ]
+
+    respx.get(f"{BASE_URL}/v2/recovery").mock(
+        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
+    )
+
+    async with WhoopClient(config, app_context.auth) as client:
+        app_context.client = client
+        result = await call_tool(
+            server,
+            "metric_trend",
+            {
+                "metric": "recovery_score",
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-11T00:00:00Z",
+            },
+            app_context,
+        )
+
+    # Existing fields should be present
+    assert result["metric"] == "recovery_score"
+    assert result["count"] == 10
+    assert "slope_per_day" in result
+    assert "first" in result
+    assert "last" in result
+    assert "period" in result
+
+    # New fields from issue #22
+    assert "r_squared" in result
+    assert isinstance(result["r_squared"], float)
+    assert 0.0 <= result["r_squared"] <= 1.0  # r² is always between 0 and 1
+
+    assert result["fit_quality"] in {"strong", "moderate", "weak", "negligible"}
+
+    assert "rolling_7d" in result
+    assert isinstance(result["rolling_7d"], list)
+    # Each entry should have date and value
+    for rp in result["rolling_7d"]:
+        assert isinstance(rp, dict)
+        assert "date" in rp
+        assert "value" in rp
+        assert isinstance(rp["date"], str)
+        assert isinstance(rp["value"], (int, float))
+
+    assert "rolling_30d" in result
+    assert isinstance(result["rolling_30d"], list)
+    for rp in result["rolling_30d"]:
+        assert isinstance(rp, dict)
+        assert "date" in rp
+        assert "value" in rp
+
+    assert "rolling_90d" in result
+    assert isinstance(result["rolling_90d"], list)
+    for rp in result["rolling_90d"]:
+        assert isinstance(rp, dict)
+        assert "date" in rp
+        assert "value" in rp
 
 
 @respx.mock
@@ -1311,8 +1426,12 @@ async def test_correlate_metrics_reuses_one_fetch_for_same_collection_metrics(
     assert len(recovery_route.calls) == 1
     assert result["metric_a"] == "recovery_score"
     assert result["metric_b"] == "hrv"
-    assert result["count"] == 8
-    assert "r" in result
+    # Default radius 3 -> 7 lags; this fixture has full-overlap same-day data,
+    # so lag=0 is the "no shift" case matching the old single-correlation
+    # semantics.
+    by_lag = {entry["lag_days"]: entry for entry in result["sweep"]}
+    assert by_lag[0]["count"] == 8
+    assert "r" in by_lag[0]
 
 
 @respx.mock
@@ -1339,6 +1458,7 @@ async def test_correlate_metrics_different_collections(
     cycle_records = [
         {
             "id": i,
+            "created_at": f"2026-08-{i:02d}T22:00:00Z",
             "start": f"2026-08-{i:02d}T22:00:00Z",
             "end": f"2026-08-{i + 1:02d}T22:00:00Z",
             "score_state": "SCORED",
@@ -1378,8 +1498,12 @@ async def test_correlate_metrics_different_collections(
     assert len(cycle_route.calls) == 1
     assert result["metric_a"] == "strain"
     assert result["metric_b"] == "recovery_score"
-    assert result["count"] == 8
-    assert "r" in result
+    # Default radius 3 -> 7 lags; this fixture has full-overlap same-day data,
+    # so lag=0 is the "no shift" case matching the old single-correlation
+    # semantics.
+    by_lag = {entry["lag_days"]: entry for entry in result["sweep"]}
+    assert by_lag[0]["count"] == 8
+    assert "r" in by_lag[0]
 
 
 @respx.mock
@@ -1405,6 +1529,7 @@ async def test_correlate_metrics_insufficient_samples(
     cycle_records = [
         {
             "id": i,
+            "created_at": f"2026-08-{i:02d}T22:00:00Z",
             "start": f"2026-08-{i:02d}T22:00:00Z",
             "end": f"2026-08-{i + 1:02d}T22:00:00Z",
             "score_state": "SCORED",
@@ -1439,9 +1564,174 @@ async def test_correlate_metrics_insufficient_samples(
             app_context,
         )
 
-    assert result["error"] == "insufficient_data"
-    assert "message" in result
-    assert "r" not in result
+    # Only 3 total matched pairs at every lag in this fixture -- below
+    # MIN_CORRELATION_SAMPLES (8) -- so every lag in the default sweep is
+    # refused; there is no longer a top-level error.
+    assert "sweep" in result
+    assert len(result["sweep"]) == 7  # default radius 3 -> lags -3..+3
+    for entry in result["sweep"]:
+        assert entry["refused"] is True
+
+
+@respx.mock
+async def test_correlate_metrics_explicit_lag_days_returns_full_sweep(
+    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """An explicit lag_days sets the sweep radius: 2*lag_days+1 entries, covering
+    exactly [-lag_days, ..., +lag_days], with at least one lag not refused.
+    """
+    recovery_records = [
+        {
+            "cycle_id": i,
+            "created_at": f"2026-08-{i:02d}T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {
+                "recovery_score": float(i * 10),
+                "hrv_rmssd_milli": float(i * 5),
+                "resting_heart_rate": 55,
+            },
+        }
+        for i in range(1, 16)
+    ]
+
+    respx.get(f"{BASE_URL}/v2/recovery").mock(
+        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
+    )
+
+    async with WhoopClient(config, app_context.auth) as client:
+        app_context.client = client
+        result = await call_tool(
+            server,
+            "correlate_metrics",
+            {
+                "metric_a": "recovery_score",
+                "metric_b": "hrv",
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-16T00:00:00Z",
+                "lag_days": 2,
+            },
+            app_context,
+        )
+
+    assert len(result["sweep"]) == 5
+    assert sorted(entry["lag_days"] for entry in result["sweep"]) == [-2, -1, 0, 1, 2]
+    assert any(
+        entry["refused"] is False and "r" in entry and "spearman_r" in entry and "count" in entry
+        for entry in result["sweep"]
+    )
+
+
+@respx.mock
+async def test_correlate_metrics_constant_metric_all_lags_refused_no_top_level_error(
+    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """A constant metric raises InsufficientDataError from analysis.correlate;
+    the sweep must never let that escape to the client -- every lag becomes
+    a refusal, and there is no top-level "error" key.
+    """
+    recovery_records = [
+        recovery_fixture(cycle_id=i, created_at=f"2026-08-{i:02d}T06:00:00Z", recovery_score=65.0)
+        for i in range(1, 10)
+    ]
+    cycle_records = [
+        cycle_fixture(cycle_id=i, created_at=f"2026-08-{i:02d}T22:00:00Z", strain=float(i * 2))
+        for i in range(1, 10)
+    ]
+
+    respx.get(f"{BASE_URL}/v2/recovery").mock(
+        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
+    )
+    respx.get(f"{BASE_URL}/v2/cycle").mock(
+        return_value=httpx.Response(200, json={"records": cycle_records, "next_token": None})
+    )
+
+    async with WhoopClient(config, app_context.auth) as client:
+        app_context.client = client
+        result = await call_tool(
+            server,
+            "correlate_metrics",
+            {
+                "metric_a": "recovery_score",
+                "metric_b": "strain",
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-10T00:00:00Z",
+            },
+            app_context,
+        )
+
+    assert "error" not in result
+    assert "sweep" in result
+    for entry in result["sweep"]:
+        assert entry["refused"] is True
+        assert "message" in entry
+
+
+async def test_correlate_metrics_rejects_negative_lag_days(
+    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """A negative lag_days is rejected outright, not silently turned into an
+    empty sweep (range(-lag_days, lag_days + 1) for lag_days=-2 is empty)."""
+    async with WhoopClient(config, app_context.auth) as client:
+        app_context.client = client
+        with pytest.raises(ToolError, match="lag_days"):
+            await call_tool(
+                server,
+                "correlate_metrics",
+                {
+                    "metric_a": "recovery_score",
+                    "metric_b": "strain",
+                    "start": "2026-08-01T00:00:00Z",
+                    "end": "2026-08-10T00:00:00Z",
+                    "lag_days": -2,
+                },
+                app_context,
+            )
+
+
+@respx.mock
+async def test_correlate_metrics_clamps_an_oversized_lag_days(
+    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """A caller-supplied lag_days far beyond any reasonable sweep is clamped
+    to _MAX_LAG_SWEEP_RADIUS rather than producing an enormous sweep from a
+    handful of days of input."""
+    recovery_records = [
+        recovery_fixture(
+            cycle_id=i, created_at=f"2026-08-{i:02d}T06:00:00Z", recovery_score=65.0 + i
+        )
+        for i in range(1, 10)
+    ]
+    cycle_records = [
+        cycle_fixture(cycle_id=i, created_at=f"2026-08-{i:02d}T22:00:00Z", strain=float(i * 2))
+        for i in range(1, 10)
+    ]
+
+    respx.get(f"{BASE_URL}/v2/recovery").mock(
+        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
+    )
+    respx.get(f"{BASE_URL}/v2/cycle").mock(
+        return_value=httpx.Response(200, json={"records": cycle_records, "next_token": None})
+    )
+
+    async with WhoopClient(config, app_context.auth) as client:
+        app_context.client = client
+        result = await call_tool(
+            server,
+            "correlate_metrics",
+            {
+                "metric_a": "recovery_score",
+                "metric_b": "strain",
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-10T00:00:00Z",
+                "lag_days": 400,
+            },
+            app_context,
+        )
+
+    # Clamped to 14 -> 29 entries, not 801.
+    assert len(result["sweep"]) == 29
+    lags_returned = sorted(entry["lag_days"] for entry in result["sweep"])
+    assert lags_returned == list(range(-14, 15))
 
 
 @respx.mock

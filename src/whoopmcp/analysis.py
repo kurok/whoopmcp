@@ -15,11 +15,19 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 #: Below this many paired observations a correlation is not worth reporting.
 MIN_CORRELATION_SAMPLES = 8
+
+#: The default lag sweep for correlate_lag_sweep: +/- 3 days.
+DEFAULT_LAG_SWEEP: tuple[int, ...] = tuple(range(-3, 4))
+
+#: Below this many observations, a trend/regression is not worth reporting --
+#: mirrors MIN_CORRELATION_SAMPLES's philosophy for this module's other
+#: "refuse below N" convention.
+MIN_TREND_SAMPLES = 8
 
 #: Friendly metric name -> key within record["score"].
 _METRIC_PATHS: dict[str, str] = {
@@ -54,6 +62,14 @@ class Summary:
 
 
 @dataclass(frozen=True, slots=True)
+class RollingPoint:
+    """One point in a rolling-mean series: a calendar date and its mean."""
+
+    date: str
+    value: float
+
+
+@dataclass(frozen=True, slots=True)
 class Trend:
     """A least-squares trend, in metric units per day."""
 
@@ -62,16 +78,31 @@ class Trend:
     slope_per_day: float
     first: float
     last: float
+    r_squared: float
+    fit_quality: str
+    rolling_7d: list[RollingPoint]
+    rolling_30d: list[RollingPoint]
+    rolling_90d: list[RollingPoint]
 
 
 @dataclass(frozen=True, slots=True)
 class Correlation:
-    """A Pearson correlation between two metrics, with its sample size."""
+    """A Pearson and Spearman correlation between two metrics, with its sample size."""
 
     metric_a: str
     metric_b: str
     count: int
     r: float
+    spearman_r: float
+
+
+@dataclass(frozen=True, slots=True)
+class LagResult:
+    """One entry of a lag sweep: either a Correlation, or a refusal reason."""
+
+    lag_days: int
+    correlation: Correlation | None
+    refused_reason: str | None
 
 
 def mean(values: Sequence[float]) -> float:
@@ -119,6 +150,46 @@ def pearson(xs: Sequence[float], ys: Sequence[float]) -> float:
         raise InsufficientDataError("correlation is undefined when a series is constant")
 
     return math.fsum(a * b for a, b in zip(dx, dy, strict=True)) / denom
+
+
+def _rank(values: Sequence[float]) -> list[float]:
+    """1-indexed average (fractional) ranks of ``values``.
+
+    Ties share the mean of the rank positions they occupy: values at sorted
+    positions 2 and 3 (1-indexed) both get rank 2.5.
+    """
+    n = len(values)
+    order = sorted(range(n), key=lambda i: values[i])
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg_rank = (i + 1 + j + 1) / 2.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def spearman(xs: Sequence[float], ys: Sequence[float]) -> float:
+    """Spearman's rank correlation coefficient.
+
+    Pearson's r computed over each series' average ranks (ties resolved by
+    the mean of the tied positions' ranks).
+
+    Raises:
+        ValueError: if the sequences differ in length.
+        InsufficientDataError: with fewer than two pairs, or when either
+            series has zero rank-variance (all values tied) -- raised by
+            ``pearson`` itself on the ranked series.
+    """
+    if len(xs) != len(ys):
+        raise ValueError(f"length mismatch: {len(xs)} vs {len(ys)}")
+    if len(xs) < 2:
+        raise InsufficientDataError("correlation needs at least 2 pairs")
+    return pearson(_rank(xs), _rank(ys))
 
 
 def linear_slope(xs: Sequence[float], ys: Sequence[float]) -> float:
@@ -224,17 +295,140 @@ def summarize(records: Sequence[dict[str, Any]], metric: str) -> Summary:
     )
 
 
+def _describe_fit(r_squared: float) -> str:
+    """Describe a fit's strength in words, from its r-squared.
+
+    A slope is not safe to narrate without knowing how much of the variance
+    it actually explains -- this is the "describe the fit in words" half of
+    that requirement, alongside the numeric r_squared field it never
+    replaces. Bands are deliberately coarse and stated here rather than
+    hidden behind the word: r_squared >= 0.7 "strong", >= 0.4 "moderate",
+    >= 0.1 "weak", otherwise "negligible". These are common, not universal,
+    conventions -- the numeric r_squared is always reported alongside this
+    so nothing is lost if a caller judges the fit differently.
+    """
+    if r_squared >= 0.7:
+        return "strong"
+    if r_squared >= 0.4:
+        return "moderate"
+    if r_squared >= 0.1:
+        return "weak"
+    return "negligible"
+
+
+def _daily_means(dated_values: Sequence[tuple[str, float]]) -> list[RollingPoint]:
+    """Collapse same-date observations to one mean each, sorted by date."""
+    groups: dict[str, list[float]] = {}
+    for day, value in dated_values:
+        groups.setdefault(day, []).append(value)
+    return [RollingPoint(date=day, value=mean(values)) for day, values in sorted(groups.items())]
+
+
+def _rolling_means(daily: Sequence[RollingPoint], window_days: int) -> list[RollingPoint]:
+    """Rolling mean over a trailing window of ``window_days`` calendar days.
+
+    ``daily`` must already be day-deduplicated and sorted by date. A date only
+    gets a point once at least ``window_days`` calendar days have elapsed
+    since the start of the *current run of coverage*; the window itself is
+    every day-deduplicated point whose date falls within the trailing
+    ``window_days``-day span, with no gap-filling for days that have no
+    observation.
+
+    "Current run of coverage" matters because a gap between two consecutive
+    daily points that is itself >= ``window_days`` resets the minimum-periods
+    clock: no point from before such a gap could ever land inside a window
+    that only looks back ``window_days - 1`` days in the first place, so
+    without the reset, the first point after a long gap would silently be
+    reported as a full ``window_days``-day mean while actually being an
+    average of whatever handful of points the gap happened to leave nearby --
+    the exact "spurious swing" the leading-edge rule exists to prevent, just
+    triggered mid-series instead of only at the very start. Each window size
+    resets independently (a gap can be big enough to reset the 7-day window
+    while leaving the 90-day window's own coverage intact), which falls out
+    for free from this function being called once per window size.
+    """
+    dates = [datetime.fromisoformat(point.date).date() for point in daily]
+    points: list[RollingPoint] = []
+    window_start_idx = 0
+    run_start = dates[0]
+    for i, current_date in enumerate(dates):
+        if i > 0 and (current_date - dates[i - 1]).days >= window_days:
+            run_start = current_date
+        if (current_date - run_start).days < window_days - 1:
+            continue
+        window_start = current_date - timedelta(days=window_days - 1)
+        while dates[window_start_idx] < window_start:
+            window_start_idx += 1
+        window_values = [point.value for point in daily[window_start_idx : i + 1]]
+        points.append(RollingPoint(date=daily[i].date, value=mean(window_values)))
+    return points
+
+
 def trend(records: Sequence[dict[str, Any]], metric: str) -> Trend:
-    """Direction and rate of change for one metric over time."""
+    """Direction, rate of change and fit quality for one metric over time.
+
+    Also returns 7/30/90-day rolling means computed on a day-deduplicated
+    calendar series, independent of the per-record slope/r_squared figures.
+    """
+    filtered = _filtered_records(records, metric)
+    if len(filtered) < MIN_TREND_SAMPLES:
+        raise InsufficientDataError(
+            f"trend needs at least {MIN_TREND_SAMPLES} observations, got {len(filtered)}"
+        )
+
     pairs = [
         (datetime.fromisoformat(record["created_at"]).timestamp() / 86_400.0, value)
-        for record, value in _filtered_records(records, metric)
+        for record, value in filtered
     ]
     pairs.sort(key=lambda pair: pair[0])
     xs = [day for day, _ in pairs]
     ys = [value for _, value in pairs]
     slope = linear_slope(xs, ys)
-    return Trend(metric=metric, count=len(ys), slope_per_day=slope, first=ys[0], last=ys[-1])
+    r_squared = pearson(xs, ys) ** 2
+
+    dated_values = [
+        (datetime.fromisoformat(record["created_at"]).astimezone(UTC).date().isoformat(), value)
+        for record, value in filtered
+    ]
+    daily = _daily_means(dated_values)
+
+    return Trend(
+        metric=metric,
+        count=len(ys),
+        slope_per_day=slope,
+        first=ys[0],
+        last=ys[-1],
+        r_squared=r_squared,
+        fit_quality=_describe_fit(r_squared),
+        rolling_7d=_rolling_means(daily, 7),
+        rolling_30d=_rolling_means(daily, 30),
+        rolling_90d=_rolling_means(daily, 90),
+    )
+
+
+def _correlation_from_pairs(
+    metric_a: str, metric_b: str, pairs: list[tuple[float, float]]
+) -> Correlation:
+    """Build a Correlation from already-matched pairs, refusing too few.
+
+    Shared by ``correlate`` (cycle_id-joined pairs) and
+    ``correlate_lag_sweep`` (date-joined pairs) so the refusal threshold and
+    message are defined in exactly one place.
+    """
+    if len(pairs) < MIN_CORRELATION_SAMPLES:
+        raise InsufficientDataError(
+            f"correlate needs at least {MIN_CORRELATION_SAMPLES} matched pairs, got {len(pairs)}"
+        )
+
+    xs = [a for a, _ in pairs]
+    ys = [b for _, b in pairs]
+    return Correlation(
+        metric_a=metric_a,
+        metric_b=metric_b,
+        count=len(pairs),
+        r=pearson(xs, ys),
+        spearman_r=spearman(xs, ys),
+    )
 
 
 def correlate(
@@ -254,11 +448,79 @@ def correlate(
             continue
         pairs.extend(zip(values_a, values_b, strict=False))
 
-    if len(pairs) < MIN_CORRELATION_SAMPLES:
-        raise InsufficientDataError(
-            f"correlate needs at least {MIN_CORRELATION_SAMPLES} matched pairs, got {len(pairs)}"
-        )
+    return _correlation_from_pairs(metric_a, metric_b, pairs)
 
-    xs = [a for a, _ in pairs]
-    ys = [b for _, b in pairs]
-    return Correlation(metric_a=metric_a, metric_b=metric_b, count=len(pairs), r=pearson(xs, ys))
+
+def _dated_means(records: Sequence[dict[str, Any]], metric: str) -> dict[str, float]:
+    """One value per unique UTC calendar date for ``metric``, averaging
+    same-date duplicates.
+
+    Uses the same ``created_at``-based date derivation as ``_join_key``'s
+    calendar-day fallback, uniformly for every record -- including
+    cycle-sourced metrics like strain, which carry ``created_at`` too.
+
+    A metric with more than one scored record on the same date (e.g. a nap
+    alongside a main sleep) collapses to one averaged value for that date,
+    so a ``LagResult.correlation.count`` downstream counts distinct dates,
+    not raw records.
+    """
+    groups: dict[str, list[float]] = {}
+    for record, value in _filtered_records(records, metric):
+        day = datetime.fromisoformat(record["created_at"]).astimezone(UTC).date().isoformat()
+        groups.setdefault(day, []).append(value)
+    return {day: mean(values) for day, values in groups.items()}
+
+
+def correlate_lag_sweep(
+    records_a: Sequence[dict[str, Any]],
+    metric_a: str,
+    records_b: Sequence[dict[str, Any]],
+    metric_b: str,
+    *,
+    lags: Sequence[int] = DEFAULT_LAG_SWEEP,
+) -> list[LagResult]:
+    """Correlate two metrics at each of several day offsets ("lags").
+
+    ``lag_days = L`` pairs metric_a's value on calendar date D with
+    metric_b's value on calendar date D + L: a positive lag means
+    metric_a's date precedes metric_b's by that many days -- metric_a
+    "leads".
+
+    This joins purely on calendar date (derived from ``created_at``), which
+    is a deliberate departure from ``correlate()``'s cycle_id-based join --
+    lag arithmetic is fundamentally a date operation. The two do NOT
+    coincide in general: a Recovery is created hours after the Cycle it
+    belongs to (often after midnight, so on the *next* calendar date), so
+    the "physiologically aligned" pairing that correlate()'s cycle_id join
+    finds at lag=0 can show up here at lag=+1 (or +2) instead. Treat a lag
+    value from this sweep as an approximate day-to-day alignment, not a
+    physiological-cycle one -- callers reasoning about "yesterday's X vs
+    today's Y" should expect the peak near the lag they'd predict, not
+    necessarily at exactly that lag.
+
+    Raises nothing from the pairing/correlation logic itself: every lag in
+    ``lags`` produces exactly one ``LagResult``, with a refusal reason in
+    place of a Correlation when too few pairs survive the shift. Malformed
+    input (a record missing ``created_at``, or an unparseable timestamp)
+    still propagates, same as every other function in this module.
+    """
+    dated_a = _dated_means(records_a, metric_a)
+    dated_b = _dated_means(records_b, metric_b)
+
+    results: list[LagResult] = []
+    for lag in lags:
+        pairs: list[tuple[float, float]] = []
+        for day_str, value_a in dated_a.items():
+            shifted_day = (date.fromisoformat(day_str) + timedelta(days=lag)).isoformat()
+            value_b = dated_b.get(shifted_day)
+            if value_b is None:
+                continue
+            pairs.append((value_a, value_b))
+
+        try:
+            correlation = _correlation_from_pairs(metric_a, metric_b, pairs)
+        except InsufficientDataError as exc:
+            results.append(LagResult(lag_days=lag, correlation=None, refused_reason=str(exc)))
+        else:
+            results.append(LagResult(lag_days=lag, correlation=correlation, refused_reason=None))
+    return results
