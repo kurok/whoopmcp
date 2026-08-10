@@ -11,6 +11,7 @@ Docs: https://developer.whoop.com/docs/developing/oauth/
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -178,6 +179,11 @@ class KeyringTokenStore:
         return Token.from_json(raw) if raw else None
 
     def save(self, token: Token) -> None:
+        # No atomicity guarantee of our own here, unlike FileTokenStore's
+        # write-then-replace: this passes straight through to the OS keychain's
+        # own set_password, and keyring's API doesn't document a swap-on-success
+        # contract the way a filesystem rename gives us. Whatever atomicity this
+        # has comes from the backend, not from anything written here.
         self._keyring.set_password(self.SERVICE, self.USERNAME, token.to_json())
 
     def clear(self) -> None:
@@ -238,14 +244,56 @@ def _raise_for_token_error(response: httpx.Response) -> None:
     raise AuthError(message)
 
 
+def _is_invalid_grant(response: httpx.Response) -> bool:
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("error") == "invalid_grant"
+
+
+class RefreshLock(Protocol):
+    """Serialises concurrent refreshes to exactly one in flight at a time.
+
+    Deliberately just a mutex, not asyncio.Lock by name: hosted mode (#27,
+    #30) needs one that holds across processes, and should be able to
+    supply it here without any change to Authenticator.
+    """
+
+    async def acquire(self) -> None: ...
+
+    def release(self) -> None: ...
+
+
+class InProcessRefreshLock:
+    """The default: a plain asyncio.Lock, sufficient for one server process."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        await self._lock.acquire()
+
+    def release(self) -> None:
+        self._lock.release()
+
+
 class Authenticator:
     """Owns the token lifecycle: exchange, refresh, persist, revoke."""
 
-    def __init__(self, config: Config, store: TokenStore | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        store: TokenStore | None = None,
+        *,
+        refresh_lock: RefreshLock | None = None,
+    ) -> None:
         self._config = config
         self._store = store or build_store(config)
         self._token: Token | None = None
         self._pending_state: str | None = None
+        self._refresh_lock: RefreshLock = refresh_lock or InProcessRefreshLock()
+        self._inflight_refresh: asyncio.Task[Token] | None = None
 
     def start_login(self) -> str:
         """Begin a login and return the URL the user must open."""
@@ -280,7 +328,54 @@ class Authenticator:
         return token
 
     async def refresh(self, token: Token) -> Token:
-        """Renew an expired token using its refresh token."""
+        """Renew an expired token using its refresh token.
+
+        Single-flighted two ways. A store-recheck after acquiring
+        self._refresh_lock short-circuits a caller that arrives once a PRIOR
+        round has already resolved successfully -- another caller may have
+        refreshed past `token` while this one waited for the lock, and
+        re-reading the shared store (rather than an in-process cache) is what
+        will let a future cross-process lock (#27, #30) work here too without
+        changing this method, since a different process's win is only
+        visible through the store. But a store-recheck alone only catches a
+        *successful* prior round: a failed one clears the store to None,
+        which leaves a caller arriving mid-flight nothing to short-circuit
+        on. So callers who arrive WHILE a round is still running instead
+        coalesce onto self._inflight_refresh, a shared asyncio.Task --
+        awaiting it delivers the winner's exception to every waiter just as
+        it would the winner's result, so a failed refresh (e.g.
+        invalid_grant) does not get retried by everyone who was waiting on
+        it.
+
+        The lock is only held for the brief "check the store, then
+        create-or-reuse the shared task" step -- the network call itself
+        happens with the lock released, so waiters merely await the same
+        task rather than blocking each other on it. Clearing the finished
+        task back out of self._inflight_refresh does not need the lock
+        either: it is plain synchronous code with no `await` between the
+        identity check and the assignment, so nothing can interleave between
+        them -- whichever waiter's continuation runs first clears it, and the
+        rest see it is already gone.
+        """
+        await self._refresh_lock.acquire()
+        try:
+            current = self._store.load()
+            if current is not None and current != token and not current.expired:
+                self._token = current
+                return current
+            if self._inflight_refresh is None:
+                self._inflight_refresh = asyncio.ensure_future(self._do_refresh(token))
+            inflight = self._inflight_refresh
+        finally:
+            self._refresh_lock.release()
+
+        try:
+            return await inflight
+        finally:
+            if self._inflight_refresh is inflight:
+                self._inflight_refresh = None
+
+    async def _do_refresh(self, token: Token) -> Token:
         async with httpx.AsyncClient(timeout=self._config.request_timeout) as client:
             response = await client.post(
                 TOKEN_URL,
@@ -291,6 +386,13 @@ class Authenticator:
                     "client_secret": self._config.client_secret,
                     "scope": "offline",
                 },
+            )
+        if response.status_code == 400 and _is_invalid_grant(response):
+            self._store.clear()
+            self._token = None
+            raise AuthError(
+                "WHOOP rejected the refresh token (invalid_grant); it will not become valid "
+                "on retry -- run whoop_login to re-authorise"
             )
         _raise_for_token_error(response)
         new_token = Token.from_response(response.json())

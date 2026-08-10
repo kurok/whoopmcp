@@ -59,6 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Authenticator.refresh` is now single-flighted. WHOOP invalidates the old
+  refresh token the instant it issues a new one, so two callers racing the
+  same refresh previously risked the loser overwriting a live token with a
+  dead one, or (once one caller's refresh failed, e.g. `invalid_grant`)
+  every other waiting caller independently retrying the same already-killed
+  refresh token. Concurrent callers now coalesce onto whichever refresh is
+  already in flight and share its result *or* its failure; a lock behind a
+  small interface (`RefreshLock`, with an in-process `asyncio.Lock`-backed
+  default) coordinates this, so hosted mode's eventual cross-process lock
+  (#27, #30) can be supplied without changing `Authenticator`. `invalid_grant`
+  now clears the stored token and raises pointing at `whoop_login`, rather
+  than leaving a dead credential in place for the next call to trip over.
 - The file token store advertised mode `0600` on every platform, but Windows
   does not enforce POSIX modes and the token was landing at `0666`. The
   guarantee is now scoped to macOS and Linux in the docs, and on Windows the

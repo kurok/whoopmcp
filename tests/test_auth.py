@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import stat
@@ -7,6 +8,7 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 import respx
 
@@ -389,3 +391,201 @@ async def test_access_token_raises_auth_error_when_no_stored_token(
     auth = Authenticator(config)
     with pytest.raises(AuthError, match="whoop_login"):
         await auth.access_token()
+
+
+# -- single-flight refresh (issue #12) --------------------------------------
+
+
+def _mock_new_token_response() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "access_token": "new-access",
+            "expires_in": 3600,
+            "refresh_token": "new-refresh",
+            "scope": "offline",
+        },
+    )
+
+
+async def test_concurrent_access_token_calls_issue_exactly_one_refresh(
+    config: Config,
+) -> None:
+    # A naive (non-single-flighted) Authenticator would let every concurrent
+    # caller see the same expired token and independently refresh it -- N
+    # calls in, N POSTs out. The event-gated side_effect below forces all N
+    # callers to genuinely be in flight at once, so this test only passes if
+    # the implementation actually serializes refreshes.
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    calls_started = asyncio.Event()
+
+    async def slow_refresh(request: httpx.Request) -> httpx.Response:
+        calls_started.set()
+        await asyncio.sleep(0.01)  # give every concurrent caller a chance to reach the POST
+        return _mock_new_token_response()
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(side_effect=slow_refresh)
+
+        auth = Authenticator(config)
+        results = await asyncio.gather(*(auth.access_token() for _ in range(10)))
+
+    assert route.call_count == 1
+    assert results == ["new-access"] * 10
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.refresh_token == "new-refresh"
+
+
+async def test_losing_refresh_cannot_overwrite_the_winners_stored_token(
+    config: Config,
+) -> None:
+    # Bypass access_token() and call refresh() directly on the same expired
+    # token from two concurrent callers -- the exact unit issue #12's Anchors
+    # section calls out. Only the winner may hit the network; the loser must
+    # come back with the winner's stored token, not clobber it with a
+    # second, redundant response.
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    calls_started = asyncio.Event()
+
+    async def slow_refresh(request: httpx.Request) -> httpx.Response:
+        calls_started.set()
+        await asyncio.sleep(0.01)
+        return _mock_new_token_response()
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(side_effect=slow_refresh)
+
+        auth = Authenticator(config)
+        results = await asyncio.gather(auth.refresh(expired), auth.refresh(expired))
+
+    assert route.call_count == 1
+    assert results[0] == results[1]
+    persisted = store.load()
+    assert persisted == results[0]
+    assert persisted in results
+
+
+async def test_concurrent_refresh_failure_is_not_retried_by_every_waiter(
+    config: Config,
+) -> None:
+    # The store-recheck alone only catches a *successful* prior refresh: it
+    # short-circuits when the store holds a fresher, non-expired token, but
+    # after a failed refresh clears the store to None, a waiter reacquiring
+    # the lock sees nothing to short-circuit on and would retry the same
+    # already-dead refresh_token itself. Single-flighting must cover failure
+    # too -- "do not retry a refresh token that WHOOP has already killed"
+    # applies to every waiter, not just the first caller to notice expiry.
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    async def slow_invalid_grant(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.01)
+        return httpx.Response(
+            400,
+            json={"error": "invalid_grant", "error_description": "Refresh token is expired."},
+        )
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(side_effect=slow_invalid_grant)
+
+        auth = Authenticator(config)
+        results = await asyncio.gather(
+            auth.refresh(expired), auth.refresh(expired), return_exceptions=True
+        )
+
+    assert route.call_count == 1  # not 2 -- the second caller must not retry the dead token
+    assert all(isinstance(r, AuthError) for r in results)
+    assert all("whoop_login" in str(r) for r in results)
+
+
+def test_interrupted_write_leaves_previous_token_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FileTokenStore.save() has been atomic (write-to-.tmp, then Path.replace)
+    # since issue #1, but never had a test proving an interrupted write can't
+    # corrupt or lose the previously-saved token. This should already pass
+    # against the current, unchanged FileTokenStore.
+    path = tmp_path / "token.json"
+    store = FileTokenStore(path)
+    original = Token("orig-access", expires_at=1234.0, refresh_token="orig-refresh")
+    store.save(original)
+
+    def boom(self: Path, *args: object, **kwargs: object) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", boom)
+
+    new_token = Token("new-access", expires_at=5678.0, refresh_token="new-refresh")
+    with pytest.raises(OSError):
+        store.save(new_token)
+
+    monkeypatch.undo()
+
+    assert store.load() == original
+    assert path.read_text(encoding="utf-8")  # still parseable, not truncated/empty
+
+
+@respx.mock
+async def test_refresh_with_invalid_grant_clears_store_and_hints_whoop_login(
+    config: Config,
+) -> None:
+    store = FileTokenStore(config.token_path)
+    old_token = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(old_token)
+
+    route = respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "error": "invalid_grant",
+                "error_description": "Refresh token is expired.",
+            },
+        )
+    )
+
+    auth = Authenticator(config)
+    with pytest.raises(AuthError, match="whoop_login"):
+        await auth.refresh(old_token)
+
+    assert route.call_count == 1  # no fallthrough to a second attempt
+    assert FileTokenStore(config.token_path).load() is None
+
+
+async def test_refresh_lock_is_a_test_double_not_asyncio_lock(config: Config) -> None:
+    # Authenticator must drive serialization through whatever RefreshLock it
+    # is given, rather than an asyncio.Lock it constructs itself -- proven by
+    # injecting a fake that merely counts calls.
+    class FakeLock:
+        def __init__(self) -> None:
+            self.acquire_count = 0
+            self.release_count = 0
+
+        async def acquire(self) -> None:
+            self.acquire_count += 1
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    fake_lock = FakeLock()
+
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(return_value=_mock_new_token_response())
+
+        auth = Authenticator(config, refresh_lock=fake_lock)
+        result = await auth.access_token()
+
+    assert result == "new-access"
+    assert fake_lock.acquire_count == 1
+    assert fake_lock.release_count == 1
