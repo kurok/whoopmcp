@@ -31,7 +31,10 @@ BASE_URL = "https://api.prod.whoop.com/developer"
 MAX_PAGE_SIZE = 25
 
 #: Documented default limits: 100 requests/minute and 10,000/day, signalled
-#: by X-RateLimit-* headers and a 429 on breach.
+#: by X-RateLimit-* headers and a 429 on breach. Confirmed with WHOOP (#9)
+#: to be per application (this client_id), shared across every member who
+#: has authorised it, not a separate budget per member -- so RateLimiter's
+#: bucket is correctly process-wide rather than keyed per user.
 RATE_LIMIT_PER_MINUTE = 100
 RATE_LIMIT_PER_DAY = 10_000
 

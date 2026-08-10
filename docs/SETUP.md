@@ -152,9 +152,11 @@ redirect URI does not match the registration byte for byte.
 rejected, typically because the grant was revoked in the WHOOP app or
 `offline` was never granted. Run `whoop_logout`, then `whoop_login` again.
 
-**`429`** — WHOOP's limits are 100 requests/minute and 10,000/day. Narrow
-your date range; collections page at 25 records maximum, so a year of history
-is roughly 15 requests per collection.
+**`429`** — WHOOP's limits are 100 requests/minute and 10,000/day, **per
+application**, shared across every member who has authorised it (confirmed
+with WHOOP, #9) — not a separate budget per member. Narrow your date range;
+collections page at 25 records maximum, so a year of history is roughly 15
+requests per collection.
 
 **A tool raises `NotImplementedError`** — expected in 0.1.x. The scaffold is
 published; the internals are not implemented yet. The error names the issue

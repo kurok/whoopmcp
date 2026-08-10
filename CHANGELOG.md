@@ -101,6 +101,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (needs #13, not yet merged). Run one worker for token refresh, or accept
   that a concurrent refresh under multiple workers can force a re-login,
   until this is resolved.
+- `analysis.Summary`/`summarize_period` now report `median` (a better centre
+  than the mean for the skewed distributions recovery and sleep produce)
+  and `days_missing` -- the requested period's length in days minus the
+  number of *unique calendar dates* actually covered, not minus the raw
+  record count, so a metric with two scored records on the same day
+  doesn't look more complete than it is. `compare_periods` adds a
+  standardised effect size (Cohen's d, via pooled standard deviation) per
+  metric alongside the existing delta, falling back to `None` rather than
+  raising when it's undefined (fewer than two observations on either
+  side, or both periods perfectly constant), and a `coverage_asymmetric`
+  flag per metric when the two periods' day-coverage fractions differ by
+  more than 0.5 -- coverage asymmetry is usually the real explanation for
+  a delta, not the thing being measured. A new top-level
+  `period_length_note` on `compare_periods` names when either period's
+  length isn't a multiple of seven, since a Monday-to-Friday window and
+  one spanning a weekend aren't like-for-like. No p-value anywhere: these
+  are small, autocorrelated daily samples, and an effect size with an
+  explicit `n` is honest where a p-value would be a false credential.
+- `correlate_metrics` now sweeps a range of day-offsets instead of reporting
+  one correlation, and every point in the sweep carries both Pearson's r
+  and Spearman's rho (`analysis.spearman`, ranks-based, ties resolved by
+  average rank) rather than Pearson alone. `lag_days` (default 3, capped at
+  14) sets the sweep radius; a positive lag means `metric_a`'s date
+  precedes `metric_b`'s. The whole sweep is always returned, never just
+  its best lag, and a lag with too few surviving pairs is reported as
+  refused rather than silently dropped. This path joins the two metrics by
+  calendar date rather than `correlate()`'s existing cycle_id join -- lag
+  arithmetic is fundamentally a date operation, and the tool's docstring
+  and `INSTRUCTIONS` now both say so, since the two joins do not coincide
+  in general (a Recovery is created hours after the Cycle it belongs to,
+  which can shift the "physiologically aligned" pairing by a day). This is
+  a breaking change to `correlate_metrics`' response shape -- no flat,
+  single-correlation mode remains.
 - `analysis.Trend`/`metric_trend` now report fit quality alongside the slope,
   as a number (`r_squared`, reusing the existing `pearson` primitive on the
   same day-offset/value series already fed to `linear_slope`) and as a word
@@ -120,6 +153,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- WHOOP has confirmed the 100/minute and 10,000/day rate limits are **per
+  application** (this project's `client_id`), shared across every member
+  who has authorised it, not a separate budget per member (#9). No constant
+  changes -- `RATE_LIMIT_PER_MINUTE`/`RATE_LIMIT_PER_DAY` already matched --
+  but it settles the assumption #11's shared, process-wide `RateLimiter`
+  was built on, and confirms #13 through #16 are required rather than
+  nice-to-have for a hosted, multi-member deployment. Documented in
+  `README.md`, `docs/SETUP.md`, and at the constants themselves. Still
+  outstanding, and not something a pull request can close: filing WHOOP's
+  rate-limit increase request and recording its status.
 - **Support narrowed to the two newest stable Python releases, 3.13 and
   3.14.** `requires-python` was `>=3.10` while CI is the thing that decides
   what actually works, so the floor now matches the matrix instead of
