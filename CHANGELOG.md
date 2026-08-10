@@ -90,6 +90,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- WHOOP has confirmed the 100/minute and 10,000/day rate limits are **per
+  application** (this project's `client_id`), shared across every member
+  who has authorised it, not a separate budget per member (#9). No constant
+  changes -- `RATE_LIMIT_PER_MINUTE`/`RATE_LIMIT_PER_DAY` already matched --
+  but it settles the assumption #11's shared, process-wide `RateLimiter`
+  was built on, and confirms #13 through #16 are required rather than
+  nice-to-have for a hosted, multi-member deployment. Documented in
+  `README.md`, `docs/SETUP.md`, and at the constants themselves. Still
+  outstanding, and not something a pull request can close: filing WHOOP's
+  rate-limit increase request and recording its status.
 - **Support narrowed to the two newest stable Python releases, 3.13 and
   3.14.** `requires-python` was `>=3.10` while CI is the thing that decides
   what actually works, so the floor now matches the matrix instead of
