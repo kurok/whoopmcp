@@ -86,6 +86,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which can shift the "physiologically aligned" pairing by a day). This is
   a breaking change to `correlate_metrics`' response shape -- no flat,
   single-correlation mode remains.
+- `analysis.Trend`/`metric_trend` now report fit quality alongside the slope,
+  as a number (`r_squared`, reusing the existing `pearson` primitive on the
+  same day-offset/value series already fed to `linear_slope`) and as a word
+  (`fit_quality`: "strong"/"moderate"/"weak"/"negligible", with the bands
+  stated in code so the word never hides the number). `trend()` now refuses
+  below `MIN_TREND_SAMPLES` (8, mirroring `MIN_CORRELATION_SAMPLES`) rather
+  than returning a slope from too few points, and a metric with zero
+  variance now correctly refuses too (r² is undefined for a constant
+  series, where the slope alone wouldn't have caught it). Also new:
+  `rolling_7d`/`rolling_30d`/`rolling_90d`, calendar-day-deduplicated rolling
+  means, so the model can describe a trend's shape and not just its
+  direction. Windowed by date, not row count, with a minimum-periods rule
+  that resets after any gap at least as long as the window itself -- so the
+  first points after a long gap in a user's data don't get reported as a
+  full window's mean when they're really an average of whatever handful of
+  points the gap happened to leave nearby.
 
 ### Changed
 
