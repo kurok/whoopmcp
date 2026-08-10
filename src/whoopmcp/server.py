@@ -12,6 +12,7 @@ they state what the data is not (a diagnosis).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -21,6 +22,9 @@ from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 from whoopmcp.analysis import InsufficientDataError, correlate, summarize, trend
 from whoopmcp.auth import Authenticator, AuthError, build_store
@@ -103,7 +107,19 @@ async def _resolve_principal(client: WhoopClient) -> Principal | None:
 
 @asynccontextmanager
 async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
-    """Build the config, auth and HTTP client once, and tear them down cleanly."""
+    """Build the config, auth and HTTP client once, and tear them down cleanly.
+
+    Under streamable-http (#27) with more than one worker, each process gets
+    its own independent Authenticator, so the plain asyncio.Lock inside the
+    default InProcessRefreshLock no longer serialises refreshes across them.
+    A cross-process RefreshLock was deliberately NOT wired in here -- see the
+    "Known limitation" note on create_streamable_http_app() below for why a
+    lock alone (without changing Authenticator.refresh()'s internals, which
+    this issue's own acceptance criteria forbid) cannot actually prevent two
+    workers from both completing a refresh with the same soon-to-rotate
+    token. stdio keeps InProcessRefreshLock, unchanged, since it is always
+    exactly one process and this doesn't apply to it.
+    """
     config = Config.from_env()
     auth = Authenticator(config)
     async with WhoopClient(config, auth) as client:
@@ -127,6 +143,86 @@ def _ensure_principal(app: AppContext) -> Principal:
     return app.principal
 
 
+async def _check_token_store_reachable() -> tuple[bool, str]:
+    """Readiness check: the configured token store can be read without raising.
+
+    Builds its own ``Config.from_env()`` rather than reaching into the live
+    AppContext: a ``custom_route`` handler gets a plain Starlette ``Request``,
+    not the ``ctx.request_context.lifespan_context`` every MCP tool gets, and
+    under streamable-http the SDK keeps the resolved AppContext only on
+    ``StreamableHTTPSessionManager``'s own private ``_lifespan_state``
+    (`mcp/server/streamable_http_manager.py`, `StreamableHTTPSessionManager.run`)
+    -- there is no public accessor for it (`MCPServer.session_manager` exposes
+    the session manager itself, per its own docstring, "to enable advanced use
+    cases like mounting multiple MCPServer instances", but not that private
+    attribute). ``Config.from_env()`` is a pure, uncached read of the same
+    environment ``lifespan()`` itself reads, so this reconstructs an equal
+    ``Config`` rather than depending on SDK internals outside its public
+    contract.
+
+    A clean "not logged in yet" is not an infrastructure failure:
+    ``FileTokenStore.load()`` already returns ``None`` for that case rather
+    than raising, so it reports ready here exactly like a valid token would.
+    Only a genuine read failure -- a corrupt token file, a permissions error,
+    anything ``build_store(...).load()`` actually raises -- counts as not
+    ready.
+
+    Runs the (synchronous, possibly-blocking -- a local file read, or under
+    the keyring backend a real OS keychain call) store read in a thread, so
+    a contended or slow store can't stall the event loop this handler shares
+    with every other in-flight request. The detail string reports only the
+    exception's type, not its message: ``FileTokenStore``'s own error text
+    includes the token file's absolute path, which this endpoint has no
+    business handing to an unauthenticated caller polling /ready.
+    """
+    try:
+        await asyncio.to_thread(build_store(Config.from_env()).load)
+    except Exception as exc:
+        return False, type(exc).__name__
+    return True, "ok"
+
+
+#: Named, independent readiness checks: add a ``(name, check)`` pair here
+#: (e.g. a sync-freshness check once #13/#15 land) rather than restructuring
+#: the /ready handler itself.
+_READINESS_CHECKS: list[tuple[str, Callable[[], Awaitable[tuple[bool, str]]]]] = [
+    ("token_store_reachable", _check_token_store_reachable),
+]
+
+
+def _register_health_routes(server: MCPServer[AppContext]) -> None:
+    """Liveness and readiness for the streamable-http transport (#27).
+
+    Plain HTTP via ``custom_route``, not MCP tools: an operator's load
+    balancer or orchestrator polls these the same way it would for any other
+    service, without needing an MCP client to do it. Not reachable under
+    stdio -- there is no HTTP surface there -- so only streamable-http
+    deployments see these at all. Deliberately just liveness/readiness: no
+    OAuth-callback or webhook route belongs here (#17 is unbuilt and blocked
+    on #13; see the issue's own scope note).
+    """
+
+    @server.custom_route("/health", methods=["GET"])
+    async def health(_request: Request) -> Response:
+        # Liveness means "the process can respond", not "everything
+        # downstream works" -- must not touch AppContext/lifespan, so a
+        # problem inside the lifespan can't take this down too.
+        return JSONResponse({"status": "ok"})
+
+    @server.custom_route("/ready", methods=["GET"])
+    async def ready(_request: Request) -> Response:
+        checks: list[dict[str, Any]] = []
+        all_ok = True
+        for name, check in _READINESS_CHECKS:
+            ok, detail = await check()
+            checks.append({"name": name, "ok": ok, "detail": detail})
+            all_ok = all_ok and ok
+        return JSONResponse(
+            {"ready": all_ok, "checks": checks},
+            status_code=200 if all_ok else 503,
+        )
+
+
 def build_server() -> MCPServer[AppContext]:
     """Construct the server and register every tool on it."""
     server: MCPServer[AppContext] = MCPServer(
@@ -140,7 +236,50 @@ def build_server() -> MCPServer[AppContext]:
     _register_auth_tools(server)
     _register_data_tools(server)
     _register_analysis_tools(server)
+    _register_health_routes(server)
     return server
+
+
+def create_streamable_http_app() -> Starlette:
+    """ASGI app factory for running whoopmcp under multiple uvicorn workers (#27).
+
+    __main__.py's own ``build_server().run(transport="streamable-http", ...)``
+    is one uvicorn.Server in one process -- fine for a single worker. An
+    operator wanting multiple workers points uvicorn directly at this
+    factory instead of through __main__.py, e.g.::
+
+        uvicorn "whoopmcp.server:create_streamable_http_app" --factory --workers 4 --port 8000
+
+    Note: only ``config.http_host`` feeds into this call -- the installed SDK's
+    ``MCPServer.streamable_http_app()`` takes a ``host`` (used for its
+    DNS-rebinding-protection allowlist) but no ``port`` kwarg at all; a port is
+    a uvicorn-server concern, not an ASGI-app one, so ``config.http_port`` has
+    no equivalent here and the operator passes ``--port`` to uvicorn directly,
+    same as ``--workers``.
+
+    **Known limitation, deliberately not papered over**: each worker process
+    gets its own independent ``AppContext``/``Authenticator``, and nothing in
+    this codebase currently serialises a token refresh across them. A
+    cross-process ``RefreshLock`` was prototyped for this (SQLite-file-lock
+    backed) and then removed before merge: ``Authenticator.refresh()``
+    releases its lock before the network call completes, coordinating
+    within one process via a private ``asyncio.Future`` (issue #12's
+    single-flight design) that has no cross-process equivalent. A lock that
+    only covers the "am I already refreshing" check -- not the request
+    itself -- cannot stop two separate workers from each independently
+    reaching WHOOP with the same about-to-be-rotated refresh token, which
+    reproduces exactly the credential-destroying race #12 exists to prevent,
+    just across processes instead of within one. Actually closing this gap
+    means either changing ``Authenticator.refresh()`` to hold a lock across
+    the network call (a change to ``Authenticator`` itself) or a
+    compare-and-swap against a shared store (needs #13, not yet merged) --
+    a decision outside this issue's own scope, reported on #27 rather than
+    guessed at. Until resolved, run exactly one worker for token refresh, or
+    accept that a concurrent refresh under multiple workers can force a
+    re-login.
+    """
+    config = Config.from_env()
+    return build_server().streamable_http_app(host=config.http_host)
 
 
 # -- authentication --------------------------------------------------------

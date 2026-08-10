@@ -91,3 +91,35 @@ def test_rate_limit_config_from_env() -> None:
     overridden = Config.from_env(env)
     assert overridden.rate_limit_per_minute == 50
     assert overridden.rate_limit_per_day == 500
+
+
+# -- transport config (issue #27) -------------------------------------------
+
+
+def test_transport_defaults_to_stdio() -> None:
+    config = Config.from_env(VALID_ENV)
+
+    assert config.transport == "stdio"
+    assert config.http_host == "127.0.0.1"
+    assert config.http_port == 8000
+
+
+def test_transport_parses_from_env() -> None:
+    env = VALID_ENV | {
+        "WHOOPMCP_TRANSPORT": "streamable-http",
+        "WHOOPMCP_HTTP_HOST": "192.0.2.1",
+        "WHOOPMCP_HTTP_PORT": "9001",
+    }
+
+    config = Config.from_env(env)
+
+    assert config.transport == "streamable-http"
+    assert config.http_host == "192.0.2.1"
+    assert config.http_port == 9001
+
+
+def test_unknown_transport_is_rejected() -> None:
+    env = VALID_ENV | {"WHOOPMCP_TRANSPORT": "carrier-pigeon"}
+
+    with pytest.raises(ConfigError, match="stdio' or 'streamable-http"):
+        Config.from_env(env)

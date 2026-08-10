@@ -30,6 +30,10 @@ dependencies = [
     "mcp>=2.0,<3",
     "httpx>=0.28,<1",
     "pydantic>=2.9,<3",
+    # Already pulled in transitively by mcp (its own HTTP transport is built
+    # on it) -- declared directly here too since server.py now imports it by
+    # name for the /health and /ready routes (#27), not just through the SDK.
+    "starlette>=1.0,<2",
 ]
 
 [project.optional-dependencies]

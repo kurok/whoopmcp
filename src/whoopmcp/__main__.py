@@ -19,8 +19,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--transport",
         choices=("stdio", "streamable-http"),
-        default="stdio",
-        help="stdio (default) is what MCP clients launch; streamable-http is for local testing.",
+        default=None,
+        help=(
+            "stdio is what MCP clients launch; streamable-http serves the MCP endpoint "
+            "over HTTP (#27). Defaults to WHOOPMCP_TRANSPORT (itself 'stdio' if unset) "
+            "when omitted, so CLI silence never overrides an operator's env var."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Bind host for --transport streamable-http. Defaults to WHOOPMCP_HTTP_HOST.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port for --transport streamable-http. Defaults to WHOOPMCP_HTTP_PORT.",
     )
     parser.add_argument(
         "--log-level",
@@ -46,13 +61,20 @@ def main(argv: list[str] | None = None) -> int:
     # `except ConfigError` there would miss it and the user would get a
     # traceback instead of the one line telling them which variable is unset.
     try:
-        Config.from_env()
+        config = Config.from_env()
     except ConfigError as exc:
         print(f"whoopmcp: {exc}", file=sys.stderr)
         return 2
 
+    transport = args.transport if args.transport is not None else config.transport
+    host = args.host if args.host is not None else config.http_host
+    port = args.port if args.port is not None else config.http_port
+
     try:
-        build_server().run(transport=args.transport)
+        if transport == "streamable-http":
+            build_server().run(transport="streamable-http", host=host, port=port)
+        else:
+            build_server().run(transport="stdio")
     except KeyboardInterrupt:  # pragma: no cover
         return 130
     return 0

@@ -258,6 +258,25 @@ class RefreshLock(Protocol):
     Deliberately just a mutex, not asyncio.Lock by name: hosted mode (#27,
     #30) needs one that holds across processes, and should be able to
     supply it here without any change to Authenticator.
+
+    Caution for whoever builds that cross-process implementation (#27
+    prototyped one, SQLite-file-lock backed, and removed it before merge):
+    a lock alone is not sufficient. refresh() below coordinates within one
+    process via a private asyncio.Future -- the lock only guards "is a
+    refresh already in flight," and is released before the network call
+    completes, relying on that Future (with no cross-process equivalent)
+    to make every other in-process caller await the SAME request rather
+    than starting their own. A cross-process RefreshLock that is merely
+    held-then-released around that same check, without also covering the
+    network call itself, does not stop two separate processes from each
+    independently completing a refresh with the same about-to-rotate
+    refresh token -- which reproduces the exact credential-destroying race
+    this whole mechanism exists to prevent, just across processes instead
+    of within one. Closing that gap for real means either holding the lock
+    across the network request (a change to this method, which the
+    original ask for this Protocol explicitly wanted to avoid) or a
+    compare-and-swap against a shared store keyed on the token's own
+    identity (needs #13). See #27 for the discovery and reasoning.
     """
 
     async def acquire(self) -> None: ...
