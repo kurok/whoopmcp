@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RateLimitedError` on 429 (carrying `X-RateLimit-Reset` as `retry_after` when
   present), and `.paginate` walks `nextToken` bounded by a `max_records` default
   of 1000 rather than an unbounded default that could exhaust the daily quota.
+- The eight data tools (`get_profile`, `get_body_measurement`, `list_recoveries`,
+  `list_sleeps`, `list_cycles`, `list_workouts`, `get_sleep`, `get_workout`) are
+  now wired to `WhoopClient`. Each trims a raw WHOOP record down to the fields
+  its own docstring promises, keeping `score_state` even on an unscored record;
+  the four list tools gained a `next_token` parameter, surface WHOOP's cursor
+  and a note when a range was truncated, and default to the last 7 days when
+  both `start` and `end` are omitted (skipped on a continuation call, so a
+  `next_token` isn't paired with a freshly-generated date window). A
+  `RateLimitedError` now returns a retry hint instead of a raw traceback.
 - The four auth tools (`whoop_auth_status`, `whoop_login`, `whoop_complete_login`,
   `whoop_logout`) are now wired to `Authenticator`. `whoop_auth_status` reads the
   token store directly rather than through `access_token()`, so checking status

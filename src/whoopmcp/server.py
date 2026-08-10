@@ -13,17 +13,17 @@ they state what the data is not (a diagnosis).
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
 from whoopmcp.auth import Authenticator, build_store
-from whoopmcp.client import WhoopClient
+from whoopmcp.client import RateLimitedError, WhoopClient
 from whoopmcp.config import Config
 
 logger = logging.getLogger("whoopmcp")
@@ -179,57 +179,238 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
 
 # -- raw data --------------------------------------------------------------
 
+#: Default lookback for the four list tools when the caller gives neither
+#: end of the range.
+_DEFAULT_LOOKBACK = timedelta(days=7)
+
+
+async def _guard_rate_limit(
+    build_response: Callable[[], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Run a data-tool body, turning a RateLimitedError into something a model can act on.
+
+    A raw RateLimitedError would otherwise propagate as an opaque ToolError;
+    a model can't retry sensibly without knowing when to.
+    """
+    try:
+        return await build_response()
+    except RateLimitedError as exc:
+        message = (
+            f"WHOOP rate limit hit; retry after {exc.retry_after:.0f} seconds."
+            if exc.retry_after is not None
+            else "WHOOP rate limit hit; retry after a short delay."
+        )
+        return {"error": "rate_limited", "retry_after_seconds": exc.retry_after, "message": message}
+
+
+def _default_range(
+    start: datetime | str | None, end: datetime | str | None, next_token: str | None
+) -> tuple[datetime | str | None, datetime | str | None]:
+    """Default a wholly-unspecified range to the last 7 days; leave any partial range alone.
+
+    Skipped entirely when ``next_token`` is set: that call is continuing a
+    previous page, and layering a fresh "now minus 7 days" window on top of
+    an opaque WHOOP cursor is exactly the kind of thing that could silently
+    change what the cursor even means. Leaving start/end as None there means
+    the request carries only the cursor (and limit), which is what "pass
+    next_token to continue" promises.
+    """
+    if start is None and end is None and next_token is None:
+        end = datetime.now(UTC)
+        start = end - _DEFAULT_LOOKBACK
+    return start, end
+
+
+def _trim_recovery(record: dict[str, Any]) -> dict[str, Any]:
+    trimmed: dict[str, Any] = {
+        "cycle_id": record.get("cycle_id"),
+        "created_at": record.get("created_at"),
+        "score_state": record.get("score_state"),
+    }
+    if record.get("score_state") == "SCORED":
+        score = record.get("score") or {}
+        trimmed["recovery_score"] = score.get("recovery_score")
+        trimmed["hrv_rmssd_milli"] = score.get("hrv_rmssd_milli")
+        trimmed["resting_heart_rate"] = score.get("resting_heart_rate")
+    return trimmed
+
+
+def _trim_sleep(record: dict[str, Any]) -> dict[str, Any]:
+    trimmed: dict[str, Any] = {
+        "id": record.get("id"),
+        "start": record.get("start"),
+        "end": record.get("end"),
+        "nap": record.get("nap"),
+        "score_state": record.get("score_state"),
+    }
+    if record.get("score_state") == "SCORED":
+        score = record.get("score") or {}
+        trimmed["sleep_performance_percentage"] = score.get("sleep_performance_percentage")
+        trimmed["sleep_efficiency_percentage"] = score.get("sleep_efficiency_percentage")
+        trimmed["respiratory_rate"] = score.get("respiratory_rate")
+        stages = score.get("stage_summary") or {}
+        trimmed["stage_durations_milli"] = {
+            "awake": stages.get("total_awake_time_milli"),
+            "light": stages.get("total_light_sleep_time_milli"),
+            "deep": stages.get("total_slow_wave_sleep_time_milli"),
+            "rem": stages.get("total_rem_sleep_time_milli"),
+        }
+    return trimmed
+
+
+def _trim_cycle(record: dict[str, Any]) -> dict[str, Any]:
+    trimmed: dict[str, Any] = {
+        "id": record.get("id"),
+        "start": record.get("start"),
+        "end": record.get("end"),
+        "score_state": record.get("score_state"),
+    }
+    if record.get("score_state") == "SCORED":
+        score = record.get("score") or {}
+        trimmed["strain"] = score.get("strain")
+        trimmed["average_heart_rate"] = score.get("average_heart_rate")
+        trimmed["max_heart_rate"] = score.get("max_heart_rate")
+        trimmed["kilojoule"] = score.get("kilojoule")
+    return trimmed
+
+
+def _trim_workout(record: dict[str, Any]) -> dict[str, Any]:
+    trimmed: dict[str, Any] = {
+        "id": record.get("id"),
+        "sport_name": record.get("sport_name"),
+        "start": record.get("start"),
+        "end": record.get("end"),
+        "score_state": record.get("score_state"),
+    }
+    if record.get("score_state") == "SCORED":
+        score = record.get("score") or {}
+        trimmed["strain"] = score.get("strain")
+        trimmed["average_heart_rate"] = score.get("average_heart_rate")
+        trimmed["max_heart_rate"] = score.get("max_heart_rate")
+        zones = score.get("zone_duration") or {}
+        trimmed["zone_durations_milli"] = {
+            "zone_zero": zones.get("zone_zero_milli"),
+            "zone_one": zones.get("zone_one_milli"),
+            "zone_two": zones.get("zone_two_milli"),
+            "zone_three": zones.get("zone_three_milli"),
+            "zone_four": zones.get("zone_four_milli"),
+            "zone_five": zones.get("zone_five_milli"),
+        }
+    return trimmed
+
 
 def _register_data_tools(server: MCPServer[AppContext]) -> None:
     @server.tool(name="get_profile", title="Get WHOOP profile", annotations=READ_ONLY)
-    async def get_profile() -> dict[str, Any]:
-        """Return the user's WHOOP profile: user id, email, first and last name.
+    async def get_profile(ctx: Context[AppContext, Any]) -> dict[str, Any]:
+        """Return the user's WHOOP profile: user id, email, first and last name."""
+        app = ctx.request_context.lifespan_context
 
-        TODO(#5): delegate to WhoopClient.get_profile.
-        """
-        raise NotImplementedError("get_profile is not implemented yet -- see issue #5")
+        async def _fetch() -> dict[str, Any]:
+            return await app.client.get_profile()
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="get_body_measurement", title="Get body measurements", annotations=READ_ONLY)
-    async def get_body_measurement() -> dict[str, Any]:
-        """Return height in metres, weight in kilograms and max heart rate in bpm.
+    async def get_body_measurement(ctx: Context[AppContext, Any]) -> dict[str, Any]:
+        """Return height in metres, weight in kilograms and max heart rate in bpm."""
+        app = ctx.request_context.lifespan_context
 
-        TODO(#5): delegate to WhoopClient.get_body_measurement.
-        """
-        raise NotImplementedError("get_body_measurement is not implemented yet -- see issue #5")
+        async def _fetch() -> dict[str, Any]:
+            return await app.client.get_body_measurement()
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="list_recoveries", title="List recoveries", annotations=READ_ONLY)
     async def list_recoveries(
-        start: str | None = None, end: str | None = None, limit: int = 25
+        ctx: Context[AppContext, Any],
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 25,
+        next_token: str | None = None,
     ) -> dict[str, Any]:
         """List recovery records: recovery score (%), HRV (ms) and resting heart rate (bpm).
 
         Args:
             start: ISO 8601 start of the range, e.g. "2026-07-01T00:00:00Z".
+                Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
             limit: Records to return, capped at 25 per page by WHOOP.
-
-        TODO(#5): delegate to WhoopClient.list_recoveries.
+            next_token: Cursor from a previous truncated response, to continue
+                that page.
         """
-        raise NotImplementedError("list_recoveries is not implemented yet -- see issue #5")
+        app = ctx.request_context.lifespan_context
+        range_start, range_end = _default_range(start, end, next_token)
+
+        async def _fetch() -> dict[str, Any]:
+            page = await app.client.list_recoveries(
+                start=range_start, end=range_end, limit=limit, next_token=next_token
+            )
+            records = [_trim_recovery(r) for r in page.records]
+            result: dict[str, Any] = {
+                "records": records,
+                "count": len(records),
+                "next_token": page.next_token,
+            }
+            if page.next_token is not None:
+                result["note"] = (
+                    f"Only {len(records)} record(s) in this range were returned; WHOOP "
+                    "paginates and has more records. Pass "
+                    f"next_token={page.next_token!r} to this tool to continue, "
+                    "or narrow the date range."
+                )
+            return result
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="list_sleeps", title="List sleeps", annotations=READ_ONLY)
     async def list_sleeps(
-        start: str | None = None, end: str | None = None, limit: int = 25
+        ctx: Context[AppContext, Any],
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 25,
+        next_token: str | None = None,
     ) -> dict[str, Any]:
         """List sleep records: performance (%), efficiency, and stage durations in milliseconds.
 
         Args:
             start: ISO 8601 start of the range.
+                Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
             limit: Records to return, capped at 25 per page by WHOOP.
-
-        TODO(#5): delegate to WhoopClient.list_sleeps.
+            next_token: Cursor from a previous truncated response, to continue
+                that page.
         """
-        raise NotImplementedError("list_sleeps is not implemented yet -- see issue #5")
+        app = ctx.request_context.lifespan_context
+        range_start, range_end = _default_range(start, end, next_token)
+
+        async def _fetch() -> dict[str, Any]:
+            page = await app.client.list_sleeps(
+                start=range_start, end=range_end, limit=limit, next_token=next_token
+            )
+            records = [_trim_sleep(r) for r in page.records]
+            result: dict[str, Any] = {
+                "records": records,
+                "count": len(records),
+                "next_token": page.next_token,
+            }
+            if page.next_token is not None:
+                result["note"] = (
+                    f"Only {len(records)} record(s) in this range were returned; WHOOP "
+                    "paginates and has more records. Pass "
+                    f"next_token={page.next_token!r} to this tool to continue, "
+                    "or narrow the date range."
+                )
+            return result
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="list_cycles", title="List cycles", annotations=READ_ONLY)
     async def list_cycles(
-        start: str | None = None, end: str | None = None, limit: int = 25
+        ctx: Context[AppContext, Any],
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 25,
+        next_token: str | None = None,
     ) -> dict[str, Any]:
         """List physiological cycles: day strain (0-21), average and max heart rate, kilojoules.
 
@@ -238,43 +419,99 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
 
         Args:
             start: ISO 8601 start of the range.
+                Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
             limit: Records to return, capped at 25 per page by WHOOP.
-
-        TODO(#5): delegate to WhoopClient.list_cycles.
+            next_token: Cursor from a previous truncated response, to continue
+                that page.
         """
-        raise NotImplementedError("list_cycles is not implemented yet -- see issue #5")
+        app = ctx.request_context.lifespan_context
+        range_start, range_end = _default_range(start, end, next_token)
+
+        async def _fetch() -> dict[str, Any]:
+            page = await app.client.list_cycles(
+                start=range_start, end=range_end, limit=limit, next_token=next_token
+            )
+            records = [_trim_cycle(r) for r in page.records]
+            result: dict[str, Any] = {
+                "records": records,
+                "count": len(records),
+                "next_token": page.next_token,
+            }
+            if page.next_token is not None:
+                result["note"] = (
+                    f"Only {len(records)} record(s) in this range were returned; WHOOP "
+                    "paginates and has more records. Pass "
+                    f"next_token={page.next_token!r} to this tool to continue, "
+                    "or narrow the date range."
+                )
+            return result
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="list_workouts", title="List workouts", annotations=READ_ONLY)
     async def list_workouts(
-        start: str | None = None, end: str | None = None, limit: int = 25
+        ctx: Context[AppContext, Any],
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 25,
+        next_token: str | None = None,
     ) -> dict[str, Any]:
         """List workouts: sport, strain, average and max heart rate, and heart-rate zone durations.
 
         Args:
             start: ISO 8601 start of the range.
+                Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
             limit: Records to return, capped at 25 per page by WHOOP.
-
-        TODO(#5): delegate to WhoopClient.list_workouts.
+            next_token: Cursor from a previous truncated response, to continue
+                that page.
         """
-        raise NotImplementedError("list_workouts is not implemented yet -- see issue #5")
+        app = ctx.request_context.lifespan_context
+        range_start, range_end = _default_range(start, end, next_token)
+
+        async def _fetch() -> dict[str, Any]:
+            page = await app.client.list_workouts(
+                start=range_start, end=range_end, limit=limit, next_token=next_token
+            )
+            records = [_trim_workout(r) for r in page.records]
+            result: dict[str, Any] = {
+                "records": records,
+                "count": len(records),
+                "next_token": page.next_token,
+            }
+            if page.next_token is not None:
+                result["note"] = (
+                    f"Only {len(records)} record(s) in this range were returned; WHOOP "
+                    "paginates and has more records. Pass "
+                    f"next_token={page.next_token!r} to this tool to continue, "
+                    "or narrow the date range."
+                )
+            return result
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="get_sleep", title="Get one sleep", annotations=READ_ONLY)
-    async def get_sleep(sleep_id: str) -> dict[str, Any]:
-        """Return a single sleep by its v2 UUID.
+    async def get_sleep(sleep_id: str, ctx: Context[AppContext, Any]) -> dict[str, Any]:
+        """Return a single sleep by its v2 UUID."""
+        app = ctx.request_context.lifespan_context
 
-        TODO(#5): delegate to WhoopClient.get_sleep.
-        """
-        raise NotImplementedError("get_sleep is not implemented yet -- see issue #5")
+        async def _fetch() -> dict[str, Any]:
+            record = await app.client.get_sleep(sleep_id)
+            return _trim_sleep(record)
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="get_workout", title="Get one workout", annotations=READ_ONLY)
-    async def get_workout(workout_id: str) -> dict[str, Any]:
-        """Return a single workout by its v2 UUID.
+    async def get_workout(workout_id: str, ctx: Context[AppContext, Any]) -> dict[str, Any]:
+        """Return a single workout by its v2 UUID."""
+        app = ctx.request_context.lifespan_context
 
-        TODO(#5): delegate to WhoopClient.get_workout.
-        """
-        raise NotImplementedError("get_workout is not implemented yet -- see issue #5")
+        async def _fetch() -> dict[str, Any]:
+            record = await app.client.get_workout(workout_id)
+            return _trim_workout(record)
+
+        return await _guard_rate_limit(_fetch)
 
 
 # -- analysis --------------------------------------------------------------
