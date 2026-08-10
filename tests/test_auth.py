@@ -8,9 +8,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+import respx
 
 from whoopmcp.auth import (
     AUTHORIZE_URL,
+    TOKEN_URL,
     Authenticator,
     AuthError,
     FileTokenStore,
@@ -185,17 +187,205 @@ def test_logout_forgets_the_pending_login(config: Config) -> None:
         auth.verify_state("anything")
 
 
-# -- not yet implemented ---------------------------------------------------
-#
-# These pin the contract the network layer must satisfy, and fail loudly the
-# moment someone implements one without deleting its guard here.
+# -- exchange_code --------------------------------------------------------
 
 
-async def test_exchange_code_is_not_implemented(config: Config) -> None:
-    with pytest.raises(NotImplementedError, match="issue #1"):
-        await Authenticator(config).exchange_code("code")
+@respx.mock
+async def test_exchange_code_posts_correct_form_and_returns_token(config: Config) -> None:
+    route = respx.post(TOKEN_URL).mock(
+        return_value=respx.MockResponse(
+            200,
+            json={
+                "access_token": "new-access-token",
+                "expires_in": 3600,
+                "refresh_token": "new-refresh-token",
+                "scope": "read:sleep offline",
+            },
+        )
+    )
+
+    auth = Authenticator(config)
+    token = await auth.exchange_code("auth-code-123")
+
+    assert token.access_token == "new-access-token"
+    assert token.refresh_token == "new-refresh-token"
+    assert token.scopes == ("read:sleep", "offline")
+    assert route.called
+    request = route.calls.last.request
+    assert request.content == (
+        b"grant_type=authorization_code&code=auth-code-123&"
+        b"client_id=cid&client_secret=csecret&"
+        b"redirect_uri=https%3A%2F%2Flocalhost%3A8443%2Fcallback"
+    )
+    # Verify token was persisted
+    assert FileTokenStore(config.token_path).load() == token
 
 
-async def test_access_token_is_not_implemented(config: Config) -> None:
-    with pytest.raises(NotImplementedError, match="issue #1"):
-        await Authenticator(config).access_token()
+@respx.mock
+async def test_exchange_code_400_response_raises_auth_error_without_leaking_secret(
+    config: Config,
+) -> None:
+    respx.post(TOKEN_URL).mock(
+        return_value=respx.MockResponse(
+            400,
+            json={
+                "error": "invalid_grant",
+                "error_description": "The authorization code is invalid.",
+            },
+        )
+    )
+
+    auth = Authenticator(config)
+    with pytest.raises(AuthError) as exc_info:
+        await auth.exchange_code("bad-code")
+
+    assert "csecret" not in str(exc_info.value)
+
+
+# -- refresh ---------------------------------------------------------------
+
+
+@respx.mock
+async def test_refresh_posts_correct_form_and_rotates_token(config: Config) -> None:
+    old_token = Token(
+        "old-access",
+        expires_at=1000.0,
+        refresh_token="old-refresh",
+        scopes=("read:sleep", "offline"),
+    )
+
+    route = respx.post(TOKEN_URL).mock(
+        return_value=respx.MockResponse(
+            200,
+            json={
+                "access_token": "new-access-token",
+                "expires_in": 3600,
+                "refresh_token": "new-refresh-token",
+                "scope": "read:sleep offline",
+            },
+        )
+    )
+
+    auth = Authenticator(config)
+    new_token = await auth.refresh(old_token)
+
+    assert new_token.access_token == "new-access-token"
+    assert new_token.refresh_token == "new-refresh-token"
+    assert new_token.refresh_token != old_token.refresh_token
+    assert route.called
+    request = route.calls.last.request
+    assert b"grant_type=refresh_token" in request.content
+    assert b"refresh_token=old-refresh" in request.content
+    assert b"client_id=cid" in request.content
+    assert b"client_secret=csecret" in request.content
+    assert b"scope=offline" in request.content
+    # Verify the new token (not the old one) was persisted
+    persisted = FileTokenStore(config.token_path).load()
+    assert persisted == new_token
+    assert persisted.refresh_token == "new-refresh-token"
+
+
+@respx.mock
+async def test_refresh_400_response_raises_auth_error_without_leaking_secret(
+    config: Config,
+) -> None:
+    old_token = Token("old-access", expires_at=1000.0, refresh_token="old-refresh")
+
+    respx.post(TOKEN_URL).mock(
+        return_value=respx.MockResponse(
+            400,
+            json={
+                "error": "invalid_grant",
+                "error_description": "Refresh token is expired.",
+            },
+        )
+    )
+
+    auth = Authenticator(config)
+    with pytest.raises(AuthError) as exc_info:
+        await auth.refresh(old_token)
+
+    assert "csecret" not in str(exc_info.value)
+
+
+# -- access_token ----------------------------------------------------------
+
+
+async def test_access_token_returns_non_expired_token_without_http_call(
+    config: Config,
+) -> None:
+    # Pre-populate the store with a non-expired token.
+    store = FileTokenStore(config.token_path)
+    token = Token(
+        "cached-access",
+        expires_at=time.time() + 3600,
+        refresh_token="cached-refresh",
+    )
+    store.save(token)
+
+    with respx.mock:
+        # If we use respx.post, any POST call will fail the route. This confirms
+        # no HTTP call is made.
+        route = respx.post(TOKEN_URL)
+
+        auth = Authenticator(config)
+        result = await auth.access_token()
+
+        assert result == "cached-access"
+        assert not route.called
+
+
+@respx.mock
+async def test_access_token_refreshes_expired_token_with_refresh_token(
+    config: Config,
+) -> None:
+    # Pre-populate the store with an expired token that has a refresh token.
+    store = FileTokenStore(config.token_path)
+    expired_token = Token(
+        "expired-access",
+        expires_at=time.time() - 100,
+        refresh_token="expired-refresh",
+    )
+    store.save(expired_token)
+
+    route = respx.post(TOKEN_URL).mock(
+        return_value=respx.MockResponse(
+            200,
+            json={
+                "access_token": "new-access-token",
+                "expires_in": 3600,
+                "refresh_token": "new-refresh-token",
+                "scope": "read:sleep offline",
+            },
+        )
+    )
+
+    auth = Authenticator(config)
+    result = await auth.access_token()
+
+    assert result == "new-access-token"
+    assert route.called
+
+
+@pytest.mark.asyncio
+async def test_access_token_raises_auth_error_when_expired_with_no_refresh_token(
+    config: Config,
+) -> None:
+    # Pre-populate the store with an expired token with no refresh token.
+    store = FileTokenStore(config.token_path)
+    expired_token = Token("expired-access", expires_at=time.time() - 100)
+    store.save(expired_token)
+
+    auth = Authenticator(config)
+    with pytest.raises(AuthError, match="whoop_login"):
+        await auth.access_token()
+
+
+@pytest.mark.asyncio
+async def test_access_token_raises_auth_error_when_no_stored_token(
+    config: Config,
+) -> None:
+    # Do not pre-populate the store.
+    auth = Authenticator(config)
+    with pytest.raises(AuthError, match="whoop_login"):
+        await auth.access_token()

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Authenticator.exchange_code`, `.refresh`, and `.access_token` now talk to WHOOP:
+  form-encoded POSTs to the token endpoint wrapped into `Token` and persisted via
+  the configured store, with `access_token()` refreshing an expired token automatically
+  and persisting WHOOP's rotated refresh token.
+
 ### Changed
 
 - **Support narrowed to the two newest stable Python releases, 3.13 and

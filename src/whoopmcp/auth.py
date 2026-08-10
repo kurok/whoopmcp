@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlencode
 
+import httpx
+
 from whoopmcp.config import Config
 
 AUTHORIZE_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
@@ -215,6 +217,27 @@ def build_authorize_url(config: Config, *, state: str | None = None) -> tuple[st
     return f"{AUTHORIZE_URL}?{query}", state
 
 
+def _raise_for_token_error(response: httpx.Response) -> None:
+    """Turn a non-2xx token-endpoint response into an AuthError.
+
+    Only WHOOP's own ``error``/``error_description`` fields are echoed back
+    -- never the request we sent, since that is where the client secret and
+    any refresh/authorization code live.
+    """
+    if response.is_success:
+        return
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    error = payload.get("error", "unknown_error") if isinstance(payload, dict) else "unknown_error"
+    description = payload.get("error_description") if isinstance(payload, dict) else None
+    message = f"WHOOP token endpoint returned {response.status_code} ({error})"
+    if description:
+        message += f": {description}"
+    raise AuthError(message)
+
+
 class Authenticator:
     """Owns the token lifecycle: exchange, refresh, persist, revoke."""
 
@@ -238,31 +261,58 @@ class Authenticator:
             raise AuthError("state mismatch; discarding this authorization code")
 
     async def exchange_code(self, code: str) -> Token:
-        """Trade an authorization code for a token, and persist it.
-
-        TODO(#1): POST to TOKEN_URL with grant_type=authorization_code,
-        code, client_id, client_secret and redirect_uri as form-encoded body;
-        wrap the response with Token.from_response and self._store.save.
-        """
-        raise NotImplementedError("exchange_code is not implemented yet -- see issue #1")
+        """Trade an authorization code for a token, and persist it."""
+        async with httpx.AsyncClient(timeout=self._config.request_timeout) as client:
+            response = await client.post(
+                TOKEN_URL,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "client_id": self._config.client_id,
+                    "client_secret": self._config.client_secret,
+                    "redirect_uri": self._config.redirect_uri,
+                },
+            )
+        _raise_for_token_error(response)
+        token = Token.from_response(response.json())
+        self._store.save(token)
+        self._token = token
+        return token
 
     async def refresh(self, token: Token) -> Token:
-        """Renew an expired token using its refresh token.
-
-        TODO(#1): POST to TOKEN_URL with grant_type=refresh_token,
-        refresh_token, client_id, client_secret and scope=offline. WHOOP
-        rotates refresh tokens, so the new one must replace the stored one.
-        """
-        raise NotImplementedError("refresh is not implemented yet -- see issue #1")
+        """Renew an expired token using its refresh token."""
+        async with httpx.AsyncClient(timeout=self._config.request_timeout) as client:
+            response = await client.post(
+                TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": token.refresh_token,
+                    "client_id": self._config.client_id,
+                    "client_secret": self._config.client_secret,
+                    "scope": "offline",
+                },
+            )
+        _raise_for_token_error(response)
+        new_token = Token.from_response(response.json())
+        self._store.save(new_token)
+        self._token = new_token
+        return new_token
 
     async def access_token(self) -> str:
-        """Return a valid access token, refreshing it if necessary.
-
-        TODO(#1): load from the store on first call, refresh when expired,
-        and raise AuthError with a "run whoop_login" hint when there is
-        nothing to refresh.
-        """
-        raise NotImplementedError("access_token is not implemented yet -- see issue #1")
+        """Return a valid access token, refreshing it if necessary."""
+        if self._token is None:
+            self._token = self._store.load()
+        token = self._token
+        if token is None:
+            raise AuthError("no stored credentials found; run whoop_login to authenticate")
+        if token.expired:
+            if token.refresh_token is None:
+                raise AuthError(
+                    "stored token is expired and has no refresh token; run whoop_login "
+                    "to authenticate"
+                )
+            token = await self.refresh(token)
+        return token.access_token
 
     def logout(self) -> None:
         """Forget the local token. Does not revoke it server-side."""
