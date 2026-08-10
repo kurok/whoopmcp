@@ -154,6 +154,13 @@ with `X-RateLimit-*` headers and a `429` on breach. Collections page at 25
 records maximum. Ask for explicit date ranges; an unbounded walk over years
 of history will exhaust the quota and the model's context window alike.
 
+Confirmed with WHOOP: the limit is **per application** (your `client_id`),
+shared across every member who has authorised it — not a separate budget
+per member. Running this locally for one person, that distinction is
+invisible. Hosting it for several, it is the whole budget: one member's
+two-year backfill is roughly 110 requests, about a minute of the *entire*
+app's per-minute quota (#9).
+
 ---
 
 ## Development
