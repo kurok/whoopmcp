@@ -6,16 +6,20 @@ from typing import Any
 import pytest
 
 from whoopmcp.analysis import (
+    DEFAULT_LAG_SWEEP,
     MIN_CORRELATION_SAMPLES,
     Correlation,
     InsufficientDataError,
+    LagResult,
     Summary,
     Trend,
     correlate,
+    correlate_lag_sweep,
     extract_metric,
     linear_slope,
     mean,
     pearson,
+    spearman,
     stdev,
     summarize,
     trend,
@@ -428,3 +432,318 @@ def test_correlate_sufficient_matched_pairs() -> None:
     assert result.count == MIN_CORRELATION_SAMPLES
     # Should be a strong positive correlation (both ascending linearly)
     assert result.r > 0.9
+
+
+def test_correlate_result_gains_spearman_r_unchanged_otherwise() -> None:
+    """correlate() keeps every existing field's exact behavior; spearman_r is additive.
+
+    Reuses test_correlate_joins_on_cycle_id's own fixture and assertions
+    verbatim, then checks the one new field.
+    """
+    records_a = [
+        scored_record(f"2026-08-{i:02d}T06:00:00Z", recovery_score=float(i * 10), cycle_id=i)
+        for i in range(1, 10)
+    ]
+    records_b = [
+        scored_record(f"2026-08-{i:02d}T07:00:00Z", strain=float(i * 2), cycle_id=i)
+        for i in range(1, 9)
+    ] + [
+        scored_record("2026-08-15T07:00:00Z", strain=999.0, cycle_id=100),
+    ]
+
+    result = correlate(records_a, "recovery_score", records_b, "strain")
+
+    # Unchanged: identical to test_correlate_joins_on_cycle_id.
+    assert result.count == 8
+    assert result.r == pytest.approx(1.0, abs=0.01)
+    # New: additive field, same near-perfect value since the relationship
+    # is both linear and monotonic (a=10*i, b=2*i).
+    assert result.spearman_r == pytest.approx(1.0, abs=0.01)
+
+
+# -- spearman ----------------------------------------------------------------
+
+
+def test_spearman_perfect_positive_relationship() -> None:
+    assert spearman([1.0, 2.0, 3.0], [10.0, 20.0, 30.0]) == pytest.approx(1.0)
+
+
+def test_spearman_perfect_negative_relationship() -> None:
+    assert spearman([1.0, 2.0, 3.0], [30.0, 20.0, 10.0]) == pytest.approx(-1.0)
+
+
+def test_spearman_handles_tied_ranks() -> None:
+    """Ties are resolved by average rank, matching a hand-computed value.
+
+    xs = [1, 2, 2, 3] -> ranks [1, 2.5, 2.5, 4] (the two 2s share the average
+    of positions 2 and 3). ys = [10, 20, 20, 40] -> ranks [1, 2.5, 2.5, 4],
+    the identical rank pattern, so Spearman's rho is exactly 1.0.
+    """
+    xs = [1.0, 2.0, 2.0, 3.0]
+    ys = [10.0, 20.0, 20.0, 40.0]
+    assert spearman(xs, ys) == pytest.approx(1.0)
+
+
+def test_spearman_ties_diverge_from_a_no_tie_series() -> None:
+    """A hand-computed, non-trivial tied case: ranks differ from raw values.
+
+    xs = [10, 20, 20, 30] -> ranks [1, 2.5, 2.5, 4] (the two 20s tie for
+    positions 2 and 3, averaging to 2.5).
+    ys = [5, 1, 9, 2]      -> ascending order is 1, 2, 5, 9, so ranks are
+    [3, 1, 4, 2] (5 is 3rd-smallest, 1 is smallest, 9 is largest, 2 is
+    2nd-smallest) -- ys has no ties of its own.
+    Spearman = pearson([1, 2.5, 2.5, 4], [3, 1, 4, 2]).
+    mean(rank_x) = 2.5, mean(rank_y) = 2.5.
+    dx = [-1.5, 0, 0, 1.5]; dy = [0.5, -1.5, 1.5, -0.5]
+    sum(dx*dy) = -0.75 + 0 + 0 - 0.75 = -1.5
+    sum(dx^2) = 2.25+0+0+2.25 = 4.5; sum(dy^2) = 0.25+2.25+2.25+0.25 = 5.0
+    rho = -1.5 / (sqrt(4.5) * sqrt(5.0)) = -1.5 / sqrt(22.5) ~= -0.31623
+    """
+    xs = [10.0, 20.0, 20.0, 30.0]
+    ys = [5.0, 1.0, 9.0, 2.0]
+    assert spearman(xs, ys) == pytest.approx(-1.5 / (4.5**0.5 * 5.0**0.5), rel=1e-6)
+
+
+def test_spearman_constant_series_is_undefined_not_zero() -> None:
+    """Every value tied means every rank is identical -- zero rank-variance,
+    the same "undefined, not zero" contract pearson() already has."""
+    with pytest.raises(InsufficientDataError):
+        spearman([1.0, 1.0, 1.0], [1.0, 2.0, 3.0])
+    with pytest.raises(InsufficientDataError):
+        spearman([1.0, 2.0, 3.0], [5.0, 5.0, 5.0])
+
+
+def test_spearman_rejects_mismatched_lengths() -> None:
+    with pytest.raises(ValueError, match="length mismatch"):
+        spearman([1.0, 2.0], [1.0])
+
+
+def test_spearman_needs_at_least_two_pairs() -> None:
+    with pytest.raises(InsufficientDataError):
+        spearman([1.0], [1.0])
+
+
+def test_spearman_diverges_from_pearson_on_nonlinear_monotonic_series() -> None:
+    """y = x^3 is monotonic but not linear: Spearman stays at 1.0 (rank order
+    is preserved exactly), Pearson is pulled down by the curvature."""
+    xs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    ys = [x**3 for x in xs]
+    assert spearman(xs, ys) == pytest.approx(1.0)
+    assert pearson(xs, ys) < 0.99
+
+
+# -- correlate_lag_sweep ------------------------------------------------------
+
+
+def test_lag_sweep_sign_convention_positive_lag_is_metric_a_leading() -> None:
+    """THE SIGN TEST. Write this first; the sign is the easiest thing to get
+    backwards (per the issue's own warning).
+
+    `lag_days=L` must pair metric_a's value on date D with metric_b's value
+    on date D+L -- a positive lag means metric_a's date precedes metric_b's.
+
+    Fixture: a 14-value series with deliberately low self-similarity at
+    every shift except 0 (verified by hand, chars below), so a correlation
+    can only be strong at the ONE lag where metric_b is an exact date-
+    shifted copy of metric_a -- unlike a plain monotonic series, whose
+    autocorrelation is close to 1.0 at every lag and can't discriminate the
+    sign at all.
+
+    values = [18, 32, 4, 79, 58, 24, 90, 16, 95, 84, 45, 11, 30, 35]
+    metric_a: dates 2026-08-01 .. 2026-08-14, value[i] on day i.
+    metric_b: dates 2026-08-02 .. 2026-08-15, value[i] on day (i+1) -- i.e.
+    metric_b's date D+1 carries metric_a's own value from date D, for every
+    i. So metric_a[D] and metric_b[D+1] are IDENTICAL by construction: lag
+    = +1 must be a perfect r = 1.0. Independently computed via Python's
+    `statistics.correlation` outside this test (not reusing pearson/
+    spearman under test): lag=+1 -> r=1.0 (n=14), lag=0 -> r~=-0.117 (n=13),
+    lag=-1 -> r~=0.058 (n=12), lag=-2 -> r~=-0.095 (n=11), lag=+2 ->
+    r~=-0.117 (n=13). Only lag=+1 is anywhere close to a real relationship.
+    """
+    values = [18.0, 32.0, 4.0, 79.0, 58.0, 24.0, 90.0, 16.0, 95.0, 84.0, 45.0, 11.0, 30.0, 35.0]
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+
+    metric_a_records = [
+        scored_record(
+            (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=values[i],
+            cycle_id=None,
+        )
+        for i in range(14)
+    ]
+    # metric_b's date (base + 1 + i) carries values[i] -- an exact one-day-
+    # later copy of metric_a.
+    metric_b_records = [
+        scored_record(
+            (base + timedelta(days=1 + i)).isoformat().replace("+00:00", "Z"),
+            hrv=values[i],
+            cycle_id=None,
+        )
+        for i in range(14)
+    ]
+
+    results = correlate_lag_sweep(
+        metric_a_records, "recovery_score", metric_b_records, "hrv", lags=range(-2, 3)
+    )
+    assert all(isinstance(r, LagResult) for r in results)
+    by_lag = {r.lag_days: r for r in results}
+
+    assert by_lag[1].correlation is not None
+    assert by_lag[1].correlation.count == 14
+    assert by_lag[1].correlation.r == pytest.approx(1.0, abs=1e-9)
+
+    # Every other lag in the sweep is decisively weaker -- not a close call.
+    for lag in (-2, -1, 0, 2):
+        entry = by_lag[lag]
+        assert entry.correlation is not None, f"lag {lag} unexpectedly refused"
+        assert abs(entry.correlation.r) < 0.2, (
+            f"lag {lag} should be near-zero, got r={entry.correlation.r} "
+            "-- the sign convention is likely backwards"
+        )
+    assert by_lag[-1].correlation.r < by_lag[1].correlation.r
+    assert by_lag[0].correlation.r < by_lag[1].correlation.r
+
+
+def test_lag_sweep_count_shrinks_as_lag_grows() -> None:
+    """n (pairs matched) per lag shrinks as |lag_days| grows, and is reported
+    per lag -- constructed from two series with only a partial date overlap
+    that narrows further the more you shift.
+    """
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+    # metric_a: 20 consecutive days.
+    metric_a_records = [
+        scored_record(
+            (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=50.0 + i,
+            cycle_id=None,
+        )
+        for i in range(20)
+    ]
+    # metric_b: the same 20 consecutive days (full overlap at lag=0, shrinking
+    # overlap as |lag| grows away from 0).
+    metric_b_records = [
+        scored_record(
+            (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            hrv=30.0 + i,
+            cycle_id=None,
+        )
+        for i in range(20)
+    ]
+
+    results = correlate_lag_sweep(
+        metric_a_records, "recovery_score", metric_b_records, "hrv", lags=range(-5, 6)
+    )
+    by_lag = {r.lag_days: r for r in results}
+
+    # None of these should be refused -- 20-day overlap, shrinking by |lag|
+    # each time, always leaves >= 15 pairs, comfortably above the 8 floor.
+    counts = {}
+    for lag in range(-5, 6):
+        entry = by_lag[lag]
+        assert entry.correlation is not None, f"lag {lag} unexpectedly refused"
+        counts[lag] = entry.correlation.count
+
+    assert counts[0] == 20
+    assert counts[5] == 15
+    assert counts[-5] == 15
+    assert counts[3] == 17
+    assert counts[-3] == 17
+    # Monotonically shrinking away from lag 0 in both directions.
+    for lag in range(1, 5):
+        assert counts[lag] > counts[lag + 1]
+        assert counts[-lag] > counts[-(lag + 1)]
+
+
+def test_lag_sweep_refused_lag_is_reported_not_omitted() -> None:
+    """A lag whose surviving pairs fall below MIN_CORRELATION_SAMPLES is
+    reported as refused, still present in the returned list -- not silently
+    dropped."""
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+    # Only 5 days of overlap at lag=0 -- below MIN_CORRELATION_SAMPLES (8).
+    metric_a_records = [
+        scored_record(
+            (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=50.0 + i,
+            cycle_id=None,
+        )
+        for i in range(5)
+    ]
+    metric_b_records = [
+        scored_record(
+            (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            hrv=30.0 + i,
+            cycle_id=None,
+        )
+        for i in range(5)
+    ]
+
+    results = correlate_lag_sweep(
+        metric_a_records, "recovery_score", metric_b_records, "hrv", lags=range(-1, 2)
+    )
+    assert len(results) == 3  # every requested lag is present
+    by_lag = {r.lag_days: r for r in results}
+
+    refused = by_lag[0]
+    assert refused.correlation is None
+    assert refused.refused_reason is not None
+    assert "5" in refused.refused_reason  # mentions the actual count, like InsufficientDataError
+
+
+def test_lag_sweep_never_raises_even_for_a_constant_metric() -> None:
+    """A constant metric -- which raises InsufficientDataError from the base
+    correlate() -- must never escape the sweep; it becomes a per-lag refusal
+    for every lag, and the sweep still returns all of them.
+    """
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+    constant_a = [
+        scored_record(
+            (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=65.0,
+            cycle_id=None,
+        )
+        for i in range(12)
+    ]
+    varying_b = [
+        scored_record(
+            (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            hrv=float(i),
+            cycle_id=None,
+        )
+        for i in range(12)
+    ]
+
+    results = correlate_lag_sweep(constant_a, "recovery_score", varying_b, "hrv", lags=(-1, 0, 1))
+    assert len(results) == 3
+    for result in results:
+        assert result.correlation is None
+        assert result.refused_reason is not None
+
+
+def test_lag_sweep_returns_every_requested_lag_not_just_the_best() -> None:
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+    metric_a_records = [
+        scored_record(
+            (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=float(i),
+            cycle_id=None,
+        )
+        for i in range(15)
+    ]
+    metric_b_records = [
+        scored_record(
+            (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            hrv=float(i * 2),
+            cycle_id=None,
+        )
+        for i in range(15)
+    ]
+
+    requested = [-3, -1, 0, 1, 3]
+    results = correlate_lag_sweep(
+        metric_a_records, "recovery_score", metric_b_records, "hrv", lags=requested
+    )
+    assert sorted(r.lag_days for r in results) == sorted(requested)
+
+
+def test_default_lag_sweep_is_plus_minus_three_days() -> None:
+    assert tuple(DEFAULT_LAG_SWEEP) == tuple(range(-3, 4))
