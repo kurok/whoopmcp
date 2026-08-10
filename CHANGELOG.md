@@ -180,6 +180,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first points after a long gap in a user's data don't get reported as a
   full window's mean when they're really an average of whatever handful of
   points the gap happened to leave nearby.
+- New `webhooks.py`: a `POST /webhooks/whoop` receiver (#17), registered on
+  the streamable-http app via `custom_route` alongside `/health`/`/ready`
+  rather than a second web framework. Verifies `X-WHOOP-Signature` as
+  base64 HMAC-SHA256 of the raw request bytes prefixed with
+  `X-WHOOP-Signature-Timestamp`, keyed on `Config.client_secret`, via
+  `hmac.compare_digest`; a missing header, a tampered body, a wrong-secret
+  signature, or a timestamp more than `WHOOPMCP_WEBHOOK_TIMESTAMP_SKEW_SECONDS`
+  (default 300s) from now are all rejected before the body ever reaches a
+  JSON decoder, so a replayed capture of a genuine request has a bounded
+  window rather than forever. A verified request is handed to an in-process
+  `asyncio.Queue` and answered `200` immediately -- WHOOP retries a slow
+  endpoint, and a retry of in-flight work is how duplicate processing
+  starts; draining the queue is #18's job, not this one. Off by default
+  (`WHOOPMCP_WEBHOOKS_ENABLED`), and a request that hits the route while
+  disabled gets the same `404` a genuinely unregistered path would. No log
+  statement on any path -- accepted, rejected, or disabled -- includes the
+  body, the signature, or the secret.
 
 ### Changed
 

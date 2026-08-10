@@ -38,6 +38,7 @@ from whoopmcp.auth import Authenticator, AuthError, build_store
 from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_params
 from whoopmcp.config import Config
 from whoopmcp.context_budget import strip_nulls
+from whoopmcp.webhooks import register_webhook_routes
 
 logger = logging.getLogger("whoopmcp")
 
@@ -210,8 +211,11 @@ def _register_health_routes(server: MCPServer[AppContext]) -> None:
     service, without needing an MCP client to do it. Not reachable under
     stdio -- there is no HTTP surface there -- so only streamable-http
     deployments see these at all. Deliberately just liveness/readiness: no
-    OAuth-callback or webhook route belongs here (#17 is unbuilt and blocked
-    on #13; see the issue's own scope note).
+    OAuth-callback route belongs here, and the webhook receiver (#17) is
+    registered separately by ``register_webhook_routes`` -- see that
+    function's own docstring for why it reads ``Config`` fresh per request
+    rather than once at server-build time, the same shape of problem
+    ``_check_token_store_reachable`` below already solves the same way.
     """
 
     @server.custom_route("/health", methods=["GET"])
@@ -249,6 +253,7 @@ def build_server() -> MCPServer[AppContext]:
     _register_data_tools(server)
     _register_analysis_tools(server)
     _register_health_routes(server)
+    register_webhook_routes(server)
     return server
 
 
