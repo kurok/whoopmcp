@@ -63,6 +63,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   note whenever the 1,000-record-per-collection cap they already had was actually hit,
   instead of returning a quietly incomplete summary. Measured before/after on
   `list_sleeps`: 1440 tokens (`detail="summary"`) vs 2014 (`detail="full"`).
+- `WhoopClient._get` now sits behind an async token bucket (`RateLimiter`) so a
+  backfill can no longer saturate WHOOP's 100/minute and 10,000/day limits
+  without noticing. Per-minute and per-day counters, the daily one resetting
+  on a UTC calendar boundary rather than a rolling 24h window; every response
+  reconciles the bucket against WHOOP's own `X-RateLimit-Limit`,
+  `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers, which take priority
+  over local accounting since the budget may be shared across callers this
+  process doesn't know about (#9). A 429 now honours `Retry-After` exactly and
+  falls back to capped exponential backoff with jitter only when that header
+  is absent, giving up after 5 attempts and raising `RateLimitedError`. Two
+  priority classes, `INTERACTIVE` and `BACKFILL`, so an interactive tool call
+  is never queued behind a backfill that got there first; nothing issues
+  `BACKFILL` yet (that's #14). Both limits are configurable via
+  `WHOOPMCP_RATE_LIMIT_PER_MINUTE` / `WHOOPMCP_RATE_LIMIT_PER_DAY` for when
+  WHOOP grants an increase.
+- Every tool that reads data now takes its caller's identity from a `Principal`
+  carried on `AppContext` (`_ensure_principal`) rather than trusting whatever
+  token happens to be loaded process-wide. Resolved once at startup from the
+  authenticated profile and again right after `whoop_complete_login`, never
+  from an environment variable; a tool invoked with no resolved principal
+  raises a typed error naming `whoop_login` before making any network call,
+  and `whoop_logout` clears it back to unresolved. This is a shape change,
+  not a feature -- no database, no session store -- so that a second user
+  (#29) becomes a change to one resolver rather than a rewrite of every tool.
 
 ### Changed
 

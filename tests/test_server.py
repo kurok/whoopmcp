@@ -7,8 +7,10 @@ a tool a client may stop asking permission for.
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,7 +26,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
-from whoopmcp.server import AppContext, build_server
+from whoopmcp.server import AppContext, Principal, build_server, lifespan
 
 #: Every tool the server promises. Adding one here without registering it, or
 #: registering one without listing it here, fails the suite.
@@ -49,6 +51,25 @@ EXPECTED_TOOLS = {
 
 #: The only tools allowed to change anything. Everything else is a read.
 MUTATING_TOOLS = {"whoop_complete_login", "whoop_logout"}
+
+
+def fast_forwarding_clock() -> Callable[[], float]:
+    """A clock that jumps far ahead on every call.
+
+    Since issue #11, WhoopClient._get retries a 429 with real backoff waits
+    before giving up -- against the default (real) clock, that means several
+    genuine multi-second sleeps every time one of these rate-limited-error
+    tests runs. This clock makes each retry's wait resolve after one poll
+    tick instead, since these tests only care about the final result, not
+    the actual wait duration.
+    """
+    state = {"now": 0.0}
+
+    def _clock() -> float:
+        state["now"] += 3600.0
+        return state["now"]
+
+    return _clock
 
 
 # -- fixture helpers for data-tool testing ---------------------------------
@@ -98,7 +119,10 @@ def config(tmp_path: Path) -> Config:
 def app_context(config: Config) -> AppContext:
     auth = Authenticator(config)
     client = WhoopClient(config, auth)
-    return AppContext(config=config, auth=auth, client=client)
+    # user_id matches profile_fixture()'s "user_id": 12345, so a test that
+    # mocks the profile endpoint and one that doesn't stay consistent with
+    # each other about who "the" user is.
+    return AppContext(config=config, auth=auth, client=client, principal=Principal(user_id=12345))
 
 
 @pytest.fixture
@@ -420,7 +444,9 @@ async def test_whoop_complete_login_happy_path(
     assert "state" in query, f"Expected 'state' in URL, got: {login_text}"
     state = query["state"][0]
 
-    # Step 2: Mock TOKEN_URL to return a successful token response
+    # Step 2: Mock TOKEN_URL, and the profile endpoint whoop_complete_login
+    # now also calls (issue #8: it resolves a Principal after a successful
+    # exchange), to both return successful responses.
     with respx.mock:
         respx.post(TOKEN_URL).mock(
             return_value=respx.MockResponse(
@@ -433,14 +459,23 @@ async def test_whoop_complete_login_happy_path(
                 },
             )
         )
-
-        # Step 3: Call whoop_complete_login with the code and state
-        complete_result = await call_tool(
-            server,
-            "whoop_complete_login",
-            {"code": "fake-auth-code", "state": state},
-            app_context,
+        respx.get(f"{BASE_URL}/v2/user/profile/basic").mock(
+            return_value=respx.MockResponse(200, json=profile_fixture())
         )
+
+        # Step 3: Call whoop_complete_login with the code and state. Its
+        # principal resolution goes through app.client -- unlike
+        # exchange_code, which opens its own short-lived httpx.AsyncClient --
+        # so, unlike the rest of this file's auth-tool tests, client must
+        # already be entered as an async context manager here.
+        async with WhoopClient(config, app_context.auth) as client:
+            app_context.client = client
+            complete_result = await call_tool(
+                server,
+                "whoop_complete_login",
+                {"code": "fake-auth-code", "state": state},
+                app_context,
+            )
 
     result_str = str(complete_result["result"])
 
@@ -877,7 +912,12 @@ async def test_get_workout(
 async def test_list_recoveries_rate_limited_error(
     config: Config, app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """list_recoveries returns rate_limited response on RateLimitedError."""
+    """list_recoveries returns rate_limited response on RateLimitedError.
+
+    Fast-forwarding clock: since issue #11, the real 429 gets retried with
+    backoff before _get gives up, and every mocked call here returns the same
+    429 -- so without this, the retries would run against the real clock.
+    """
     reset_time = time.time() + 60
     respx.get(f"{BASE_URL}/v2/recovery").mock(
         return_value=httpx.Response(
@@ -887,7 +927,7 @@ async def test_list_recoveries_rate_limited_error(
         )
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -1502,7 +1542,10 @@ async def test_compare_periods_happy_path(
 async def test_summarize_period_rate_limited_error(
     config: Config, app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Summarize period returns rate_limited response on RateLimitedError."""
+    """Summarize period returns rate_limited response on RateLimitedError.
+
+    Fast-forwarding clock: see test_list_recoveries_rate_limited_error.
+    """
     reset_time = time.time() + 60
     respx.get(f"{BASE_URL}/v2/recovery").mock(
         return_value=httpx.Response(
@@ -1512,7 +1555,7 @@ async def test_summarize_period_rate_limited_error(
         )
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -1525,3 +1568,204 @@ async def test_summarize_period_rate_limited_error(
     assert "retry_after_seconds" in result
     assert result["retry_after_seconds"] > 0
     assert "retry" in result["message"].lower()
+
+
+# -- identity tests (issue #8) ----------------------------------------------
+
+#: The 12 tools _ensure_principal must gate -- every data and analysis tool,
+#: and none of the 4 auth tools (those are how a principal gets created, or
+#: must keep working regardless of one).
+_PRINCIPAL_GATED_TOOLS = {
+    "get_profile",
+    "get_body_measurement",
+    "list_recoveries",
+    "list_sleeps",
+    "list_cycles",
+    "list_workouts",
+    "get_sleep",
+    "get_workout",
+    "summarize_period",
+    "metric_trend",
+    "correlate_metrics",
+    "compare_periods",
+}
+
+
+@respx.mock
+async def test_lifespan_resolves_principal_from_profile_response(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AppContext exposes a principal after a successful lifespan() run.
+
+    Exercises the real lifespan() context manager -- not the app_context
+    fixture, which bypasses it entirely -- so this actually confirms
+    resolution comes from the mocked /v2/user/profile/basic response, not
+    from an environment variable naming a user.
+    """
+    # lifespan() calls Config.from_env() with no arguments, so it reads
+    # os.environ directly, unlike the `config` fixture (which builds a
+    # Config from an explicit dict). Point the real environment at the same
+    # values so lifespan()'s own Config lands on the same state_dir, where
+    # the autouse _seed_valid_token fixture already saved a usable token.
+    # Clear any ambient WHOOPMCP_* env vars first so they don't interfere.
+    for name in (
+        "WHOOPMCP_TOKEN_BACKEND",
+        "WHOOPMCP_SCOPES",
+        "WHOOPMCP_STATE_DIR",
+        "WHOOPMCP_CACHE",
+        "WHOOPMCP_TIMEOUT",
+        "WHOOPMCP_RATE_LIMIT_PER_MINUTE",
+        "WHOOPMCP_RATE_LIMIT_PER_DAY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("WHOOP_CLIENT_ID", config.client_id)
+    monkeypatch.setenv("WHOOP_CLIENT_SECRET", config.client_secret)
+    monkeypatch.setenv("WHOOP_REDIRECT_URI", config.redirect_uri)
+    monkeypatch.setenv("WHOOPMCP_STATE_DIR", str(config.state_dir))
+
+    fixture = profile_fixture()
+    respx.get(f"{BASE_URL}/v2/user/profile/basic").mock(
+        return_value=httpx.Response(200, json=fixture)
+    )
+
+    async with lifespan(build_server()) as app:
+        principal = app.principal
+
+    assert principal == Principal(user_id=fixture["user_id"])
+
+
+@pytest.mark.parametrize("tool_name", ["get_profile", "list_recoveries", "summarize_period"])
+async def test_gated_tool_without_principal_raises_typed_not_authenticated_error(
+    server: MCPServer[AppContext], app_context: AppContext, tool_name: str
+) -> None:
+    """A data/analysis tool with no resolved principal fails clean and fast.
+
+    No respx mock is set up here on purpose: _ensure_principal must raise
+    before any network activity, so if it didn't, this would attempt (and
+    fail on) a real HTTP call rather than silently passing.
+    """
+    app_context.principal = None
+    arguments = (
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"}
+        if tool_name == "summarize_period"
+        else {}
+    )
+
+    with pytest.raises(ToolError, match="whoop_login"):
+        await call_tool(server, tool_name, arguments, app_context)
+
+
+async def test_whoop_logout_clears_principal(
+    server: MCPServer[AppContext], app_context: AppContext
+) -> None:
+    """whoop_logout clears principal back to None on the AppContext it was given."""
+    assert app_context.principal is not None  # the fixture seeds one
+
+    await call_tool(server, "whoop_logout", {}, app_context)
+
+    assert app_context.principal is None
+
+
+@respx.mock
+async def test_whoop_complete_login_sets_resolved_principal(
+    server: MCPServer[AppContext], config: Config, app_context: AppContext
+) -> None:
+    """whoop_complete_login resolves and sets a principal after a successful exchange."""
+    app_context.principal = None  # start from "no identity", like a fresh login
+
+    login_result = await call_tool(server, "whoop_login", {}, app_context)
+    login_text = str(login_result["result"])
+    url_match = re.search(r"https://api\.prod\.whoop\.com\S+", login_text)
+    assert url_match, f"Expected an authorize URL in the response, got: {login_text}"
+    state = parse_qs(urlparse(url_match.group(0)).query)["state"][0]
+
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": "fake-access-token",
+                "expires_in": 3600,
+                "refresh_token": "fake-refresh-token",
+                "scope": "read:sleep offline",
+            },
+        )
+    )
+    fixture = profile_fixture()
+    respx.get(f"{BASE_URL}/v2/user/profile/basic").mock(
+        return_value=httpx.Response(200, json=fixture)
+    )
+
+    async with WhoopClient(config, app_context.auth) as client:
+        app_context.client = client
+        await call_tool(
+            server,
+            "whoop_complete_login",
+            {"code": "fake-auth-code", "state": state},
+            app_context,
+        )
+
+    assert app_context.principal == Principal(user_id=fixture["user_id"])
+
+
+@pytest.mark.parametrize("tool_name", ["whoop_auth_status", "whoop_login", "whoop_logout"])
+async def test_auth_tools_work_without_a_principal(
+    server: MCPServer[AppContext], app_context: AppContext, tool_name: str
+) -> None:
+    """The 3 non-mutating auth tools never require a principal.
+
+    whoop_complete_login is the 4th auth tool and is implicitly covered by
+    test_whoop_complete_login_sets_resolved_principal above, which also runs
+    it with app_context.principal starting out None.
+    """
+    app_context.principal = None
+
+    # None of these three should raise -- they either report or clear
+    # identity-related state themselves, rather than requiring one.
+    await call_tool(server, tool_name, {}, app_context)
+
+
+def test_every_principal_gated_tool_source_calls_ensure_principal(
+    server: MCPServer[AppContext],
+) -> None:
+    """Structural, greppable check that every gated tool's own body calls the gate.
+
+    Registry lookup (server._tool_manager.get_tool(name).fn), not
+    inspect.getsource on _register_data_tools/_register_analysis_tools
+    directly: those two functions each define several tool closures back to
+    back, so scanning their combined source for "_ensure_principal(" would
+    pass even if only one of the 8 (or 4) tools nested inside actually called
+    it. Pulling each registered Tool's own `.fn` off the tool manager and
+    reading ITS source in isolation checks every one of the 12 tools
+    individually, which is what actually catches a tool added later that
+    skips the gate.
+    """
+    for name in _PRINCIPAL_GATED_TOOLS:
+        tool = server._tool_manager.get_tool(name)
+        assert tool is not None, f"{name} is not registered"
+        source = inspect.getsource(tool.fn)
+        assert "_ensure_principal(" in source, (
+            f"{name} never calls _ensure_principal -- an unauthenticated caller "
+            "would reach the network instead of getting a typed error"
+        )
+        # The absence check this acceptance criterion actually cares about:
+        # a tool resolving its own config/identity from ambient state
+        # (env/global) instead of through the AppContext it was given.
+        assert "Config.from_env(" not in source, (
+            f"{name} appears to resolve configuration directly rather than "
+            "through the AppContext it was given"
+        )
+
+
+async def test_auth_tools_are_not_principal_gated(server: MCPServer[AppContext]) -> None:
+    """None of the 4 auth tools call _ensure_principal -- they predate having one.
+
+    Registry lookup, for the same reason as the test above.
+    """
+    for name in ("whoop_auth_status", "whoop_login", "whoop_complete_login", "whoop_logout"):
+        tool = server._tool_manager.get_tool(name)
+        assert tool is not None, f"{name} is not registered"
+        source = inspect.getsource(tool.fn)
+        assert "_ensure_principal(" not in source, (
+            f"{name} is an auth tool and must keep working with no resolved "
+            "principal, but its body calls _ensure_principal"
+        )

@@ -18,6 +18,7 @@ under-test the analysis tools while over-building the data-tool fixtures:
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -33,11 +34,31 @@ from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.context_budget import TOOL_CEILINGS, estimate_tokens
-from whoopmcp.server import AppContext, build_server
+from whoopmcp.server import AppContext, Principal, build_server
 
 # -- fixture helpers, mirroring tests/test_server.py's own (kept separate so
 # this file's worst-case fixtures can evolve independently of the happy-path
 # ones) ----------------------------------------------------------------------
+
+
+def fast_forwarding_clock() -> Callable[[], float]:
+    """A clock that jumps far ahead on every call.
+
+    Since issue #11, WhoopClient._get sits behind a RateLimiter that (against
+    the default, real clock) genuinely waits out a per-minute/per-day window
+    rollover once its budget is exhausted -- and the analysis-tool fixtures
+    below page through 1,100+ records per collection, which is well past the
+    default 100/minute budget in a single test. This clock makes any such
+    wait resolve after one poll tick instead, exactly mirroring
+    tests/test_server.py's own helper of the same name.
+    """
+    state = {"now": 0.0}
+
+    def _clock() -> float:
+        state["now"] += 3600.0
+        return state["now"]
+
+    return _clock
 
 
 async def call_tool(
@@ -76,8 +97,11 @@ def config(tmp_path: Path) -> Config:
 @pytest.fixture
 def app_context(config: Config) -> AppContext:
     auth = Authenticator(config)
-    client = WhoopClient(config, auth)
-    return AppContext(config=config, auth=auth, client=client)
+    client = WhoopClient(config, auth, clock=fast_forwarding_clock())
+    # principal= matches test_server.py's own fixture and profile_fixture()'s
+    # user_id (#8, merged after this file was first written) -- every tool
+    # now gates on _ensure_principal, which raises without this.
+    return AppContext(config=config, auth=auth, client=client, principal=Principal(user_id=12345))
 
 
 @pytest.fixture
@@ -332,7 +356,7 @@ async def test_get_profile_within_ceiling(
         return_value=httpx.Response(200, json=fixture)
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(server, "get_profile", {}, app_context)
 
@@ -348,7 +372,7 @@ async def test_get_body_measurement_within_ceiling(
         return_value=httpx.Response(200, json=fixture)
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(server, "get_body_measurement", {}, app_context)
 
@@ -366,7 +390,7 @@ async def test_list_recoveries_within_ceiling(
         return_value=httpx.Response(200, json=_dense_page(_dense_recovery))
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -388,7 +412,7 @@ async def test_list_sleeps_within_ceiling(
         return_value=httpx.Response(200, json=_dense_page(_dense_sleep))
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -409,7 +433,7 @@ async def test_list_cycles_within_ceiling(
         return_value=httpx.Response(200, json=_dense_page(_dense_cycle))
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -431,7 +455,7 @@ async def test_list_workouts_within_ceiling(
         return_value=httpx.Response(200, json=_dense_page(_dense_workout))
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -452,7 +476,7 @@ async def test_get_sleep_within_ceiling(
         return_value=httpx.Response(200, json=_dense_sleep(1))
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(server, "get_sleep", {"sleep_id": "sleep-uuid-1"}, app_context)
 
@@ -467,7 +491,7 @@ async def test_get_workout_within_ceiling(
         return_value=httpx.Response(200, json=_dense_workout(1))
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server, "get_workout", {"workout_id": "workout-uuid-1"}, app_context
@@ -487,7 +511,7 @@ async def test_summarize_period_within_ceiling(
     _mock_paginated_collection("/v2/activity/sleep", _analysis_sleep_records())
     _mock_paginated_collection("/v2/cycle", _analysis_cycle_records())
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -505,7 +529,7 @@ async def test_metric_trend_within_ceiling(
 ) -> None:
     _mock_paginated_collection("/v2/recovery", _analysis_recovery_records())
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -528,7 +552,7 @@ async def test_correlate_metrics_within_ceiling(
     _mock_paginated_collection("/v2/recovery", _analysis_recovery_records())
     _mock_paginated_collection("/v2/cycle", _analysis_cycle_records())
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -553,7 +577,7 @@ async def test_compare_periods_within_ceiling(
     _mock_paginated_collection("/v2/activity/sleep", _analysis_sleep_records())
     _mock_paginated_collection("/v2/cycle", _analysis_cycle_records())
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -581,7 +605,7 @@ async def test_truncation_appears_on_summarize_period_and_metric_trend(
     _mock_paginated_collection("/v2/activity/sleep", _analysis_sleep_records())
     _mock_paginated_collection("/v2/cycle", _analysis_cycle_records())
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         summary = await call_tool(
             server,
@@ -617,7 +641,7 @@ async def test_list_sleeps_detail_summary_is_smaller_than_full(
         return_value=httpx.Response(200, json=_dense_page(_dense_sleep))
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         summary_result = await call_tool(
             server,
@@ -647,7 +671,7 @@ async def test_list_workouts_detail_summary_is_smaller_than_full(
         return_value=httpx.Response(200, json=_dense_page(_dense_workout))
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         summary_result = await call_tool(
             server,
@@ -690,7 +714,7 @@ async def test_list_recoveries_nulls_are_absent_not_present_with_null(
         return_value=httpx.Response(200, json={"records": [record], "next_token": None})
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,

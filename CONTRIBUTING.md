@@ -48,6 +48,14 @@ out of `client.py`, so each stays testable without the other. Anything that
 knows WHOOP's response *shapes* belongs in `analysis.extract_metric` or in
 `client`, not scattered across tools.
 
+**The user is an argument, never ambient.** A tool body gets its caller's
+identity from the `AppContext` it was handed (`_ensure_principal(app)`),
+never by reaching into `Config.from_env()`, an environment variable, or any
+other process-global state. Today there is exactly one user, resolved once
+at startup and after login, so this looks like ceremony -- but it is what
+lets a second user (#29) become a change to one resolver instead of a
+rewrite of every tool.
+
 ## Working on a stub
 
 The scaffold's unimplemented functions raise `NotImplementedError` naming
