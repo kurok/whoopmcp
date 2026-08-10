@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RateLimitedError` on 429 (carrying `X-RateLimit-Reset` as `retry_after` when
   present), and `.paginate` walks `nextToken` bounded by a `max_records` default
   of 1000 rather than an unbounded default that could exhaust the daily quota.
+- The four analysis tools (`summarize_period`, `metric_trend`, `correlate_metrics`,
+  `compare_periods`) are now wired to `analysis.py`. `summarize_period` fetches
+  each of the recovery/sleep/cycle collections exactly once regardless of how
+  many of the six metrics map to it, and a metric with too little data gets its
+  own `insufficient_data` entry rather than failing the other five; `correlate_metrics`
+  reuses one fetch when both metrics share a collection. Every result carries its
+  sample size, and the reported period reflects the timestamps actually returned
+  across every collection fetched, not the range requested.
 - The eight data tools (`get_profile`, `get_body_measurement`, `list_recoveries`,
   `list_sleeps`, `list_cycles`, `list_workouts`, `get_sleep`, `get_workout`) are
   now wired to `WhoopClient`. Each trims a raw WHOOP record down to the fields

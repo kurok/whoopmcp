@@ -13,7 +13,7 @@ they state what the data is not (a diagnosis).
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -22,8 +22,9 @@ from typing import Any
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
+from whoopmcp.analysis import InsufficientDataError, correlate, summarize, trend
 from whoopmcp.auth import Authenticator, build_store
-from whoopmcp.client import RateLimitedError, WhoopClient
+from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_params
 from whoopmcp.config import Config
 
 logger = logging.getLogger("whoopmcp")
@@ -516,10 +517,95 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
 
 # -- analysis --------------------------------------------------------------
 
+#: Friendly metric name -> the collection it is sourced from.
+_METRIC_COLLECTION: dict[str, str] = {
+    "recovery_score": "recovery",
+    "hrv": "recovery",
+    "resting_heart_rate": "recovery",
+    "sleep_performance": "sleep",
+    "sleep_efficiency": "sleep",
+    "strain": "cycle",
+}
+
+#: Collection name -> its WHOOP v2 list endpoint.
+_COLLECTION_PATH: dict[str, str] = {
+    "recovery": "/v2/recovery",
+    "sleep": "/v2/activity/sleep",
+    "cycle": "/v2/cycle",
+}
+
+
+def _resolve_collection(metric: str) -> str:
+    """Resolve a friendly metric name to the collection it is sourced from."""
+    try:
+        return _METRIC_COLLECTION[metric]
+    except KeyError:
+        raise ValueError(f"unknown metric: {metric!r}") from None
+
+
+async def _fetch_collection(
+    app: AppContext, collection: str, start: str, end: str
+) -> list[dict[str, Any]]:
+    """Walk every page of one collection over a range via WhoopClient.paginate.
+
+    Analysis tools need raw WHOOP records (score_state, nested score dicts)
+    -- the same shape analysis.py's extract_metric/summarize/trend/correlate
+    already know how to read -- not the trimmed shapes the data tools return,
+    so this goes straight to paginate() rather than through list_recoveries etc.
+    """
+    params = build_collection_params(start=start, end=end)
+    return [record async for record in app.client.paginate(_COLLECTION_PATH[collection], params)]
+
+
+def _actual_range(records: Sequence[dict[str, Any]]) -> tuple[str | None, str | None]:
+    """The earliest/latest created_at actually present, not the range requested --
+    a truncated page or a sparse collection covers less than what was asked for.
+    """
+    timestamps = sorted(r["created_at"] for r in records if r.get("created_at"))
+    if not timestamps:
+        return None, None
+    return timestamps[0], timestamps[-1]
+
+
+async def _summarize_window(
+    app: AppContext, start: str, end: str
+) -> tuple[dict[str, Any], tuple[str | None, str | None]]:
+    """Fetch each of the 3 collections once, then analysis.summarize per metric.
+
+    6 metrics share only 3 collections -- fetching once per metric here would
+    be 6 requests instead of 3, and summarize_period's whole point is not
+    doing that. A metric whose collection can't produce enough SCORED records
+    for analysis.summarize gets its own {"error": "insufficient_data", ...}
+    entry rather than failing the other 5 metrics that DID have enough data.
+    """
+    records_by_collection = {
+        collection: await _fetch_collection(app, collection, start, end)
+        for collection in ("recovery", "sleep", "cycle")
+    }
+    summaries: dict[str, Any] = {}
+    for metric, collection in _METRIC_COLLECTION.items():
+        records = records_by_collection[collection]
+        try:
+            result = summarize(records, metric)
+        except InsufficientDataError as exc:
+            summaries[metric] = {"error": "insufficient_data", "message": str(exc)}
+            continue
+        summaries[metric] = {
+            "mean": result.mean,
+            "stdev": result.stdev,
+            "minimum": result.minimum,
+            "maximum": result.maximum,
+            "count": result.count,
+        }
+    all_records = [r for records in records_by_collection.values() for r in records]
+    return summaries, _actual_range(all_records)
+
 
 def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
     @server.tool(name="summarize_period", title="Summarise a period", annotations=READ_ONLY)
-    async def summarize_period(start: str, end: str) -> dict[str, Any]:
+    async def summarize_period(
+        start: str, end: str, ctx: Context[AppContext, Any]
+    ) -> dict[str, Any]:
         """Summarise recovery, sleep and strain over a date range.
 
         Returns mean, standard deviation, min and max for each metric, along
@@ -528,13 +614,19 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         Args:
             start: ISO 8601 start of the range.
             end: ISO 8601 end of the range.
-
-        TODO(#6): fetch each collection once, then analysis.summarize per metric.
         """
-        raise NotImplementedError("summarize_period is not implemented yet -- see issue #6")
+        app = ctx.request_context.lifespan_context
+
+        async def _fetch() -> dict[str, Any]:
+            summaries, (range_start, range_end) = await _summarize_window(app, start, end)
+            return {"summaries": summaries, "period": {"start": range_start, "end": range_end}}
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="metric_trend", title="Trend of one metric", annotations=READ_ONLY)
-    async def metric_trend(metric: str, start: str, end: str) -> dict[str, Any]:
+    async def metric_trend(
+        metric: str, start: str, end: str, ctx: Context[AppContext, Any]
+    ) -> dict[str, Any]:
         """Compute the direction and rate of change of one metric over a range.
 
         Args:
@@ -545,14 +637,31 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
 
         Returns the least-squares slope in metric units per day. A slope is a
         description of the window requested, not a forecast.
-
-        TODO(#6): resolve the metric to a collection, fetch, then analysis.trend.
         """
-        raise NotImplementedError("metric_trend is not implemented yet -- see issue #6")
+        app = ctx.request_context.lifespan_context
+
+        async def _fetch() -> dict[str, Any]:
+            collection = _resolve_collection(metric)
+            records = await _fetch_collection(app, collection, start, end)
+            try:
+                result = trend(records, metric)
+            except InsufficientDataError as exc:
+                return {"error": "insufficient_data", "message": str(exc)}
+            range_start, range_end = _actual_range(records)
+            return {
+                "metric": result.metric,
+                "count": result.count,
+                "slope_per_day": result.slope_per_day,
+                "first": result.first,
+                "last": result.last,
+                "period": {"start": range_start, "end": range_end},
+            }
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="correlate_metrics", title="Correlate two metrics", annotations=READ_ONLY)
     async def correlate_metrics(
-        metric_a: str, metric_b: str, start: str, end: str
+        metric_a: str, metric_b: str, start: str, end: str, ctx: Context[AppContext, Any]
     ) -> dict[str, Any]:
         """Correlate two metrics over a range, joining records on cycle.
 
@@ -565,14 +674,40 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             metric_b: Second metric name.
             start: ISO 8601 start of the range.
             end: ISO 8601 end of the range.
-
-        TODO(#6): fetch both collections, join, then analysis.correlate.
         """
-        raise NotImplementedError("correlate_metrics is not implemented yet -- see issue #6")
+        app = ctx.request_context.lifespan_context
+
+        async def _fetch() -> dict[str, Any]:
+            collection_a = _resolve_collection(metric_a)
+            collection_b = _resolve_collection(metric_b)
+            records_a = await _fetch_collection(app, collection_a, start, end)
+            # Two metrics can share a collection (e.g. recovery_score and hrv are
+            # both "recovery") -- fetch it once and reuse rather than twice.
+            records_b = (
+                records_a
+                if collection_b == collection_a
+                else await _fetch_collection(app, collection_b, start, end)
+            )
+            try:
+                result = correlate(records_a, metric_a, records_b, metric_b)
+            except InsufficientDataError as exc:
+                return {"error": "insufficient_data", "message": str(exc)}
+            return {
+                "metric_a": result.metric_a,
+                "metric_b": result.metric_b,
+                "count": result.count,
+                "r": result.r,
+            }
+
+        return await _guard_rate_limit(_fetch)
 
     @server.tool(name="compare_periods", title="Compare two periods", annotations=READ_ONLY)
     async def compare_periods(
-        baseline_start: str, baseline_end: str, comparison_start: str, comparison_end: str
+        baseline_start: str,
+        baseline_end: str,
+        comparison_start: str,
+        comparison_end: str,
+        ctx: Context[AppContext, Any],
     ) -> dict[str, Any]:
         """Compare every summary metric between a baseline period and a later one.
 
@@ -584,7 +719,36 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             baseline_end: ISO 8601 end of the baseline period.
             comparison_start: ISO 8601 start of the comparison period.
             comparison_end: ISO 8601 end of the comparison period.
-
-        TODO(#6): summarize both windows and diff them.
         """
-        raise NotImplementedError("compare_periods is not implemented yet -- see issue #6")
+        app = ctx.request_context.lifespan_context
+
+        async def _fetch() -> dict[str, Any]:
+            # Sequential, not concurrent (no asyncio.gather): each window's fetch
+            # completes before the next window's starts.
+            baseline_summaries, baseline_range = await _summarize_window(
+                app, baseline_start, baseline_end
+            )
+            comparison_summaries, comparison_range = await _summarize_window(
+                app, comparison_start, comparison_end
+            )
+            delta: dict[str, Any] = {}
+            for metric in _METRIC_COLLECTION:
+                b = baseline_summaries[metric]
+                c = comparison_summaries[metric]
+                if "error" in b or "error" in c:
+                    delta[metric] = {"error": "insufficient_data"}
+                    continue
+                delta[metric] = {"delta_mean": c["mean"] - b["mean"]}
+            return {
+                "baseline": {
+                    "summary": baseline_summaries,
+                    "period": {"start": baseline_range[0], "end": baseline_range[1]},
+                },
+                "comparison": {
+                    "summary": comparison_summaries,
+                    "period": {"start": comparison_range[0], "end": comparison_range[1]},
+                },
+                "delta": delta,
+            }
+
+        return await _guard_rate_limit(_fetch)
