@@ -242,9 +242,18 @@ async def test_whoop_login(server: object, app_context: AppContext) -> None:
     url_text = result.content[0].text if result.content else str(result.structured_content or "")
     url_text = str(url_text)
 
-    # Result should contain the authorize URL host
-    assert "api.prod.whoop.com" in url_text.lower(), (
-        f"Expected authorization URL to contain 'api.prod.whoop.com', got: {url_text}"
+    # Result should contain the authorize URL, hosted at the real WHOOP host --
+    # parse it out and check the actual hostname rather than a raw substring
+    # search over the whole message (CodeQL flags that as incomplete URL
+    # sanitization: "https://evil.example/api.prod.whoop.com" would also
+    # contain the substring without actually being the WHOOP host).
+    # Anchored to the real host, not a bare "https://\S+" -- this message's
+    # prose itself mentions "https://" in a parenthetical earlier on
+    # ("...other than https://)..."), which a loose pattern would match first.
+    url_match = re.search(r"https://api\.prod\.whoop\.com\S+", url_text)
+    assert url_match, f"Expected an authorization URL in the response, got: {url_text}"
+    assert urlparse(url_match.group(0)).hostname == "api.prod.whoop.com", (
+        f"Expected the authorization URL's host to be api.prod.whoop.com, got: {url_text}"
     )
     # Result should mention the custom-scheme redirect (whoopmcp://)
     # and indicate that an error page is expected
