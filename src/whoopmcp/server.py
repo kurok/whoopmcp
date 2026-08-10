@@ -23,7 +23,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
 from whoopmcp.analysis import InsufficientDataError, correlate, summarize, trend
-from whoopmcp.auth import Authenticator, build_store
+from whoopmcp.auth import Authenticator, AuthError, build_store
 from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_params
 from whoopmcp.config import Config
 
@@ -48,6 +48,20 @@ Guidance:
 """
 
 
+@dataclass(frozen=True, slots=True)
+class Principal:
+    """The identity a tool call runs as.
+
+    Every data/analysis tool receives this through ``AppContext`` rather than
+    resolving a user id itself -- see CONTRIBUTING.md: "the user is an
+    argument, never ambient." Single-user today; the shape is what lets a
+    second user become a change to one resolver later (#29) instead of a
+    rewrite of every tool.
+    """
+
+    user_id: int
+
+
 @dataclass(slots=True)
 class AppContext:
     """What the server holds open for the life of the process."""
@@ -55,6 +69,36 @@ class AppContext:
     config: Config
     auth: Authenticator
     client: WhoopClient
+    principal: Principal | None = None
+
+
+async def _resolve_principal(client: WhoopClient) -> Principal | None:
+    """Best-effort resolve the signed-in user's identity via a live profile call.
+
+    Must never raise: called from ``lifespan()`` at startup, where "not
+    logged in yet" is the ordinary case, not a failure -- an exception here
+    would crash server startup over it. Any failure, or a successful
+    response missing a usable ``user_id``, resolves to "no principal yet"
+    rather than propagating.
+    """
+    try:
+        profile = await client.get_profile()
+        if not isinstance(profile, dict):
+            return None
+        user_id = profile.get("user_id")
+        if user_id is None:
+            return None
+        return Principal(user_id=int(user_id))
+    except Exception:
+        # Deliberately broad: token-store read errors like UnicodeDecodeError
+        # or PermissionError, malformed JSON responses (json.JSONDecodeError),
+        # a client not entered as a context manager (RuntimeError), network
+        # failures, auth failures (AuthError), and user_id coercion failures
+        # (ValueError/TypeError from int()) must all degrade to None, never
+        # propagate, since this runs inside lifespan() and an exception there
+        # crashes the whole server at startup over what is usually just "not
+        # logged in yet".
+        return None
 
 
 @asynccontextmanager
@@ -63,8 +107,24 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
     config = Config.from_env()
     auth = Authenticator(config)
     async with WhoopClient(config, auth) as client:
+        principal = await _resolve_principal(client)
         logger.info("whoopmcp ready (state dir: %s)", config.state_dir)
-        yield AppContext(config=config, auth=auth, client=client)
+        yield AppContext(config=config, auth=auth, client=client, principal=principal)
+
+
+def _ensure_principal(app: AppContext) -> Principal:
+    """Gate a data/analysis tool on an already-resolved identity.
+
+    Deliberately not a resolver: a lazy per-call resolve would cost an extra
+    ``get_profile()`` request on every data/analysis tool invocation whenever
+    the principal happens to be unset, which fights issue #11's whole point
+    (conserving WHOOP's rate-limit budget). Resolution happens only in
+    ``lifespan()`` and after ``whoop_complete_login`` -- this just checks the
+    result.
+    """
+    if app.principal is None:
+        raise AuthError("no WHOOP identity resolved; run whoop_login to authenticate")
+    return app.principal
 
 
 def build_server() -> MCPServer[AppContext]:
@@ -153,6 +213,7 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
         app = ctx.request_context.lifespan_context
         app.auth.verify_state(state)
         token = await app.auth.exchange_code(code)
+        app.principal = await _resolve_principal(app.client)
         granted = ", ".join(token.scopes) if token.scopes else "(none)"
         return f"Login complete. Granted scopes: {granted}"
 
@@ -171,6 +232,7 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
         """
         app = ctx.request_context.lifespan_context
         app.auth.logout()
+        app.principal = None
         return (
             "Local WHOOP credentials removed. This does not revoke the "
             "authorization at WHOOP -- do that from the WHOOP app under "
@@ -305,6 +367,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def get_profile(ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Return the user's WHOOP profile: user id, email, first and last name."""
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
 
         async def _fetch() -> dict[str, Any]:
             return await app.client.get_profile()
@@ -315,6 +378,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def get_body_measurement(ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Return height in metres, weight in kilograms and max heart rate in bpm."""
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
 
         async def _fetch() -> dict[str, Any]:
             return await app.client.get_body_measurement()
@@ -340,6 +404,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 that page.
         """
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
         range_start, range_end = _default_range(start, end, next_token)
 
         async def _fetch() -> dict[str, Any]:
@@ -382,6 +447,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 that page.
         """
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
         range_start, range_end = _default_range(start, end, next_token)
 
         async def _fetch() -> dict[str, Any]:
@@ -427,6 +493,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 that page.
         """
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
         range_start, range_end = _default_range(start, end, next_token)
 
         async def _fetch() -> dict[str, Any]:
@@ -469,6 +536,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 that page.
         """
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
         range_start, range_end = _default_range(start, end, next_token)
 
         async def _fetch() -> dict[str, Any]:
@@ -496,6 +564,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def get_sleep(sleep_id: str, ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Return a single sleep by its v2 UUID."""
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
 
         async def _fetch() -> dict[str, Any]:
             record = await app.client.get_sleep(sleep_id)
@@ -507,6 +576,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def get_workout(workout_id: str, ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Return a single workout by its v2 UUID."""
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
 
         async def _fetch() -> dict[str, Any]:
             record = await app.client.get_workout(workout_id)
@@ -616,6 +686,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             end: ISO 8601 end of the range.
         """
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
 
         async def _fetch() -> dict[str, Any]:
             summaries, (range_start, range_end) = await _summarize_window(app, start, end)
@@ -636,9 +707,13 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             end: ISO 8601 end of the range.
 
         Returns the least-squares slope in metric units per day. A slope is a
-        description of the window requested, not a forecast.
+        description of the window requested, not a forecast. Also returns an
+        r² fit-quality figure for that slope -- both as the number and as a
+        word ("strong"/"moderate"/"weak"/"negligible") -- and 7/30/90-day
+        rolling means of the metric over calendar days.
         """
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
 
         async def _fetch() -> dict[str, Any]:
             collection = _resolve_collection(metric)
@@ -654,6 +729,11 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 "slope_per_day": result.slope_per_day,
                 "first": result.first,
                 "last": result.last,
+                "r_squared": result.r_squared,
+                "fit_quality": result.fit_quality,
+                "rolling_7d": [{"date": p.date, "value": p.value} for p in result.rolling_7d],
+                "rolling_30d": [{"date": p.date, "value": p.value} for p in result.rolling_30d],
+                "rolling_90d": [{"date": p.date, "value": p.value} for p in result.rolling_90d],
                 "period": {"start": range_start, "end": range_end},
             }
 
@@ -676,6 +756,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             end: ISO 8601 end of the range.
         """
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
 
         async def _fetch() -> dict[str, Any]:
             collection_a = _resolve_collection(metric_a)
@@ -721,6 +802,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             comparison_end: ISO 8601 end of the comparison period.
         """
         app = ctx.request_context.lifespan_context
+        _ensure_principal(app)
 
         async def _fetch() -> dict[str, Any]:
             # Sequential, not concurrent (no asyncio.gather): each window's fetch

@@ -12,6 +12,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+
 from whoopmcp.store import (
     CURRENT_SCHEMA_VERSION,
     get_body_measurement,
