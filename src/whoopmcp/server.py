@@ -745,7 +745,10 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             end: ISO 8601 end of the range.
 
         Returns the least-squares slope in metric units per day. A slope is a
-        description of the window requested, not a forecast.
+        description of the window requested, not a forecast. Also returns an
+        r² fit-quality figure for that slope -- both as the number and as a
+        word ("strong"/"moderate"/"weak"/"negligible") -- and 7/30/90-day
+        rolling means of the metric over calendar days.
         """
         app = ctx.request_context.lifespan_context
         _ensure_principal(app)
@@ -764,6 +767,11 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 "slope_per_day": result.slope_per_day,
                 "first": result.first,
                 "last": result.last,
+                "r_squared": result.r_squared,
+                "fit_quality": result.fit_quality,
+                "rolling_7d": [{"date": p.date, "value": p.value} for p in result.rolling_7d],
+                "rolling_30d": [{"date": p.date, "value": p.value} for p in result.rolling_30d],
+                "rolling_90d": [{"date": p.date, "value": p.value} for p in result.rolling_90d],
                 "period": {"start": range_start, "end": range_end},
             }
 

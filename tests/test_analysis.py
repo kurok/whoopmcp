@@ -337,16 +337,13 @@ def test_summarize_days_missing_duplicate_dates() -> None:
 def test_trend_uses_timestamps_not_index() -> None:
     """Trend computes slope per day using actual timestamps, not record index.
 
-    If the records are on days 0, 1, 5, 6 (unevenly spaced) with values
+    If the records are on days 0, 1, 5, 6, 7, 8, 9, 10 (unevenly spaced) with values
     increasing by 10 per day, an index-based slope would compute wrong.
     The timestamp-based slope should detect 10.0 per day.
     """
-    # Day 0: value = 0
-    # Day 1: value = 10 (day 1 - day 0 = 1 day, value changed by 10)
-    # Day 5: value = 50 (day 5 - day 0 = 5 days, value changed by 50, so 10/day)
-    # Day 6: value = 60 (day 6 - day 0 = 6 days, value changed by 60, so 10/day)
+    # Days 0,1,5,6,7,8,9,10 with values 0,10,50,60,70,80,90,100 (all 10.0 per day)
     # True slope per day = 10.0
-    # Index-based would give (0+10+50+60) / 4 mean, then slope over index 0,1,2,3 = wrong
+    # Index-based would give (0+10+50+60+70+80+90+100) / 8 mean, then slope over index 0-7 = wrong
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     records = [
         scored_record(
@@ -365,11 +362,27 @@ def test_trend_uses_timestamps_not_index() -> None:
             (base_date + timedelta(days=6)).isoformat().replace("+00:00", "Z"),
             recovery_score=60.0,
         ),
+        scored_record(
+            (base_date + timedelta(days=7)).isoformat().replace("+00:00", "Z"),
+            recovery_score=70.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=8)).isoformat().replace("+00:00", "Z"),
+            recovery_score=80.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=9)).isoformat().replace("+00:00", "Z"),
+            recovery_score=90.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=10)).isoformat().replace("+00:00", "Z"),
+            recovery_score=100.0,
+        ),
     ]
     result = trend(records, "recovery_score")
     assert isinstance(result, Trend)
     assert result.metric == "recovery_score"
-    assert result.count == 4
+    assert result.count == 8
     # Slope should be approximately 10.0 per day (timestamp-based)
     # Index-based would be different and wrong
     assert result.slope_per_day == pytest.approx(10.0, abs=0.1)
@@ -381,11 +394,16 @@ def test_trend_first_and_last() -> None:
         scored_record("2026-08-03T06:00:00Z", recovery_score=75.0),
         scored_record("2026-08-01T06:00:00Z", recovery_score=60.0),
         scored_record("2026-08-02T06:00:00Z", recovery_score=70.0),
+        scored_record("2026-08-04T06:00:00Z", recovery_score=80.0),
+        scored_record("2026-08-05T06:00:00Z", recovery_score=85.0),
+        scored_record("2026-08-06T06:00:00Z", recovery_score=90.0),
+        scored_record("2026-08-07T06:00:00Z", recovery_score=95.0),
+        scored_record("2026-08-08T06:00:00Z", recovery_score=100.0),
     ]
     result = trend(records, "recovery_score")
-    # Chronologically: day 1 (60), day 2 (70), day 3 (75)
+    # Chronologically: day 1 (60), day 2 (70), ..., day 8 (100)
     assert result.first == 60.0
-    assert result.last == 75.0
+    assert result.last == 100.0
 
 
 def test_trend_excludes_unscored_records() -> None:
@@ -401,13 +419,37 @@ def test_trend_excludes_unscored_records() -> None:
         ),
         scored_record(
             (base_date + timedelta(days=2)).isoformat().replace("+00:00", "Z"),
+            recovery_score=65.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=3)).isoformat().replace("+00:00", "Z"),
+            recovery_score=70.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=4)).isoformat().replace("+00:00", "Z"),
+            recovery_score=75.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=5)).isoformat().replace("+00:00", "Z"),
             recovery_score=80.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=6)).isoformat().replace("+00:00", "Z"),
+            recovery_score=85.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=7)).isoformat().replace("+00:00", "Z"),
+            recovery_score=90.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=8)).isoformat().replace("+00:00", "Z"),
+            recovery_score=95.0,
         ),
     ]
     result = trend(records, "recovery_score")
-    assert result.count == 2  # only the two SCORED records
+    assert result.count == 8  # only the eight SCORED records (unscored is excluded)
     assert result.first == 60.0
-    assert result.last == 80.0
+    assert result.last == 95.0
 
 
 # -- correlate --------------------------------------------------------
@@ -534,3 +576,240 @@ def test_correlate_sufficient_matched_pairs() -> None:
     assert result.count == MIN_CORRELATION_SAMPLES
     # Should be a strong positive correlation (both ascending linearly)
     assert result.r > 0.9
+
+
+# -- trend: r_squared and rolling windows (issue #22) -----
+
+
+def test_trend_computes_r_squared_on_synthetic_series() -> None:
+    """r_squared, slope, and first/last all match hand-computed values.
+
+    Series: day 0-7 with values 10,12,14,16,18,20,22,24 (exactly value = 2*day + 10).
+    Expected slope: 2.0 per day (diff is always 2 per 1 day).
+    Expected r_squared: 1.0 (perfect linear relationship).
+
+    Hand computation for slope (least squares):
+    xs = [0, 1, 2, 3, 4, 5, 6, 7], ys = [10, 12, 14, 16, 18, 20, 22, 24]
+    mean(xs) = 3.5, mean(ys) = 17
+    numerator = ((-3.5)*(-7) + (-2.5)*(-5) + (-1.5)*(-3) + (-0.5)*(-1)
+               + (0.5)*(1) + (1.5)*(3) + (2.5)*(5) + (3.5)*(7))
+              = 24.5 + 12.5 + 4.5 + 0.5 + 0.5 + 4.5 + 12.5 + 24.5 = 84
+    denominator = 12.25 + 6.25 + 2.25 + 0.25 + 0.25 + 2.25 + 6.25 + 12.25 = 42
+    slope = 84 / 42 = 2.0
+
+    r_squared = pearson(xs, ys)^2 = 1.0^2 = 1.0 (since it's perfectly linear)
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=10.0 + 2.0 * i,
+        )
+        for i in range(8)
+    ]
+    result = trend(records, "recovery_score")
+    assert result.metric == "recovery_score"
+    assert result.count == 8
+    assert result.slope_per_day == pytest.approx(2.0, abs=0.01)
+    assert result.r_squared == pytest.approx(1.0, abs=1e-6)
+    assert result.first == 10.0
+    assert result.last == 24.0
+
+
+def test_trend_r_squared_is_one_on_perfectly_linear_series() -> None:
+    """A perfectly linear series (value = 3*day + 5) yields r_squared = 1.0."""
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=5.0 + 3.0 * i,
+        )
+        for i in range(8)  # Days 0-7, values 5, 8, 11, 14, 17, 20, 23, 26
+    ]
+    result = trend(records, "recovery_score")
+    assert result.r_squared == pytest.approx(1.0, abs=1e-6)
+
+
+def test_trend_r_squared_is_low_on_pure_noise() -> None:
+    """A deterministic no-correlation series gives low r_squared.
+
+    Series: day 0-7 with values [1,2,1,2,1,2,1,2] (alternating).
+    This has zero correlation with day index: mean(value) = 1.5, and the
+    oscillation has no linear trend component even with 8 points.
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    # Alternating pattern: no linear correlation with day
+    values = [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0]
+    records = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=values[i],
+        )
+        for i in range(8)
+    ]
+    result = trend(records, "recovery_score")
+    # With no linear trend, r_squared should be very low
+    assert result.r_squared < 0.1
+    assert result.fit_quality == "negligible"
+
+
+def test_trend_fit_quality_describes_r_squared_in_words() -> None:
+    """fit_quality bands r_squared into a word, per the issue's explicit
+    "describe the fit in words in the response" scope bullet -- r_squared
+    alone is the number, fit_quality is the words, neither replaces the
+    other.
+
+    A perfectly linear series (r_squared == 1.0) must band to "strong".
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=10.0 + 2.0 * i,
+        )
+        for i in range(8)
+    ]
+    result = trend(records, "recovery_score")
+    assert result.r_squared == pytest.approx(1.0)
+    assert result.fit_quality == "strong"
+
+
+def test_trend_rolling_7d_respects_minimum_periods() -> None:
+    """rolling_7d has no entry for the first 6 calendar days of the series.
+
+    Create 10 consecutive daily records (days 0-9).
+    rolling_7d should have no entry for days 0-5 (not yet 7 calendar days elapsed).
+    The first rolling_7d entry should be for day 6 (dates show 7 calendar days have passed).
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=50.0 + float(i),
+        )
+        for i in range(10)
+    ]
+    result = trend(records, "recovery_score")
+
+    # rolling_7d should exist and have data
+    assert result.rolling_7d is not None
+    assert isinstance(result.rolling_7d, list)
+
+    # First rolling point should be on day 6 (0-indexed)
+    # because elapsed time from day 0 to day 6 = 6 days >= 7-1 days
+    if result.rolling_7d:
+        first_date_str = result.rolling_7d[0].date
+        first_date = datetime.fromisoformat(first_date_str).date()
+        expected_first = (base_date + timedelta(days=6)).date()
+        assert first_date == expected_first
+
+    # Verify no entries exist for days 0-5 (too few days elapsed)
+    rolling_dates = {rp.date for rp in result.rolling_7d}
+    for i in range(6):
+        day_date = (base_date + timedelta(days=i)).date().isoformat()
+        assert day_date not in rolling_dates
+
+
+def test_trend_rolling_windows_computed_by_date_not_row_count() -> None:
+    """Rolling windows use calendar date range, not row count -- and the
+    minimum-periods clock restarts after a gap at least as long as the
+    window itself, rather than staying pinned to the series' very first date.
+
+    Records: days 0-4 (daily), a 19-day gap, then days 24-33 (daily). The
+    gap (20 days between day 4 and day 24) is bigger than the 7-day window,
+    so no point from before it could ever fall inside a post-gap window --
+    which means the immediately-post-gap points (24-29) must get NO
+    rolling_7d entry at all, exactly as if day 24 were itself the start of
+    a new series. Only once 6 more calendar days have elapsed *within the
+    post-gap run* (day 30) does a real, full 7-day window exist, and its
+    value must come only from days 24-30 -- never from the pre-gap cluster.
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = []
+
+    # Days 0-4: first cluster (5 days -- never reaches a full 7-day window
+    # on its own, so it should produce no rolling_7d points either).
+    for i in range(5):
+        records.append(
+            scored_record(
+                (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+                recovery_score=50.0 + float(i),
+            )
+        )
+
+    # Gap: no records for days 5-23 (19 days -- exceeds the 7-day window).
+
+    # Days 24-33: second cluster (after the gap), 10 days -- enough to reach
+    # a full window post-reset.
+    for i in range(24, 34):
+        records.append(
+            scored_record(
+                (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+                recovery_score=50.0 + float(i - 24),
+            )
+        )
+
+    result = trend(records, "recovery_score")
+    points_by_date = {rp.date: rp.value for rp in result.rolling_7d}
+
+    # The first 6 post-gap days (24-29) must have NO rolling_7d entry: the
+    # gap reset the clock, and only 0-5 calendar days have elapsed since day
+    # 24 at that point -- not the full 6 the 7-day window requires.
+    for i in range(24, 30):
+        day = (base_date + timedelta(days=i)).date().isoformat()
+        assert day not in points_by_date, (
+            f"day {i} got a rolling_7d point from only {i - 24 + 1} post-gap "
+            "days of real history -- the minimum-periods clock did not reset "
+            "after the gap"
+        )
+
+    # Day 30 is the first point with a genuine 7-day post-gap window
+    # [24, 30], values 50..56 -- and must exclude every pre-gap value.
+    day_30 = (base_date + timedelta(days=30)).date().isoformat()
+    assert day_30 in points_by_date
+    expected_value = mean([50.0 + float(i) for i in range(7)])
+    assert points_by_date[day_30] == pytest.approx(expected_value, abs=0.01)
+
+    # The pre-gap cluster (only 5 days) never reaches a full window either.
+    for i in range(5):
+        day = (base_date + timedelta(days=i)).date().isoformat()
+        assert day not in points_by_date
+
+
+def test_trend_below_min_samples_raises_insufficient_data_error() -> None:
+    """A series with 7 or fewer SCORED records raises InsufficientDataError.
+
+    Tests with exactly MIN_TREND_SAMPLES - 1 = 7 records.
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=50.0 + float(i),
+        )
+        for i in range(7)  # Exactly 7 records
+    ]
+    with pytest.raises(InsufficientDataError) as exc_info:
+        trend(records, "recovery_score")
+    # Message should mention the actual count
+    assert "7" in str(exc_info.value)
+
+
+def test_trend_constant_value_series_raises_insufficient_data_error() -> None:
+    """A constant-value metric series (all values identical) raises InsufficientDataError.
+
+    Even with 10 SCORED records, if they all have the same metric value,
+    pearson() will raise InsufficientDataError because the y series is constant.
+    This is intentional: a flat metric has undefined r_squared.
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    # All records have recovery_score = 65.0 (constant)
+    records = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=65.0,  # Identical across all records
+        )
+        for i in range(10)  # Plenty of records, but constant values
+    ]
+    with pytest.raises(InsufficientDataError, match=r"constant|insufficient"):
+        trend(records, "recovery_score")
