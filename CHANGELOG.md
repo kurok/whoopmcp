@@ -62,6 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BACKFILL` yet (that's #14). Both limits are configurable via
   `WHOOPMCP_RATE_LIMIT_PER_MINUTE` / `WHOOPMCP_RATE_LIMIT_PER_DAY` for when
   WHOOP grants an increase.
+- Every tool that reads data now takes its caller's identity from a `Principal`
+  carried on `AppContext` (`_ensure_principal`) rather than trusting whatever
+  token happens to be loaded process-wide. Resolved once at startup from the
+  authenticated profile and again right after `whoop_complete_login`, never
+  from an environment variable; a tool invoked with no resolved principal
+  raises a typed error naming `whoop_login` before making any network call,
+  and `whoop_logout` clears it back to unresolved. This is a shape change,
+  not a feature -- no database, no session store -- so that a second user
+  (#29) becomes a change to one resolver rather than a rewrite of every tool.
 
 ### Changed
 
