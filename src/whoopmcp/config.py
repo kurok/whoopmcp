@@ -64,6 +64,15 @@ class Config:
             "streamable-http" (#27).
         http_host: Bind host for the streamable-http transport.
         http_port: Bind port for the streamable-http transport.
+        webhooks_enabled: Whether the `/webhooks/whoop` receiver (#17) is
+            registered at all. Off by default: the route is public and
+            unauthenticated by construction, so an operator who hasn't set
+            up a WHOOP webhook subscription shouldn't have it exposed.
+        webhook_timestamp_skew_seconds: How far a webhook's
+            `X-WHOOP-Signature-Timestamp` may drift from now, in either
+            direction, before it's rejected even with a valid signature.
+            Bounds the window a captured, correctly-signed request can be
+            replayed in.
     """
 
     client_id: str
@@ -79,6 +88,8 @@ class Config:
     transport: Transport = "stdio"
     http_host: str = "127.0.0.1"
     http_port: int = 8000
+    webhooks_enabled: bool = False
+    webhook_timestamp_skew_seconds: float = 300.0
 
     @property
     def token_path(self) -> Path:
@@ -153,6 +164,10 @@ class Config:
             transport=transport,  # type: ignore[arg-type]
             http_host=src.get("WHOOPMCP_HTTP_HOST", "127.0.0.1"),
             http_port=int(src.get("WHOOPMCP_HTTP_PORT", "8000")),
+            webhooks_enabled=_as_bool(src.get("WHOOPMCP_WEBHOOKS_ENABLED", "false")),
+            webhook_timestamp_skew_seconds=float(
+                src.get("WHOOPMCP_WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300")
+            ),
         )
 
 
