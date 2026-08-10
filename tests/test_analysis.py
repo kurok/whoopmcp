@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -15,7 +16,9 @@ from whoopmcp.analysis import (
     extract_metric,
     linear_slope,
     mean,
+    median,
     pearson,
+    standardized_effect_size,
     stdev,
     summarize,
     trend,
@@ -39,6 +42,72 @@ def test_stdev_uses_the_sample_denominator() -> None:
 def test_stdev_needs_two_values() -> None:
     with pytest.raises(InsufficientDataError):
         stdev([1.0])
+
+
+def test_median_odd_count() -> None:
+    """Median of odd-length sequence returns the middle element."""
+    assert median([1.0, 3.0, 5.0]) == 3.0
+    assert median([10.0, 20.0, 30.0, 40.0, 50.0]) == 30.0
+
+
+def test_median_even_count() -> None:
+    """Median of even-length sequence returns average of two middle elements."""
+    assert median([1.0, 2.0, 3.0, 4.0]) == 2.5
+    assert median([10.0, 20.0, 30.0, 40.0]) == 25.0
+
+
+def test_median_single_value() -> None:
+    """Median of a single element is that element."""
+    assert median([42.0]) == 42.0
+
+
+def test_median_of_nothing_is_an_error() -> None:
+    """Median of an empty sequence raises InsufficientDataError."""
+    with pytest.raises(InsufficientDataError, match="median of an empty sequence"):
+        median([])
+
+
+def test_standardized_effect_size_happy_path() -> None:
+    """Cohen's d between two normal distributions with known values."""
+    # Group A: [1, 2, 3, 4, 5] -> mean=3, stdev^2 = 2.5
+    # Group B: [5, 6, 7, 8, 9] -> mean=7, stdev^2 = 2.5
+    # pooled_variance = ((5-1)*2.5 + (5-1)*2.5) / (5+5-2) = (10 + 10) / 8 = 2.5
+    # pooled_stdev = sqrt(2.5) ~ 1.581
+    # d = (7 - 3) / 1.581 ~ 2.53
+    result = standardized_effect_size(
+        mean_a=3.0,
+        stdev_a=math.sqrt(2.5),
+        count_a=5,
+        mean_b=7.0,
+        stdev_b=math.sqrt(2.5),
+        count_b=5,
+    )
+    assert result == pytest.approx(2.53, abs=0.01)
+
+
+def test_standardized_effect_size_insufficient_data_a() -> None:
+    """Cohen's d raises InsufficientDataError when count_a < 2."""
+    with pytest.raises(InsufficientDataError):
+        standardized_effect_size(
+            mean_a=5.0, stdev_a=1.0, count_a=1, mean_b=10.0, stdev_b=1.0, count_b=5
+        )
+
+
+def test_standardized_effect_size_insufficient_data_b() -> None:
+    """Cohen's d raises InsufficientDataError when count_b < 2."""
+    with pytest.raises(InsufficientDataError):
+        standardized_effect_size(
+            mean_a=5.0, stdev_a=1.0, count_a=5, mean_b=10.0, stdev_b=1.0, count_b=1
+        )
+
+
+def test_standardized_effect_size_zero_pooled_stdev() -> None:
+    """Cohen's d raises InsufficientDataError when pooled stdev is exactly 0."""
+    # Both groups are perfectly constant and identical: no variance at all
+    with pytest.raises(InsufficientDataError):
+        standardized_effect_size(
+            mean_a=5.0, stdev_a=0.0, count_a=5, mean_b=5.0, stdev_b=0.0, count_b=5
+        )
 
 
 def test_pearson_detects_a_perfect_positive_relationship() -> None:
@@ -189,7 +258,7 @@ def test_summarize_happy_path() -> None:
         scored_record("2026-08-02T06:00:00Z", recovery_score=70.0),
         scored_record("2026-08-03T06:00:00Z", recovery_score=80.0),
     ]
-    result = summarize(records, "recovery_score")
+    result = summarize(records, "recovery_score", expected_days=3)
     assert isinstance(result, Summary)
     assert result.metric == "recovery_score"
     assert result.count == 3
@@ -199,6 +268,10 @@ def test_summarize_happy_path() -> None:
     # stdev of [60, 70, 80] with n-1: mean=70, sum of sq diffs = 200+0+100=200, div by 2
     # = 100, sqrt = 10
     assert result.stdev == pytest.approx(10.0)
+    # Median of [60, 70, 80] is 70.0
+    assert result.median == pytest.approx(70.0)
+    # All 3 calendar dates covered out of 3 expected
+    assert result.days_missing == 0
 
 
 def test_summarize_excludes_unscored_records() -> None:
@@ -210,9 +283,11 @@ def test_summarize_excludes_unscored_records() -> None:
         unscored_record("2026-08-04T06:00:00Z"),
         scored_record("2026-08-05T06:00:00Z", recovery_score=70.0),
     ]
-    result = summarize(records, "recovery_score")
+    result = summarize(records, "recovery_score", expected_days=5)
     assert result.count == 3
     assert result.mean == pytest.approx(70.0)
+    # Only 3 unique calendar dates (Aug 1, 3, 5) have SCORED records out of 5 expected
+    assert result.days_missing == 2
 
 
 def test_summarize_insufficient_data() -> None:
@@ -222,7 +297,38 @@ def test_summarize_insufficient_data() -> None:
         unscored_record("2026-08-02T06:00:00Z"),
     ]
     with pytest.raises(InsufficientDataError):
-        summarize(records, "recovery_score")
+        summarize(records, "recovery_score", expected_days=2)
+
+
+def test_summarize_days_missing_with_gap() -> None:
+    """Days missing reflects gaps in calendar coverage, not record count."""
+    # 5 SCORED records spanning 5 distinct calendar dates, but expected_days=10
+    records = [
+        scored_record("2026-08-01T06:00:00Z", recovery_score=60.0),
+        scored_record("2026-08-03T06:00:00Z", recovery_score=70.0),
+        scored_record("2026-08-05T06:00:00Z", recovery_score=75.0),
+        scored_record("2026-08-07T06:00:00Z", recovery_score=80.0),
+        scored_record("2026-08-09T06:00:00Z", recovery_score=65.0),
+    ]
+    result = summarize(records, "recovery_score", expected_days=10)
+    # 5 unique dates covered, 10 expected -> 5 days missing
+    assert result.days_missing == 5
+    assert result.count == 5
+
+
+def test_summarize_days_missing_duplicate_dates() -> None:
+    """Multiple SCORED records on same calendar date count as one date for coverage."""
+    # Two records on 2026-08-01 (e.g., nap + main sleep), one each on Aug 2, 3
+    records = [
+        scored_record("2026-08-01T06:00:00Z", recovery_score=60.0),
+        scored_record("2026-08-01T20:00:00Z", recovery_score=65.0),  # Same day, different time
+        scored_record("2026-08-02T06:00:00Z", recovery_score=70.0),
+        scored_record("2026-08-03T06:00:00Z", recovery_score=75.0),
+    ]
+    result = summarize(records, "recovery_score", expected_days=4)
+    # 3 unique calendar dates (Aug 1, 2, 3), 4 expected -> 1 day missing
+    assert result.count == 4  # All 4 records contribute to the statistic
+    assert result.days_missing == 1  # But only 3 unique dates for coverage
 
 
 # -- trend --------------------------------------------------------

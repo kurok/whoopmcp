@@ -22,7 +22,13 @@ from typing import Any
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
-from whoopmcp.analysis import InsufficientDataError, correlate, summarize, trend
+from whoopmcp.analysis import (
+    InsufficientDataError,
+    correlate,
+    standardized_effect_size,
+    summarize,
+    trend,
+)
 from whoopmcp.auth import Authenticator, AuthError, build_store
 from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_params
 from whoopmcp.config import Config
@@ -639,7 +645,7 @@ def _actual_range(records: Sequence[dict[str, Any]]) -> tuple[str | None, str | 
 
 async def _summarize_window(
     app: AppContext, start: str, end: str
-) -> tuple[dict[str, Any], tuple[str | None, str | None]]:
+) -> tuple[dict[str, Any], tuple[str | None, str | None], int]:
     """Fetch each of the 3 collections once, then analysis.summarize per metric.
 
     6 metrics share only 3 collections -- fetching once per metric here would
@@ -648,6 +654,7 @@ async def _summarize_window(
     for analysis.summarize gets its own {"error": "insufficient_data", ...}
     entry rather than failing the other 5 metrics that DID have enough data.
     """
+    expected_days = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).days
     records_by_collection = {
         collection: await _fetch_collection(app, collection, start, end)
         for collection in ("recovery", "sleep", "cycle")
@@ -656,7 +663,7 @@ async def _summarize_window(
     for metric, collection in _METRIC_COLLECTION.items():
         records = records_by_collection[collection]
         try:
-            result = summarize(records, metric)
+            result = summarize(records, metric, expected_days=expected_days)
         except InsufficientDataError as exc:
             summaries[metric] = {"error": "insufficient_data", "message": str(exc)}
             continue
@@ -665,10 +672,36 @@ async def _summarize_window(
             "stdev": result.stdev,
             "minimum": result.minimum,
             "maximum": result.maximum,
+            "median": result.median,
+            "days_missing": result.days_missing,
             "count": result.count,
         }
     all_records = [r for records in records_by_collection.values() for r in records]
-    return summaries, _actual_range(all_records)
+    return summaries, _actual_range(all_records), expected_days
+
+
+def _period_length_note(baseline_days: int, comparison_days: int) -> str | None:
+    """Explain when a period's length isn't a whole number of weeks.
+
+    A period that doesn't span whole weeks can over- or under-represent
+    weekdays vs. weekends relative to the other period, which confounds a
+    delta between the two. Returns ``None`` when both periods are a multiple
+    of 7 days.
+    """
+    baseline_ok = baseline_days % 7 == 0
+    comparison_ok = comparison_days % 7 == 0
+    if baseline_ok and comparison_ok:
+        return None
+    if not baseline_ok and not comparison_ok:
+        detail = "neither is a multiple of 7"
+    elif not baseline_ok:
+        detail = "baseline is not a multiple of 7"
+    else:
+        detail = "comparison is not a multiple of 7"
+    return (
+        f"baseline is {baseline_days} days, comparison is {comparison_days} days -- "
+        f"{detail}, so weekday/weekend proportions may not be comparable"
+    )
 
 
 def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
@@ -678,8 +711,11 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
     ) -> dict[str, Any]:
         """Summarise recovery, sleep and strain over a date range.
 
-        Returns mean, standard deviation, min and max for each metric, along
-        with the number of scored records behind each figure.
+        Returns mean, standard deviation, median, min and max for each
+        metric, along with the number of scored records behind each figure
+        and ``days_missing`` -- how many calendar days in the range have no
+        scored record for that metric, a coverage gap rather than a record
+        count.
 
         Args:
             start: ISO 8601 start of the range.
@@ -689,7 +725,9 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         _ensure_principal(app)
 
         async def _fetch() -> dict[str, Any]:
-            summaries, (range_start, range_end) = await _summarize_window(app, start, end)
+            summaries, (range_start, range_end), _expected_days = await _summarize_window(
+                app, start, end
+            )
             return {"summaries": summaries, "period": {"start": range_start, "end": range_end}}
 
         return await _guard_rate_limit(_fetch)
@@ -799,12 +837,14 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         async def _fetch() -> dict[str, Any]:
             # Sequential, not concurrent (no asyncio.gather): each window's fetch
             # completes before the next window's starts.
-            baseline_summaries, baseline_range = await _summarize_window(
+            baseline_summaries, baseline_range, baseline_expected_days = await _summarize_window(
                 app, baseline_start, baseline_end
             )
-            comparison_summaries, comparison_range = await _summarize_window(
-                app, comparison_start, comparison_end
-            )
+            (
+                comparison_summaries,
+                comparison_range,
+                comparison_expected_days,
+            ) = await _summarize_window(app, comparison_start, comparison_end)
             delta: dict[str, Any] = {}
             for metric in _METRIC_COLLECTION:
                 b = baseline_summaries[metric]
@@ -812,7 +852,27 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 if "error" in b or "error" in c:
                     delta[metric] = {"error": "insufficient_data"}
                     continue
-                delta[metric] = {"delta_mean": c["mean"] - b["mean"]}
+                try:
+                    effect_size: float | None = standardized_effect_size(
+                        b["mean"], b["stdev"], b["count"], c["mean"], c["stdev"], c["count"]
+                    )
+                except InsufficientDataError:
+                    effect_size = None
+                coverage_b = (
+                    1 - b["days_missing"] / baseline_expected_days
+                    if baseline_expected_days
+                    else 0.0
+                )
+                coverage_c = (
+                    1 - c["days_missing"] / comparison_expected_days
+                    if comparison_expected_days
+                    else 0.0
+                )
+                delta[metric] = {
+                    "delta_mean": c["mean"] - b["mean"],
+                    "effect_size": effect_size,
+                    "coverage_asymmetric": abs(coverage_b - coverage_c) > 0.5,
+                }
             return {
                 "baseline": {
                     "summary": baseline_summaries,
@@ -823,6 +883,9 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                     "period": {"start": comparison_range[0], "end": comparison_range[1]},
                 },
                 "delta": delta,
+                "period_length_note": _period_length_note(
+                    baseline_expected_days, comparison_expected_days
+                ),
             }
 
         return await _guard_rate_limit(_fetch)

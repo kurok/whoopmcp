@@ -51,6 +51,8 @@ class Summary:
     stdev: float
     minimum: float
     maximum: float
+    median: float
+    days_missing: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +99,21 @@ def stdev(values: Sequence[float]) -> float:
     return math.sqrt(math.fsum((v - mu) ** 2 for v in values) / (len(values) - 1))
 
 
+def median(values: Sequence[float]) -> float:
+    """Median: the middle value, or the average of the two middle values.
+
+    Raises:
+        InsufficientDataError: on an empty sequence.
+    """
+    if not values:
+        raise InsufficientDataError("median of an empty sequence")
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
 def pearson(xs: Sequence[float], ys: Sequence[float]) -> float:
     """Pearson correlation coefficient.
 
@@ -119,6 +136,34 @@ def pearson(xs: Sequence[float], ys: Sequence[float]) -> float:
         raise InsufficientDataError("correlation is undefined when a series is constant")
 
     return math.fsum(a * b for a, b in zip(dx, dy, strict=True)) / denom
+
+
+def standardized_effect_size(
+    mean_a: float,
+    stdev_a: float,
+    count_a: int,
+    mean_b: float,
+    stdev_b: float,
+    count_b: int,
+) -> float:
+    """Cohen's d between two groups, via pooled standard deviation.
+
+    Raises:
+        InsufficientDataError: if either group has fewer than 2 observations,
+            or when the pooled standard deviation is exactly 0 (both groups
+            perfectly constant and identical -- undefined, not zero).
+    """
+    if count_a < 2 or count_b < 2:
+        raise InsufficientDataError("effect size needs at least 2 observations per group")
+
+    pooled_variance = ((count_a - 1) * stdev_a**2 + (count_b - 1) * stdev_b**2) / (
+        count_a + count_b - 2
+    )
+    pooled_stdev = pooled_variance**0.5
+    if pooled_stdev == 0.0:
+        raise InsufficientDataError("effect size is undefined when pooled stdev is 0")
+
+    return (mean_b - mean_a) / pooled_stdev
 
 
 def linear_slope(xs: Sequence[float], ys: Sequence[float]) -> float:
@@ -211,16 +256,32 @@ def extract_metric(records: Sequence[dict[str, Any]], metric: str) -> list[float
     return [value for _, value in _filtered_records(records, metric)]
 
 
-def summarize(records: Sequence[dict[str, Any]], metric: str) -> Summary:
-    """Descriptive statistics for one metric across ``records``."""
+def summarize(records: Sequence[dict[str, Any]], metric: str, *, expected_days: int) -> Summary:
+    """Descriptive statistics for one metric across ``records``.
+
+    Args:
+        records: Raw WHOOP records to summarize.
+        metric: Friendly metric name, as in ``extract_metric``.
+        expected_days: How many calendar days the caller's window spans, used
+            to compute ``days_missing`` -- the coverage gap, not a record
+            count.
+    """
     values = extract_metric(records, metric)
+    result_mean = mean(values)
+    result_stdev = stdev(values)
+    unique_dates = {
+        datetime.fromisoformat(record["created_at"]).astimezone(UTC).date().isoformat()
+        for record, _ in _filtered_records(records, metric)
+    }
     return Summary(
         metric=metric,
         count=len(values),
-        mean=mean(values),
-        stdev=stdev(values),
+        mean=result_mean,
+        stdev=result_stdev,
         minimum=min(values),
         maximum=max(values),
+        median=median(values),
+        days_missing=max(0, expected_days - len(unique_dates)),
     )
 
 
