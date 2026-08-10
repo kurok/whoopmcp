@@ -10,9 +10,14 @@ Docs: https://developer.whoop.com/api/
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import asyncio
+import contextlib
+import enum
+import random
+import time
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -29,6 +34,126 @@ MAX_PAGE_SIZE = 25
 #: by X-RateLimit-* headers and a 429 on breach.
 RATE_LIMIT_PER_MINUTE = 100
 RATE_LIMIT_PER_DAY = 10_000
+
+#: How many times _get retries a 429 before giving up and raising.
+_MAX_429_RETRIES = 5
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_MAX_SECONDS = 30.0
+
+
+class RequestPriority(enum.Enum):
+    """Two priority classes. Nothing in this codebase issues BACKFILL yet
+    (that's future work, #14) -- this just builds the mechanism ahead of it.
+    """
+
+    INTERACTIVE = "interactive"
+    BACKFILL = "backfill"
+
+
+#: How often a blocked acquire()/wait rechecks the clock. Bounded and small
+#: so a test using an injected clock (advanced instantly, no real waiting)
+#: still completes in well under a second -- production callers just see a
+#: slightly-delayed, but still prompt, grant once a window rolls over, a
+#: header reveals more room, or a 429's wait elapses.
+_POLL_INTERVAL_SECONDS = 0.02
+
+
+class RateLimiter:
+    """An async token bucket in front of every request. Per-minute and
+    per-day counters; the daily one resets on a UTC calendar boundary, not
+    a rolling 24h window. Reconciled against WHOOP's own X-RateLimit-*
+    headers on every response -- local accounting is an optimisation, the
+    headers are the truth, and the budget may be shared with callers this
+    process doesn't know about (#9).
+    """
+
+    def __init__(
+        self,
+        *,
+        per_minute: int,
+        per_day: int,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._per_minute_limit = per_minute
+        self._per_day_limit = per_day
+        self._clock = clock or time.time
+        self._minute_remaining = per_minute
+        self._minute_window_start = self._clock()
+        self._day_remaining = per_day
+        self._day_reset_at = self._next_utc_midnight(self._clock())
+        self._lock = asyncio.Lock()
+        self._interactive_waiting = 0
+
+    @staticmethod
+    def _next_utc_midnight(now: float) -> float:
+        current = datetime.fromtimestamp(now, tz=UTC)
+        next_day = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return next_day.timestamp()
+
+    def _replenish_locked(self) -> None:
+        """Reset any counter whose window has rolled over. Caller holds self._lock."""
+        now = self._clock()
+        if now - self._minute_window_start >= 60.0:
+            self._minute_remaining = self._per_minute_limit
+            self._minute_window_start = now
+        if now >= self._day_reset_at:
+            self._day_remaining = self._per_day_limit
+            self._day_reset_at = self._next_utc_midnight(now)
+
+    async def acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE) -> None:
+        if priority is RequestPriority.INTERACTIVE:
+            self._interactive_waiting += 1
+        try:
+            while True:
+                async with self._lock:
+                    self._replenish_locked()
+                    capacity_available = self._minute_remaining > 0 and self._day_remaining > 0
+                    # A BACKFILL caller must never consume a freed slot while
+                    # any INTERACTIVE caller is still waiting for one.
+                    may_take = capacity_available and (
+                        priority is RequestPriority.INTERACTIVE or self._interactive_waiting == 0
+                    )
+                    if may_take:
+                        self._minute_remaining -= 1
+                        self._day_remaining -= 1
+                        return
+                await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+        finally:
+            if priority is RequestPriority.INTERACTIVE:
+                self._interactive_waiting -= 1
+
+    def reconcile(self, headers: httpx.Headers) -> None:
+        """WHOOP's own header values replace local accounting outright --
+        not just a downward clamp -- since the header is the one source of
+        truth for a budget that may be shared across other callers.
+        """
+        remaining = headers.get("X-RateLimit-Remaining")
+        if remaining is not None:
+            with contextlib.suppress(ValueError):
+                self._minute_remaining = int(remaining)
+        limit = headers.get("X-RateLimit-Limit")
+        if limit is not None:
+            with contextlib.suppress(ValueError):
+                self._per_minute_limit = int(limit)
+        reset_seconds = _reset_seconds(headers)
+        if reset_seconds is not None:
+            # X-RateLimit-Reset is seconds until the per-minute window rolls
+            # over (the convention #2 already established for this header).
+            # Back the window's start out from that so a local timer that has
+            # drifted from WHOOP's own doesn't grant early, or make an
+            # already-refilled bucket wait longer than it has to.
+            self._minute_window_start = self._clock() + reset_seconds - 60.0
+
+
+async def _wait_seconds(clock: Callable[[], float], seconds: float) -> None:
+    """Wait `seconds` of the given clock's time, polling briefly rather than
+    a single long asyncio.sleep -- so a test using a fake clock (advanced
+    instantly) completes in a bounded, small amount of real time instead of
+    the full logical duration.
+    """
+    deadline = clock() + seconds
+    while clock() < deadline:
+        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
 
 class WhoopAPIError(RuntimeError):
@@ -112,6 +237,44 @@ def _error_message(response: httpx.Response) -> str:
     return f"HTTP {response.status_code}"
 
 
+def _reset_seconds(headers: httpx.Headers) -> float | None:
+    """Extract ``retry_after`` from ``X-RateLimit-Reset``, if present and
+    parseable. Existing, established (if ambiguous) convention from #2:
+    kept exactly as-is, just factored out so the final-429 path, the
+    ``RateLimitedError`` it raises, and ``RateLimiter.reconcile`` can all
+    share it.
+    """
+    retry_after: float | None = None
+    reset_header = headers.get("X-RateLimit-Reset")
+    if reset_header is not None:
+        try:
+            retry_after = float(reset_header)
+        except ValueError:
+            retry_after = None
+    return retry_after
+
+
+def _parse_retry_after_seconds(response: httpx.Response) -> float | None:
+    """Retry-After is a standard HTTP header, always seconds here (WHOOP
+    doesn't use the HTTP-date form) -- unambiguous, unlike X-RateLimit-Reset.
+    """
+    header = response.headers.get("Retry-After")
+    if header is None:
+        return None
+    try:
+        return float(header)
+    except ValueError:
+        return None
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Capped exponential backoff with full jitter, used only when WHOOP
+    doesn't tell us exactly how long to wait via Retry-After.
+    """
+    capped = min(_BACKOFF_MAX_SECONDS, _BACKOFF_BASE_SECONDS * (2**attempt))
+    return random.uniform(0, capped)  # noqa: S311 -- jitter, not a security use
+
+
 class WhoopClient:
     """Async WHOOP v2 client. One instance per server process.
 
@@ -120,10 +283,22 @@ class WhoopClient:
     here.
     """
 
-    def __init__(self, config: Config, auth: Authenticator) -> None:
+    def __init__(
+        self,
+        config: Config,
+        auth: Authenticator,
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self._config = config
         self._auth = auth
         self._http: httpx.AsyncClient | None = None
+        self._clock = clock or time.time
+        self._rate_limiter = RateLimiter(
+            per_minute=config.rate_limit_per_minute,
+            per_day=config.rate_limit_per_day,
+            clock=self._clock,
+        )
 
     async def __aenter__(self) -> WhoopClient:
         self._http = httpx.AsyncClient(
@@ -167,37 +342,63 @@ class WhoopClient:
         new_token = await self._auth.refresh(token)
         return new_token.access_token
 
-    async def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+    async def _get(
+        self,
+        path: str,
+        params: dict[str, str] | None = None,
+        *,
+        priority: RequestPriority = RequestPriority.INTERACTIVE,
+    ) -> dict[str, Any]:
         """GET a path, with a bearer token attached and errors normalised."""
         token = await self._auth.access_token()
+        await self._rate_limiter.acquire(priority)
         response = await self._request(path, params, token)
+        self._rate_limiter.reconcile(response.headers)
 
         if response.status_code == 401:
             token = await self._force_refresh()
+            await self._rate_limiter.acquire(priority)
             response = await self._request(path, params, token)
+            self._rate_limiter.reconcile(response.headers)
+
+        attempt = 0
+        while response.status_code == 429 and attempt < _MAX_429_RETRIES:
+            retry_after = _parse_retry_after_seconds(response)
+            wait_seconds = retry_after if retry_after is not None else _backoff_seconds(attempt)
+            await _wait_seconds(self._clock, wait_seconds)
+            attempt += 1
+            await self._rate_limiter.acquire(priority)
+            response = await self._request(path, params, token)
+            self._rate_limiter.reconcile(response.headers)
 
         if response.status_code == 429:
-            retry_after: float | None = None
-            reset_header = response.headers.get("X-RateLimit-Reset")
-            if reset_header is not None:
-                try:
-                    retry_after = float(reset_header)
-                except ValueError:
-                    retry_after = None
-            raise RateLimitedError(_error_message(response), retry_after=retry_after)
+            raise RateLimitedError(
+                _error_message(response), retry_after=_reset_seconds(response.headers)
+            )
 
         if not response.is_success:
             raise WhoopAPIError(response.status_code, _error_message(response))
 
         return response.json()
 
-    async def _get_page(self, path: str, params: dict[str, str]) -> Page:
+    async def _get_page(
+        self,
+        path: str,
+        params: dict[str, str],
+        *,
+        priority: RequestPriority = RequestPriority.INTERACTIVE,
+    ) -> Page:
         """GET one page of a collection."""
-        data = await self._get(path, params)
+        data = await self._get(path, params, priority=priority)
         return Page(records=data.get("records", []), next_token=data.get("next_token"))
 
     async def paginate(
-        self, path: str, params: dict[str, str], *, max_records: int = 1000
+        self,
+        path: str,
+        params: dict[str, str],
+        *,
+        max_records: int = 1000,
+        priority: RequestPriority = RequestPriority.INTERACTIVE,
     ) -> AsyncIterator[dict[str, Any]]:
         """Walk a collection, following ``nextToken`` until it runs out.
 
@@ -208,7 +409,7 @@ class WhoopClient:
         fetched = 0
         current_params = dict(params)
         while True:
-            page = await self._get_page(path, current_params)
+            page = await self._get_page(path, current_params, priority=priority)
             for record in page.records:
                 if fetched >= max_records:
                     return

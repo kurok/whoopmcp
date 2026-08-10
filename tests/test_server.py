@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,25 @@ EXPECTED_TOOLS = {
 
 #: The only tools allowed to change anything. Everything else is a read.
 MUTATING_TOOLS = {"whoop_complete_login", "whoop_logout"}
+
+
+def fast_forwarding_clock() -> Callable[[], float]:
+    """A clock that jumps far ahead on every call.
+
+    Since issue #11, WhoopClient._get retries a 429 with real backoff waits
+    before giving up -- against the default (real) clock, that means several
+    genuine multi-second sleeps every time one of these rate-limited-error
+    tests runs. This clock makes each retry's wait resolve after one poll
+    tick instead, since these tests only care about the final result, not
+    the actual wait duration.
+    """
+    state = {"now": 0.0}
+
+    def _clock() -> float:
+        state["now"] += 3600.0
+        return state["now"]
+
+    return _clock
 
 
 # -- fixture helpers for data-tool testing ---------------------------------
@@ -873,7 +893,12 @@ async def test_get_workout(
 async def test_list_recoveries_rate_limited_error(
     config: Config, app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """list_recoveries returns rate_limited response on RateLimitedError."""
+    """list_recoveries returns rate_limited response on RateLimitedError.
+
+    Fast-forwarding clock: since issue #11, the real 429 gets retried with
+    backoff before _get gives up, and every mocked call here returns the same
+    429 -- so without this, the retries would run against the real clock.
+    """
     reset_time = time.time() + 60
     respx.get(f"{BASE_URL}/v2/recovery").mock(
         return_value=httpx.Response(
@@ -883,7 +908,7 @@ async def test_list_recoveries_rate_limited_error(
         )
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,
@@ -1498,7 +1523,10 @@ async def test_compare_periods_happy_path(
 async def test_summarize_period_rate_limited_error(
     config: Config, app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Summarize period returns rate_limited response on RateLimitedError."""
+    """Summarize period returns rate_limited response on RateLimitedError.
+
+    Fast-forwarding clock: see test_list_recoveries_rate_limited_error.
+    """
     reset_time = time.time() + 60
     respx.get(f"{BASE_URL}/v2/recovery").mock(
         return_value=httpx.Response(
@@ -1508,7 +1536,7 @@ async def test_summarize_period_rate_limited_error(
         )
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
+    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
         app_context.client = client
         result = await call_tool(
             server,

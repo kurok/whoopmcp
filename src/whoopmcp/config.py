@@ -55,6 +55,10 @@ class Config:
         state_dir: Directory for the token file and any cache.
         cache_enabled: Whether responses may be cached on disk.
         request_timeout: Per-request timeout in seconds.
+        rate_limit_per_minute: Local budget for requests/minute, mirroring
+            WHOOP's documented default.
+        rate_limit_per_day: Local budget for requests/day, mirroring WHOOP's
+            documented default.
     """
 
     client_id: str
@@ -65,6 +69,8 @@ class Config:
     state_dir: Path = field(default_factory=_default_state_dir)
     cache_enabled: bool = False
     request_timeout: float = 30.0
+    rate_limit_per_minute: int = 100
+    rate_limit_per_day: int = 10_000
 
     @property
     def token_path(self) -> Path:
@@ -128,6 +134,8 @@ class Config:
             state_dir=state_dir,
             cache_enabled=_as_bool(src.get("WHOOPMCP_CACHE", "false")),
             request_timeout=float(src.get("WHOOPMCP_TIMEOUT", "30")),
+            rate_limit_per_minute=int(src.get("WHOOPMCP_RATE_LIMIT_PER_MINUTE", "100")),
+            rate_limit_per_day=int(src.get("WHOOPMCP_RATE_LIMIT_PER_DAY", "10000")),
         )
 
 

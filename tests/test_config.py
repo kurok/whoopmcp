@@ -77,3 +77,17 @@ def test_scopes_can_be_narrowed() -> None:
     env = VALID_ENV | {"WHOOPMCP_SCOPES": "read:recovery offline"}
 
     assert Config.from_env(env).scopes == ("read:recovery", "offline")
+
+
+def test_rate_limit_config_from_env() -> None:
+    config = Config.from_env(VALID_ENV)
+    assert config.rate_limit_per_minute == 100
+    assert config.rate_limit_per_day == 10_000
+
+    env = VALID_ENV | {
+        "WHOOPMCP_RATE_LIMIT_PER_MINUTE": "50",
+        "WHOOPMCP_RATE_LIMIT_PER_DAY": "500",
+    }
+    overridden = Config.from_env(env)
+    assert overridden.rate_limit_per_minute == 50
+    assert overridden.rate_limit_per_day == 500
