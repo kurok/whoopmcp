@@ -81,5 +81,8 @@ TOOL_CEILINGS: dict[str, int] = {
     # rebase should not make unasked.
     "metric_trend": 32000,
     "correlate_metrics": 300,
-    "compare_periods": 600,
+    # 900, not 600: #21 added effect_size/coverage_asymmetric per metric plus
+    # a top-level period_length_note, measured at 675 against this file's own
+    # worst-case fixture (previously 600 was calibrated pre-#21).
+    "compare_periods": 900,
 }
