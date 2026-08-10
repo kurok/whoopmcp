@@ -34,11 +34,13 @@ mypy
 ## Where things go
 
 ```
-config.py     environment -> Config, validated once at startup
-auth.py       OAuth 2.0 flow + token storage
-client.py     one method per documented WHOOP endpoint, nothing more
-analysis.py   pure functions over already-fetched records
-server.py     MCP tool definitions; the only file that imports mcp
+config.py            environment -> Config, validated once at startup
+auth.py              OAuth 2.0 flow + token storage
+client.py            one method per documented WHOOP endpoint, nothing more
+analysis.py          pure functions over already-fetched records
+context_budget.py    response-shaping/measurement shared by tools (token
+                     estimation, null-stripping); not network, not statistics
+server.py            MCP tool definitions; the only file that imports mcp
 ```
 
 The split is the point. Keep network code out of `analysis.py` and statistics

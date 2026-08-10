@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
@@ -26,6 +26,7 @@ from whoopmcp.analysis import InsufficientDataError, correlate, summarize, trend
 from whoopmcp.auth import Authenticator, build_store
 from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_params
 from whoopmcp.config import Config
+from whoopmcp.context_budget import strip_nulls
 
 logger = logging.getLogger("whoopmcp")
 
@@ -236,7 +237,15 @@ def _trim_recovery(record: dict[str, Any]) -> dict[str, Any]:
     return trimmed
 
 
-def _trim_sleep(record: dict[str, Any]) -> dict[str, Any]:
+def _trim_sleep(record: dict[str, Any], *, detail: str = "full") -> dict[str, Any]:
+    """Trim a raw sleep record.
+
+    ``detail="summary"`` (used by list_sleeps' default) drops the nested
+    stage-duration breakdown; ``detail="full"`` (get_sleep's only mode, and
+    list_sleeps' opt-in) keeps it under "stage_durations" -- the caller is
+    responsible for adding the sibling "units" key documenting it, since
+    that lives at the envelope level, not on the record itself.
+    """
     trimmed: dict[str, Any] = {
         "id": record.get("id"),
         "start": record.get("start"),
@@ -249,13 +258,14 @@ def _trim_sleep(record: dict[str, Any]) -> dict[str, Any]:
         trimmed["sleep_performance_percentage"] = score.get("sleep_performance_percentage")
         trimmed["sleep_efficiency_percentage"] = score.get("sleep_efficiency_percentage")
         trimmed["respiratory_rate"] = score.get("respiratory_rate")
-        stages = score.get("stage_summary") or {}
-        trimmed["stage_durations_milli"] = {
-            "awake": stages.get("total_awake_time_milli"),
-            "light": stages.get("total_light_sleep_time_milli"),
-            "deep": stages.get("total_slow_wave_sleep_time_milli"),
-            "rem": stages.get("total_rem_sleep_time_milli"),
-        }
+        if detail == "full":
+            stages = score.get("stage_summary") or {}
+            trimmed["stage_durations"] = {
+                "awake": stages.get("total_awake_time_milli"),
+                "light": stages.get("total_light_sleep_time_milli"),
+                "deep": stages.get("total_slow_wave_sleep_time_milli"),
+                "rem": stages.get("total_rem_sleep_time_milli"),
+            }
     return trimmed
 
 
@@ -275,7 +285,12 @@ def _trim_cycle(record: dict[str, Any]) -> dict[str, Any]:
     return trimmed
 
 
-def _trim_workout(record: dict[str, Any]) -> dict[str, Any]:
+def _trim_workout(record: dict[str, Any], *, detail: str = "full") -> dict[str, Any]:
+    """Trim a raw workout record.
+
+    See ``_trim_sleep`` for the ``detail`` contract; the analogous nested
+    field here is "zone_durations".
+    """
     trimmed: dict[str, Any] = {
         "id": record.get("id"),
         "sport_name": record.get("sport_name"),
@@ -288,15 +303,16 @@ def _trim_workout(record: dict[str, Any]) -> dict[str, Any]:
         trimmed["strain"] = score.get("strain")
         trimmed["average_heart_rate"] = score.get("average_heart_rate")
         trimmed["max_heart_rate"] = score.get("max_heart_rate")
-        zones = score.get("zone_duration") or {}
-        trimmed["zone_durations_milli"] = {
-            "zone_zero": zones.get("zone_zero_milli"),
-            "zone_one": zones.get("zone_one_milli"),
-            "zone_two": zones.get("zone_two_milli"),
-            "zone_three": zones.get("zone_three_milli"),
-            "zone_four": zones.get("zone_four_milli"),
-            "zone_five": zones.get("zone_five_milli"),
-        }
+        if detail == "full":
+            zones = score.get("zone_duration") or {}
+            trimmed["zone_durations"] = {
+                "zone_zero": zones.get("zone_zero_milli"),
+                "zone_one": zones.get("zone_one_milli"),
+                "zone_two": zones.get("zone_two_milli"),
+                "zone_three": zones.get("zone_three_milli"),
+                "zone_four": zones.get("zone_four_milli"),
+                "zone_five": zones.get("zone_five_milli"),
+            }
     return trimmed
 
 
@@ -307,7 +323,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         app = ctx.request_context.lifespan_context
 
         async def _fetch() -> dict[str, Any]:
-            return await app.client.get_profile()
+            return strip_nulls(await app.client.get_profile())
 
         return await _guard_rate_limit(_fetch)
 
@@ -317,7 +333,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         app = ctx.request_context.lifespan_context
 
         async def _fetch() -> dict[str, Any]:
-            return await app.client.get_body_measurement()
+            return strip_nulls(await app.client.get_body_measurement())
 
         return await _guard_rate_limit(_fetch)
 
@@ -346,7 +362,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             page = await app.client.list_recoveries(
                 start=range_start, end=range_end, limit=limit, next_token=next_token
             )
-            records = [_trim_recovery(r) for r in page.records]
+            records = [strip_nulls(_trim_recovery(r)) for r in page.records]
             result: dict[str, Any] = {
                 "records": records,
                 "count": len(records),
@@ -370,6 +386,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         end: str | None = None,
         limit: int = 25,
         next_token: str | None = None,
+        detail: Literal["summary", "full"] = "summary",
     ) -> dict[str, Any]:
         """List sleep records: performance (%), efficiency, and stage durations in milliseconds.
 
@@ -380,7 +397,13 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             limit: Records to return, capped at 25 per page by WHOOP.
             next_token: Cursor from a previous truncated response, to continue
                 that page.
+            detail: "summary" (default) omits the per-stage sleep-duration
+                breakdown to keep the response small; "full" includes it
+                under "stage_durations", with the units declared once in a
+                top-level "units" key.
         """
+        if detail not in ("summary", "full"):
+            raise ValueError(f"detail must be 'summary' or 'full', got {detail!r}")
         app = ctx.request_context.lifespan_context
         range_start, range_end = _default_range(start, end, next_token)
 
@@ -388,12 +411,14 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             page = await app.client.list_sleeps(
                 start=range_start, end=range_end, limit=limit, next_token=next_token
             )
-            records = [_trim_sleep(r) for r in page.records]
+            records = [strip_nulls(_trim_sleep(r, detail=detail)) for r in page.records]
             result: dict[str, Any] = {
                 "records": records,
                 "count": len(records),
                 "next_token": page.next_token,
             }
+            if detail == "full":
+                result["units"] = {"stage_durations": "milliseconds"}
             if page.next_token is not None:
                 result["note"] = (
                     f"Only {len(records)} record(s) in this range were returned; WHOOP "
@@ -433,7 +458,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             page = await app.client.list_cycles(
                 start=range_start, end=range_end, limit=limit, next_token=next_token
             )
-            records = [_trim_cycle(r) for r in page.records]
+            records = [strip_nulls(_trim_cycle(r)) for r in page.records]
             result: dict[str, Any] = {
                 "records": records,
                 "count": len(records),
@@ -457,6 +482,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         end: str | None = None,
         limit: int = 25,
         next_token: str | None = None,
+        detail: Literal["summary", "full"] = "summary",
     ) -> dict[str, Any]:
         """List workouts: sport, strain, average and max heart rate, and heart-rate zone durations.
 
@@ -467,7 +493,13 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             limit: Records to return, capped at 25 per page by WHOOP.
             next_token: Cursor from a previous truncated response, to continue
                 that page.
+            detail: "summary" (default) omits the per-zone heart-rate
+                duration breakdown to keep the response small; "full"
+                includes it under "zone_durations", with the units declared
+                once in a top-level "units" key.
         """
+        if detail not in ("summary", "full"):
+            raise ValueError(f"detail must be 'summary' or 'full', got {detail!r}")
         app = ctx.request_context.lifespan_context
         range_start, range_end = _default_range(start, end, next_token)
 
@@ -475,12 +507,14 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             page = await app.client.list_workouts(
                 start=range_start, end=range_end, limit=limit, next_token=next_token
             )
-            records = [_trim_workout(r) for r in page.records]
+            records = [strip_nulls(_trim_workout(r, detail=detail)) for r in page.records]
             result: dict[str, Any] = {
                 "records": records,
                 "count": len(records),
                 "next_token": page.next_token,
             }
+            if detail == "full":
+                result["units"] = {"zone_durations": "milliseconds"}
             if page.next_token is not None:
                 result["note"] = (
                     f"Only {len(records)} record(s) in this range were returned; WHOOP "
@@ -499,7 +533,9 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
 
         async def _fetch() -> dict[str, Any]:
             record = await app.client.get_sleep(sleep_id)
-            return _trim_sleep(record)
+            trimmed = strip_nulls(_trim_sleep(record))
+            trimmed["units"] = {"stage_durations": "milliseconds"}
+            return trimmed
 
         return await _guard_rate_limit(_fetch)
 
@@ -510,7 +546,9 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
 
         async def _fetch() -> dict[str, Any]:
             record = await app.client.get_workout(workout_id)
-            return _trim_workout(record)
+            trimmed = strip_nulls(_trim_workout(record))
+            trimmed["units"] = {"zone_durations": "milliseconds"}
+            return trimmed
 
         return await _guard_rate_limit(_fetch)
 
@@ -543,18 +581,43 @@ def _resolve_collection(metric: str) -> str:
         raise ValueError(f"unknown metric: {metric!r}") from None
 
 
+#: Cap passed to WhoopClient.paginate() for every analysis-tool fetch. Also
+#: the number quoted in the truncation "note" below, so the two stay in
+#: sync without threading the value through every call site.
+_ANALYSIS_MAX_RECORDS = 1000
+
+
 async def _fetch_collection(
-    app: AppContext, collection: str, start: str, end: str
-) -> list[dict[str, Any]]:
+    app: AppContext,
+    collection: str,
+    start: str,
+    end: str,
+    *,
+    max_records: int = _ANALYSIS_MAX_RECORDS,
+) -> tuple[list[dict[str, Any]], bool]:
     """Walk every page of one collection over a range via WhoopClient.paginate.
 
     Analysis tools need raw WHOOP records (score_state, nested score dicts)
     -- the same shape analysis.py's extract_metric/summarize/trend/correlate
     already know how to read -- not the trimmed shapes the data tools return,
     so this goes straight to paginate() rather than through list_recoveries etc.
+
+    Returns the records and a ``truncated`` flag: true if the collection may
+    hold more than ``max_records`` matched the range requested. Checking
+    ``len(records) >= max_records`` is an approximation -- a collection with
+    exactly that many real records and no more would be a false positive --
+    but paginate() doesn't otherwise say whether it stopped because the
+    cursor ran out or because the cap did, and that's an accepted tradeoff
+    rather than a bug to fix.
     """
     params = build_collection_params(start=start, end=end)
-    return [record async for record in app.client.paginate(_COLLECTION_PATH[collection], params)]
+    records = [
+        record
+        async for record in app.client.paginate(
+            _COLLECTION_PATH[collection], params, max_records=max_records
+        )
+    ]
+    return records, len(records) >= max_records
 
 
 def _actual_range(records: Sequence[dict[str, Any]]) -> tuple[str | None, str | None]:
@@ -569,7 +632,7 @@ def _actual_range(records: Sequence[dict[str, Any]]) -> tuple[str | None, str | 
 
 async def _summarize_window(
     app: AppContext, start: str, end: str
-) -> tuple[dict[str, Any], tuple[str | None, str | None]]:
+) -> tuple[dict[str, Any], tuple[str | None, str | None], bool]:
     """Fetch each of the 3 collections once, then analysis.summarize per metric.
 
     6 metrics share only 3 collections -- fetching once per metric here would
@@ -577,11 +640,17 @@ async def _summarize_window(
     doing that. A metric whose collection can't produce enough SCORED records
     for analysis.summarize gets its own {"error": "insufficient_data", ...}
     entry rather than failing the other 5 metrics that DID have enough data.
+
+    The returned ``truncated`` flag is true if ANY of the 3 collections hit
+    the per-fetch record cap -- one truncated collection is enough to make
+    the whole window's summary incomplete.
     """
-    records_by_collection = {
+    fetched = {
         collection: await _fetch_collection(app, collection, start, end)
         for collection in ("recovery", "sleep", "cycle")
     }
+    records_by_collection = {collection: records for collection, (records, _) in fetched.items()}
+    truncated = any(collection_truncated for _, collection_truncated in fetched.values())
     summaries: dict[str, Any] = {}
     for metric, collection in _METRIC_COLLECTION.items():
         records = records_by_collection[collection]
@@ -598,7 +667,7 @@ async def _summarize_window(
             "count": result.count,
         }
     all_records = [r for records in records_by_collection.values() for r in records]
-    return summaries, _actual_range(all_records)
+    return summaries, _actual_range(all_records), truncated
 
 
 def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
@@ -618,8 +687,20 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         app = ctx.request_context.lifespan_context
 
         async def _fetch() -> dict[str, Any]:
-            summaries, (range_start, range_end) = await _summarize_window(app, start, end)
-            return {"summaries": summaries, "period": {"start": range_start, "end": range_end}}
+            summaries, (range_start, range_end), truncated = await _summarize_window(
+                app, start, end
+            )
+            result: dict[str, Any] = {
+                "summaries": summaries,
+                "period": {"start": range_start, "end": range_end},
+                "truncated": truncated,
+            }
+            if truncated:
+                result["note"] = (
+                    f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
+                    "narrow the date range for a complete summary."
+                )
+            return result
 
         return await _guard_rate_limit(_fetch)
 
@@ -642,20 +723,29 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
 
         async def _fetch() -> dict[str, Any]:
             collection = _resolve_collection(metric)
-            records = await _fetch_collection(app, collection, start, end)
+            records, truncated = await _fetch_collection(app, collection, start, end)
             try:
                 result = trend(records, metric)
             except InsufficientDataError as exc:
+                # No records worth speaking of on this path -- truncated/note
+                # would be noise, not signal.
                 return {"error": "insufficient_data", "message": str(exc)}
             range_start, range_end = _actual_range(records)
-            return {
+            response: dict[str, Any] = {
                 "metric": result.metric,
                 "count": result.count,
                 "slope_per_day": result.slope_per_day,
                 "first": result.first,
                 "last": result.last,
                 "period": {"start": range_start, "end": range_end},
+                "truncated": truncated,
             }
+            if truncated:
+                response["note"] = (
+                    f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
+                    "narrow the date range for a complete trend."
+                )
+            return response
 
         return await _guard_rate_limit(_fetch)
 
@@ -680,24 +770,33 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         async def _fetch() -> dict[str, Any]:
             collection_a = _resolve_collection(metric_a)
             collection_b = _resolve_collection(metric_b)
-            records_a = await _fetch_collection(app, collection_a, start, end)
+            records_a, truncated_a = await _fetch_collection(app, collection_a, start, end)
             # Two metrics can share a collection (e.g. recovery_score and hrv are
             # both "recovery") -- fetch it once and reuse rather than twice.
-            records_b = (
-                records_a
-                if collection_b == collection_a
-                else await _fetch_collection(app, collection_b, start, end)
-            )
+            if collection_b == collection_a:
+                records_b, truncated_b = records_a, truncated_a
+            else:
+                records_b, truncated_b = await _fetch_collection(app, collection_b, start, end)
+            truncated = truncated_a or truncated_b
             try:
                 result = correlate(records_a, metric_a, records_b, metric_b)
             except InsufficientDataError as exc:
+                # No records worth speaking of on this path -- truncated/note
+                # would be noise, not signal.
                 return {"error": "insufficient_data", "message": str(exc)}
-            return {
+            response: dict[str, Any] = {
                 "metric_a": result.metric_a,
                 "metric_b": result.metric_b,
                 "count": result.count,
                 "r": result.r,
+                "truncated": truncated,
             }
+            if truncated:
+                response["note"] = (
+                    f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
+                    "narrow the date range for a complete correlation."
+                )
+            return response
 
         return await _guard_rate_limit(_fetch)
 
@@ -725,12 +824,13 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         async def _fetch() -> dict[str, Any]:
             # Sequential, not concurrent (no asyncio.gather): each window's fetch
             # completes before the next window's starts.
-            baseline_summaries, baseline_range = await _summarize_window(
+            baseline_summaries, baseline_range, baseline_truncated = await _summarize_window(
                 app, baseline_start, baseline_end
             )
-            comparison_summaries, comparison_range = await _summarize_window(
+            comparison_summaries, comparison_range, comparison_truncated = await _summarize_window(
                 app, comparison_start, comparison_end
             )
+            truncated = baseline_truncated or comparison_truncated
             delta: dict[str, Any] = {}
             for metric in _METRIC_COLLECTION:
                 b = baseline_summaries[metric]
@@ -739,7 +839,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                     delta[metric] = {"error": "insufficient_data"}
                     continue
                 delta[metric] = {"delta_mean": c["mean"] - b["mean"]}
-            return {
+            response: dict[str, Any] = {
                 "baseline": {
                     "summary": baseline_summaries,
                     "period": {"start": baseline_range[0], "end": baseline_range[1]},
@@ -749,6 +849,13 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                     "period": {"start": comparison_range[0], "end": comparison_range[1]},
                 },
                 "delta": delta,
+                "truncated": truncated,
             }
+            if truncated:
+                response["note"] = (
+                    f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
+                    "narrow the date range for a complete comparison."
+                )
+            return response
 
         return await _guard_rate_limit(_fetch)

@@ -47,6 +47,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never triggers a side-effect refresh; `whoop_complete_login` verifies `state`
   before exchanging the code and reports the scopes WHOOP actually granted. No
   tool returns an access or refresh token value in any field.
+- Every tool now carries a measured context-budget ceiling (`context_budget.TOOL_CEILINGS`),
+  asserted in `tests/test_context_budget.py` against a worst-case fixture (a dense
+  25-record page for the 8 data tools -- the most one call can return, since WHOOP
+  caps a page there regardless of range -- and a >1,100-record, >2-year collection
+  for the 4 analysis tools) and discovered by enumerating the live tool registry, so
+  a tool added later with no declared ceiling fails CI rather than going unnoticed.
+  `list_sleeps`/`list_workouts` gained a `detail` parameter (`"summary"` by default,
+  `"full"` on request) that drops the millisecond stage/zone breakdown from the
+  default response; when kept, that breakdown's unit is now declared once in a
+  `units` envelope field rather than once per record (`stage_durations_milli` /
+  `zone_durations_milli` are renamed to `stage_durations` / `zone_durations`
+  accordingly). Every data tool strips null-valued fields from each record before
+  returning it. The four analysis tools now report `truncated`/a retry-narrower-range
+  note whenever the 1,000-record-per-collection cap they already had was actually hit,
+  instead of returning a quietly incomplete summary. Measured before/after on
+  `list_sleeps`: 1440 tokens (`detail="summary"`) vs 2014 (`detail="full"`).
 
 ### Changed
 

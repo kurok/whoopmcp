@@ -599,7 +599,7 @@ async def test_list_recoveries_happy_path(
 async def test_list_sleeps_happy_path(
     config: Config, app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """list_sleeps returns trimmed records with stage_durations_milli mapping."""
+    """list_sleeps with detail="full" returns trimmed records with stage_durations mapping."""
     sleep1 = sleep_fixture(sleep_id="sleep-1")
     sleep2 = sleep_fixture(sleep_id="sleep-2")
 
@@ -615,23 +615,24 @@ async def test_list_sleeps_happy_path(
         result = await call_tool(
             server,
             "list_sleeps",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "detail": "full"},
             app_context,
         )
 
     assert result["count"] == 2
     assert len(result["records"]) == 2
     assert result["next_token"] is None
+    assert result["units"] == {"stage_durations": "milliseconds"}
     # Verify trimming and field remapping
     for record in result["records"]:
         assert "sleep_performance_percentage" in record
         assert "sleep_efficiency_percentage" in record
         assert "respiratory_rate" in record
-        assert "stage_durations_milli" in record
-        assert record["stage_durations_milli"]["awake"] == 900000
-        assert record["stage_durations_milli"]["light"] == 14400000
-        assert record["stage_durations_milli"]["deep"] == 7200000
-        assert record["stage_durations_milli"]["rem"] == 5400000
+        assert "stage_durations" in record
+        assert record["stage_durations"]["awake"] == 900000
+        assert record["stage_durations"]["light"] == 14400000
+        assert record["stage_durations"]["deep"] == 7200000
+        assert record["stage_durations"]["rem"] == 5400000
         assert "total_in_bed_time_milli" not in record
 
 
@@ -673,7 +674,7 @@ async def test_list_cycles_happy_path(
 async def test_list_workouts_happy_path(
     config: Config, app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """list_workouts returns trimmed records with zone_durations_milli mapping."""
+    """list_workouts with detail="full" returns trimmed records with zone_durations mapping."""
     workout1 = workout_fixture(workout_id="w-1")
     workout2 = workout_fixture(workout_id="w-2", strain=9.0)
 
@@ -689,21 +690,22 @@ async def test_list_workouts_happy_path(
         result = await call_tool(
             server,
             "list_workouts",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "detail": "full"},
             app_context,
         )
 
     assert result["count"] == 2
     assert len(result["records"]) == 2
     assert result["next_token"] is None
+    assert result["units"] == {"zone_durations": "milliseconds"}
     for record in result["records"]:
         assert "sport_name" in record
         assert "strain" in record
         assert "average_heart_rate" in record
         assert "max_heart_rate" in record
-        assert "zone_durations_milli" in record
-        assert record["zone_durations_milli"]["zone_zero"] == 0
-        assert record["zone_durations_milli"]["zone_five"] == 600000
+        assert "zone_durations" in record
+        assert record["zone_durations"]["zone_zero"] == 0
+        assert record["zone_durations"]["zone_five"] == 600000
 
 
 @respx.mock
@@ -844,7 +846,8 @@ async def test_get_sleep(
 
     assert result["id"] == "sleep-123"
     assert "sleep_performance_percentage" in result
-    assert "stage_durations_milli" in result
+    assert "stage_durations" in result
+    assert result["units"] == {"stage_durations": "milliseconds"}
     assert "total_in_bed_time_milli" not in result
 
 
@@ -866,7 +869,8 @@ async def test_get_workout(
     assert result["id"] == "workout-456"
     assert "sport_name" in result
     assert "strain" in result
-    assert "zone_durations_milli" in result
+    assert "zone_durations" in result
+    assert result["units"] == {"zone_durations": "milliseconds"}
 
 
 @respx.mock
