@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -305,8 +306,13 @@ def test_read_function_raises_without_user_id() -> None:
     at runtime. Uses get_recoveries as the representative test."""
     conn = open_store(":memory:")
 
+    # *args rather than a literal get_recoveries(conn) call: the missing
+    # argument is deliberate here (that's the point of the test), but a
+    # static analyzer can't tell that apart from a real call-site bug --
+    # CodeQL's wrong-number-of-arguments query flagged the literal form.
+    args: tuple[Any, ...] = (conn,)
     with pytest.raises(TypeError, match=r"missing.*required.*positional.*argument"):
-        get_recoveries(conn)  # type: ignore[call-arg]
+        get_recoveries(*args)
 
     conn.close()
 

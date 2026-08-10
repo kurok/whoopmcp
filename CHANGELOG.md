@@ -85,6 +85,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `whoop_logout` clears it back to unresolved. This is a shape change,
   not a feature -- no database, no session store -- so that a second user
   (#29) becomes a change to one resolver rather than a rewrite of every tool.
+- `correlate_metrics` now sweeps a range of day-offsets instead of reporting
+  one correlation, and every point in the sweep carries both Pearson's r
+  and Spearman's rho (`analysis.spearman`, ranks-based, ties resolved by
+  average rank) rather than Pearson alone. `lag_days` (default 3, capped at
+  14) sets the sweep radius; a positive lag means `metric_a`'s date
+  precedes `metric_b`'s. The whole sweep is always returned, never just
+  its best lag, and a lag with too few surviving pairs is reported as
+  refused rather than silently dropped. This path joins the two metrics by
+  calendar date rather than `correlate()`'s existing cycle_id join -- lag
+  arithmetic is fundamentally a date operation, and the tool's docstring
+  and `INSTRUCTIONS` now both say so, since the two joins do not coincide
+  in general (a Recovery is created hours after the Cycle it belongs to,
+  which can shift the "physiologically aligned" pairing by a day). This is
+  a breaking change to `correlate_metrics`' response shape -- no flat,
+  single-correlation mode remains.
 - `analysis.Trend`/`metric_trend` now report fit quality alongside the slope,
   as a number (`r_squared`, reusing the existing `pearson` primitive on the
   same day-offset/value series already fed to `linear_slope`) and as a word
