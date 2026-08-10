@@ -15,11 +15,16 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 #: Below this many paired observations a correlation is not worth reporting.
 MIN_CORRELATION_SAMPLES = 8
+
+#: Below this many observations, a trend/regression is not worth reporting --
+#: mirrors MIN_CORRELATION_SAMPLES's philosophy for this module's other
+#: "refuse below N" convention.
+MIN_TREND_SAMPLES = 8
 
 #: Friendly metric name -> key within record["score"].
 _METRIC_PATHS: dict[str, str] = {
@@ -54,6 +59,14 @@ class Summary:
 
 
 @dataclass(frozen=True, slots=True)
+class RollingPoint:
+    """One point in a rolling-mean series: a calendar date and its mean."""
+
+    date: str
+    value: float
+
+
+@dataclass(frozen=True, slots=True)
 class Trend:
     """A least-squares trend, in metric units per day."""
 
@@ -62,6 +75,11 @@ class Trend:
     slope_per_day: float
     first: float
     last: float
+    r_squared: float
+    fit_quality: str
+    rolling_7d: list[RollingPoint]
+    rolling_30d: list[RollingPoint]
+    rolling_90d: list[RollingPoint]
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,17 +242,115 @@ def summarize(records: Sequence[dict[str, Any]], metric: str) -> Summary:
     )
 
 
+def _describe_fit(r_squared: float) -> str:
+    """Describe a fit's strength in words, from its r-squared.
+
+    A slope is not safe to narrate without knowing how much of the variance
+    it actually explains -- this is the "describe the fit in words" half of
+    that requirement, alongside the numeric r_squared field it never
+    replaces. Bands are deliberately coarse and stated here rather than
+    hidden behind the word: r_squared >= 0.7 "strong", >= 0.4 "moderate",
+    >= 0.1 "weak", otherwise "negligible". These are common, not universal,
+    conventions -- the numeric r_squared is always reported alongside this
+    so nothing is lost if a caller judges the fit differently.
+    """
+    if r_squared >= 0.7:
+        return "strong"
+    if r_squared >= 0.4:
+        return "moderate"
+    if r_squared >= 0.1:
+        return "weak"
+    return "negligible"
+
+
+def _daily_means(dated_values: Sequence[tuple[str, float]]) -> list[RollingPoint]:
+    """Collapse same-date observations to one mean each, sorted by date."""
+    groups: dict[str, list[float]] = {}
+    for date, value in dated_values:
+        groups.setdefault(date, []).append(value)
+    return [RollingPoint(date=date, value=mean(values)) for date, values in sorted(groups.items())]
+
+
+def _rolling_means(daily: Sequence[RollingPoint], window_days: int) -> list[RollingPoint]:
+    """Rolling mean over a trailing window of ``window_days`` calendar days.
+
+    ``daily`` must already be day-deduplicated and sorted by date. A date only
+    gets a point once at least ``window_days`` calendar days have elapsed
+    since the start of the *current run of coverage*; the window itself is
+    every day-deduplicated point whose date falls within the trailing
+    ``window_days``-day span, with no gap-filling for days that have no
+    observation.
+
+    "Current run of coverage" matters because a gap between two consecutive
+    daily points that is itself >= ``window_days`` resets the minimum-periods
+    clock: no point from before such a gap could ever land inside a window
+    that only looks back ``window_days - 1`` days in the first place, so
+    without the reset, the first point after a long gap would silently be
+    reported as a full ``window_days``-day mean while actually being an
+    average of whatever handful of points the gap happened to leave nearby --
+    the exact "spurious swing" the leading-edge rule exists to prevent, just
+    triggered mid-series instead of only at the very start. Each window size
+    resets independently (a gap can be big enough to reset the 7-day window
+    while leaving the 90-day window's own coverage intact), which falls out
+    for free from this function being called once per window size.
+    """
+    dates = [datetime.fromisoformat(point.date).date() for point in daily]
+    points: list[RollingPoint] = []
+    window_start_idx = 0
+    run_start = dates[0]
+    for i, current_date in enumerate(dates):
+        if i > 0 and (current_date - dates[i - 1]).days >= window_days:
+            run_start = current_date
+        if (current_date - run_start).days < window_days - 1:
+            continue
+        window_start = current_date - timedelta(days=window_days - 1)
+        while dates[window_start_idx] < window_start:
+            window_start_idx += 1
+        window_values = [point.value for point in daily[window_start_idx : i + 1]]
+        points.append(RollingPoint(date=daily[i].date, value=mean(window_values)))
+    return points
+
+
 def trend(records: Sequence[dict[str, Any]], metric: str) -> Trend:
-    """Direction and rate of change for one metric over time."""
+    """Direction, rate of change and fit quality for one metric over time.
+
+    Also returns 7/30/90-day rolling means computed on a day-deduplicated
+    calendar series, independent of the per-record slope/r_squared figures.
+    """
+    filtered = _filtered_records(records, metric)
+    if len(filtered) < MIN_TREND_SAMPLES:
+        raise InsufficientDataError(
+            f"trend needs at least {MIN_TREND_SAMPLES} observations, got {len(filtered)}"
+        )
+
     pairs = [
         (datetime.fromisoformat(record["created_at"]).timestamp() / 86_400.0, value)
-        for record, value in _filtered_records(records, metric)
+        for record, value in filtered
     ]
     pairs.sort(key=lambda pair: pair[0])
     xs = [day for day, _ in pairs]
     ys = [value for _, value in pairs]
     slope = linear_slope(xs, ys)
-    return Trend(metric=metric, count=len(ys), slope_per_day=slope, first=ys[0], last=ys[-1])
+    r_squared = pearson(xs, ys) ** 2
+
+    dated_values = [
+        (datetime.fromisoformat(record["created_at"]).astimezone(UTC).date().isoformat(), value)
+        for record, value in filtered
+    ]
+    daily = _daily_means(dated_values)
+
+    return Trend(
+        metric=metric,
+        count=len(ys),
+        slope_per_day=slope,
+        first=ys[0],
+        last=ys[-1],
+        r_squared=r_squared,
+        fit_quality=_describe_fit(r_squared),
+        rolling_7d=_rolling_means(daily, 7),
+        rolling_30d=_rolling_means(daily, 30),
+        rolling_90d=_rolling_means(daily, 90),
+    )
 
 
 def correlate(
