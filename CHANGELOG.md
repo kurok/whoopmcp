@@ -62,6 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BACKFILL` yet (that's #14). Both limits are configurable via
   `WHOOPMCP_RATE_LIMIT_PER_MINUTE` / `WHOOPMCP_RATE_LIMIT_PER_DAY` for when
   WHOOP grants an increase.
+- New `store.py`: a `sqlite3` persistence layer, making `Config.cache_path`/
+  `.cache_enabled` real (previously declared, never read). Six tables --
+  cycles, sleeps, recoveries, workouts, body measurements, profile -- each
+  keyed by `(whoop_user_id, resource_id)` (or `whoop_user_id` alone for the
+  two singleton tables), storing the extracted columns other modules
+  already read alongside the full raw JSON payload, plus a `sync_state`
+  table (user, entity, cursor, last run, outcome) and a `deleted_at` column
+  on every entity table reserved for #18. Schema versioning via a
+  `PRAGMA user_version` ladder, applied forward on every open. Every write
+  is an upsert keyed on the primary key -- a recovery WHOOP rescores days
+  later updates in place rather than duplicating -- and every read function
+  requires `whoop_user_id` as its first argument, with no default and a
+  runtime check behind the type hint. Not yet wired into `server.py` or
+  `client.py`; this issue is the data layer only, importing from neither.
 - Every tool that reads data now takes its caller's identity from a `Principal`
   carried on `AppContext` (`_ensure_principal`) rather than trusting whatever
   token happens to be loaded process-wide. Resolved once at startup from the
