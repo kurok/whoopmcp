@@ -22,7 +22,13 @@ from typing import Any
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 
-from whoopmcp.analysis import InsufficientDataError, correlate, summarize, trend
+from whoopmcp.analysis import (
+    DEFAULT_LAG_SWEEP,
+    InsufficientDataError,
+    correlate_lag_sweep,
+    summarize,
+    trend,
+)
 from whoopmcp.auth import Authenticator, AuthError, build_store
 from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_params
 from whoopmcp.config import Config
@@ -41,6 +47,10 @@ Guidance:
   will exhaust both the rate limit and the context window.
 - A WHOOP "cycle" is a physiological day, which does not align with midnight.
   Join sleep and recovery to strain through cycle_id, not calendar date.
+  Exception: correlate_metrics' lag sweep matches by calendar date instead,
+  since a lag is fundamentally a date shift -- its lag values are
+  day-to-day, not cycle-to-cycle, and can land one lag off from what
+  cycle_id-based reasoning would predict.
 - Records carry a score_state; only "SCORED" records have usable scores.
 - This is wellness data, not clinical data. Report what the numbers say and
   their sample size. Do not diagnose, and do not present a correlation over
@@ -587,6 +597,14 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
 
 # -- analysis --------------------------------------------------------------
 
+#: Largest sweep radius correlate_metrics accepts for lag_days. Unbounded
+#: would let a caller request an arbitrarily large sweep (each entry costs
+#: context, and #25's ceiling doesn't help here since this tool predates
+#: it) from a handful of days of input -- 14 (29 entries) comfortably
+#: covers the "does yesterday/last-week's X predict Y" questions this
+#: feature exists for.
+_MAX_LAG_SWEEP_RADIUS = 14
+
 #: Friendly metric name -> the collection it is sourced from.
 _METRIC_COLLECTION: dict[str, str] = {
     "recovery_score": "recovery",
@@ -741,20 +759,42 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
 
     @server.tool(name="correlate_metrics", title="Correlate two metrics", annotations=READ_ONLY)
     async def correlate_metrics(
-        metric_a: str, metric_b: str, start: str, end: str, ctx: Context[AppContext, Any]
+        metric_a: str,
+        metric_b: str,
+        start: str,
+        end: str,
+        ctx: Context[AppContext, Any],
+        lag_days: int = max(DEFAULT_LAG_SWEEP),
     ) -> dict[str, Any]:
-        """Correlate two metrics over a range, joining records on cycle.
+        """Correlate two metrics over a range, sweeping a range of day-offsets.
 
-        Returns Pearson's r with the sample size it was computed from, and
-        refuses to report below 8 paired observations. Correlation here is
-        descriptive: it does not establish that one metric drives the other.
+        Joins the two metrics by UTC calendar date rather than by cycle, and
+        reports Pearson's r and Spearman's rho at every lag from -lag_days to
+        +lag_days (inclusive), each with its own sample size. A positive lag
+        means metric_a's date precedes metric_b's by that many days --
+        metric_a "leads". A lag whose surviving pairs fall below 8 is
+        reported as refused rather than omitted.
+
+        Correlation here is descriptive, not causal: WHOOP daily samples are
+        autocorrelated (today's recovery is not independent of yesterday's),
+        so do not read a strong r at some lag as proof that one metric drives
+        the other, and do not treat a handful of weeks as a stable finding.
 
         Args:
             metric_a: First metric name, as in metric_trend.
             metric_b: Second metric name.
             start: ISO 8601 start of the range.
             end: ISO 8601 end of the range.
+            lag_days: Sweep radius in days (default 3, capped at 14); the
+                sweep covers every integer lag from -lag_days to +lag_days.
+
+        Raises:
+            ValueError: if lag_days is negative.
         """
+        if lag_days < 0:
+            raise ValueError(f"lag_days must be >= 0, got {lag_days}")
+        lag_days = min(lag_days, _MAX_LAG_SWEEP_RADIUS)
+
         app = ctx.request_context.lifespan_context
         _ensure_principal(app)
 
@@ -769,15 +809,28 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 if collection_b == collection_a
                 else await _fetch_collection(app, collection_b, start, end)
             )
-            try:
-                result = correlate(records_a, metric_a, records_b, metric_b)
-            except InsufficientDataError as exc:
-                return {"error": "insufficient_data", "message": str(exc)}
+            sweep_results = correlate_lag_sweep(
+                records_a, metric_a, records_b, metric_b, lags=range(-lag_days, lag_days + 1)
+            )
             return {
-                "metric_a": result.metric_a,
-                "metric_b": result.metric_b,
-                "count": result.count,
-                "r": result.r,
+                "metric_a": metric_a,
+                "metric_b": metric_b,
+                "sweep": [
+                    {
+                        "lag_days": entry.lag_days,
+                        "refused": entry.correlation is None,
+                        **(
+                            {
+                                "count": entry.correlation.count,
+                                "r": entry.correlation.r,
+                                "spearman_r": entry.correlation.spearman_r,
+                            }
+                            if entry.correlation is not None
+                            else {"message": entry.refused_reason}
+                        ),
+                    }
+                    for entry in sweep_results
+                ],
             }
 
         return await _guard_rate_limit(_fetch)
