@@ -35,6 +35,7 @@ from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.context_budget import TOOL_CEILINGS, estimate_tokens
 from whoopmcp.server import AppContext, Principal, build_server
+from whoopmcp.store import link_principal_to_member, open_store
 
 # -- fixture helpers, mirroring tests/test_server.py's own (kept separate so
 # this file's worst-case fixtures can evolve independently of the happy-path
@@ -101,7 +102,25 @@ def app_context(config: Config) -> AppContext:
     # principal= matches test_server.py's own fixture and profile_fixture()'s
     # user_id (#8, merged after this file was first written) -- every tool
     # now gates on _ensure_principal, which raises without this.
-    return AppContext(config=config, auth=auth, client=client, principal=Principal(user_id=12345))
+    #
+    # store_conn= plus the principal_members row (#29, merged after this file
+    # was first written): every tool now resolves identity via
+    # resolve_member_id, which requires a store and errors without a mapping
+    # for the calling principal -- ("__local__", None, None) is
+    # _principal_key's own sentinel for a request-less (stdio-shaped) Context,
+    # exactly what call_tool's ServerRequestContext(session=None, ...) builds.
+    conn = open_store(":memory:")
+    link_principal_to_member(
+        conn, client_id="__local__", issuer=None, subject=None, whoop_user_id=12345
+    )
+    yield AppContext(
+        config=config,
+        auth=auth,
+        client=client,
+        principal=Principal(user_id=12345),
+        store_conn=conn,
+    )
+    conn.close()
 
 
 @pytest.fixture

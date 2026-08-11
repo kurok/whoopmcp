@@ -240,6 +240,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wired into `server.py`: nothing here maps a validated token to a WHOOP
   member (that's #29), so turning on enforcement for the real `/mcp` endpoint
   today would only break existing clients, not protect anything yet.
+- New `tests/test_tenancy.py`: pins down issue #29's tenancy contract ahead of
+  its implementation. Specifies a `principal_members` mapping table written
+  only by a completed WHOOP login, never inferred from a header or accepted
+  from a caller-supplied parameter; one `resolve_member_id` edge resolver
+  that audits every call and never defaults an unmapped principal;
+  database-level scoping proven by a deliberately unscoped query, including
+  the sharper case of a completely unfiltered `UPDATE`, which needs an
+  internal rollback (not just a raised exception) to actually fail closed
+  rather than leaving a pending mutation for a later commit to persist; and
+  a registry-driven cross-tenant sweep over `build_server().list_tools()` --
+  never a hand-maintained tool name list -- shown during development to
+  catch a deliberately unprotected tool before it can leak another member's
+  data.
+- Issue #29 implements the tenancy contract the entry above specified. A
+  `store.py` schema v3 adds `principal_members` (composite key `client_id`/
+  `issuer`/`subject`, `''` sentinels rather than `NULL` so two no-subject
+  principals can't silently collide) written only by `whoop_complete_login`,
+  and `tool_call_audit`, shape-locked to `whoop_user_id`/`tool_name`/
+  `called_at` with no column to carry a payload in. `server.resolve_member_id`
+  is the one edge resolver every data/analysis tool now calls, through a new
+  `_ensure_matches_live_grant` that replaces the old bare `_ensure_principal`
+  gate and additionally refuses a resolved member that isn't this process's
+  one live WHOOP grant; an unmapped principal raises `UnresolvedPrincipalError`
+  rather than defaulting, and a caller-supplied header or query-param identity
+  hint is never consulted. Database-level enforcement is a new
+  `store._execute_scoped`, built on `sqlite3.Connection.set_authorizer` and
+  now the only way any of store.py's seven tenant-scoped tables are read or
+  written: a query touching one without reading its own `whoop_user_id`
+  column raises `UnscopedQueryError` and rolls back before any row reaches a
+  caller, closing the gap where a non-`SELECT` statement has already fully
+  executed by the time the violation is caught. `lifespan()` now opens the
+  store unconditionally rather than only when webhooks are enabled, so this
+  join has something to resolve against outside of tests.
 
 ### Changed
 

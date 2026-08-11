@@ -26,7 +26,7 @@ from typing import Any
 
 #: Bump this and append to ``_MIGRATIONS`` when the schema changes. Never
 #: edit an already-shipped migration -- append a new one instead.
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 # -- schema ------------------------------------------------------------------
 #
@@ -159,13 +159,173 @@ CREATE TABLE IF NOT EXISTS webhook_events (
 CREATE INDEX IF NOT EXISTS ix_webhook_events_status ON webhook_events (status);
 """
 
+#: Version 3 (#29): the principal<->WHOOP-member join, and its audit log.
+#:
+#: ``principal_members`` is the ONLY table that maps an MCP principal (a
+#: bearer token's ``client_id``/``issuer``/``subject`` triple -- see
+#: ``mcp.server.auth.provider.principal_components``, or the fixed local
+#: sentinel ``server._LOCAL_PRINCIPAL_CLIENT_ID`` under stdio / no-bearer-auth
+#: deployments) to a ``whoop_user_id``. Populated ONLY by
+#: ``link_principal_to_member``, called ONLY from ``server.whoop_complete_login``
+#: -- never inferred from a header, a hostname, or an unsigned claim.
+#: ``issuer``/``subject`` are ``NOT NULL DEFAULT ''`` rather than nullable:
+#: sqlite's own NULL-handling means a composite PRIMARY KEY does not treat two
+#: NULLs as equal, so two distinct no-subject principals could otherwise both
+#: "successfully" insert as if the key were unique when it silently was not.
+#: ``''`` sidesteps that trap; every caller passes it through unconditionally
+#: (see ``link_principal_to_member``/``get_member_for_principal``).
+#:
+#: ``tool_call_audit`` is deliberately narrow: ``whoop_user_id``, ``tool_name``,
+#: ``called_at`` and nothing else. That is a schema-shape guarantee that
+#: nobody can silently smuggle a payload/argument/result column onto this
+#: table later without ``test_tool_call_audit_table_is_shape_locked_to_no
+#: _payload_columns`` failing first -- see ``record_tool_call``.
+_SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS principal_members (
+    client_id TEXT NOT NULL,
+    issuer TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT '',
+    whoop_user_id INTEGER NOT NULL,
+    linked_at TEXT NOT NULL,
+    PRIMARY KEY (client_id, issuer, subject)
+);
+
+CREATE TABLE IF NOT EXISTS tool_call_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    whoop_user_id INTEGER NOT NULL,
+    tool_name TEXT NOT NULL,
+    called_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_tool_call_audit_whoop_user_id ON tool_call_audit (whoop_user_id);
+"""
+
 #: Migration ladder: version N's script, applied when the database's
 #: `PRAGMA user_version` is below N. Keyed by the version it produces, so
-#: appending a real migration later is `_MIGRATIONS[3] = "ALTER TABLE ..."`.
+#: appending a real migration later is `_MIGRATIONS[4] = "ALTER TABLE ..."`.
 _MIGRATIONS: dict[int, str] = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
+    3: _SCHEMA_V3,
 }
+
+#: Tables filtered by ``whoop_user_id`` that ``_execute_scoped`` enforces a
+#: read of that column against, on every touch. Deliberately excludes:
+#: ``webhook_events`` (its ``whoop_user_id`` is nullable pre-identity-resolution
+#: data -- issue #18's own design, not a leak surface #29 is about), and
+#: ``principal_members``/``tool_call_audit`` (the identity/audit layer itself,
+#: not member data to filter by member). If a new tenant-scoped table is ever
+#: added here without a matching cross-read test case, ``tests/test_tenancy.py
+#: ::test_tested_entity_tables_cover_every_tenant_scoped_table`` fails loudly.
+_TENANT_SCOPED_TABLES: frozenset[str] = frozenset(
+    {
+        "recoveries",
+        "sleeps",
+        "cycles",
+        "workouts",
+        "body_measurements",
+        "profiles",
+        "sync_state",
+    }
+)
+
+
+class UnscopedQueryError(RuntimeError):
+    """A query against a tenant-scoped table never read its ``whoop_user_id`` column.
+
+    Raised by ``_execute_scoped`` -- the database-level half of #29's
+    enforcement: a missing member filter fails here, at the engine, not only
+    by application code remembering to pass one.
+    """
+
+
+def _execute_scoped(
+    conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+) -> sqlite3.Cursor:
+    """Run ``sql`` against ``conn``, failing closed if it touches a
+    tenant-scoped table (``_TENANT_SCOPED_TABLES``) without reading that
+    table's own ``whoop_user_id`` column as a restrictive equality predicate.
+
+    This is the ONLY way any function in this module touches ``conn`` for an
+    entity read/write -- ``test_store_has_no_unwrapped_sqlite_execute_outside
+    _scoped_wrapper`` enforces that structurally, so a future store.py
+    function cannot quietly route around this check.
+
+    Mechanism: installs a ``sqlite3.Connection.set_authorizer`` callback for
+    the duration of this one statement's compilation, recording every
+    ``SQLITE_READ`` (table, column) pair and every table named by a
+    ``SQLITE_INSERT``/``SQLITE_UPDATE``/``SQLITE_DELETE`` action. Any
+    tenant-scoped table that was touched (read OR written) but never had its
+    ``whoop_user_id`` column read is unscoped -- this also catches a bare
+    ``UPDATE t SET col = val`` with no ``WHERE`` at all, which triggers no
+    ``SQLITE_READ`` whatsoever (there is nothing to read to pick rows), only
+    the write action naming the table.
+
+    For SELECT statements, an additional check ensures ``whoop_user_id`` is
+    used with a restrictive equality predicate (``whoop_user_id = ?``), not
+    just mentioned. This catches cases like ``WHERE whoop_user_id > 0`` or
+    ``SELECT whoop_user_id FROM table`` without a WHERE clause.
+
+    A non-``SELECT`` statement is already fully executed (sqlite3 steps it to
+    completion inside a single ``execute()`` call) by the time the violation
+    is detected, so raising alone would leave its mutation sitting as a
+    pending, uncommitted change that a later, unrelated ``conn.commit()``
+    could silently persist. ``conn.rollback()`` before raising undoes it.
+    Every store.py write function commits immediately after its own
+    ``_execute_scoped`` call and never batches multiple writes in one
+    transaction, so this rollback only ever undoes the offending statement
+    itself, never a caller's earlier, already-legitimate work.
+    """
+    import re
+
+    reads: dict[str, set[str]] = {}
+    writes: set[str] = set()
+
+    def authorizer(
+        action: int, arg1: str | None, arg2: str | None, arg3: str | None, arg4: str | None
+    ) -> int:
+        del arg3, arg4
+        if action == sqlite3.SQLITE_READ and arg1 in _TENANT_SCOPED_TABLES:
+            reads.setdefault(arg1, set()).add(arg2 or "")
+        elif (
+            action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE)
+            and arg1 in _TENANT_SCOPED_TABLES
+        ):
+            writes.add(arg1)
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(authorizer)
+    try:
+        cursor = conn.execute(sql, params)
+    finally:
+        conn.set_authorizer(None)
+
+    touched = writes | set(reads)
+    unscoped = {table for table in touched if "whoop_user_id" not in reads.get(table, set())}
+    if unscoped:
+        conn.rollback()
+        raise UnscopedQueryError(
+            f"query touches tenant-scoped table(s) {sorted(unscoped)} without "
+            f"reading whoop_user_id: {sql!r}"
+        )
+
+    # For SELECT statements that reference whoop_user_id, ensure it is used
+    # with a restrictive equality predicate (whoop_user_id = ?) rather than
+    # just mentioned or used non-restrictively. This catches cases like
+    # "WHERE whoop_user_id > 0" or "SELECT whoop_user_id FROM ..." without
+    # a restrictive WHERE clause.
+    references_whoop_user_id = any("whoop_user_id" in reads.get(table, set()) for table in reads)
+    if (
+        "SELECT" in sql.upper()
+        and references_whoop_user_id
+        and not re.search(r"whoop_user_id\s*=\s*\?", sql, re.IGNORECASE)
+    ):
+        conn.rollback()
+        raise UnscopedQueryError(
+            f"query touches tenant-scoped table(s) with whoop_user_id but "
+            f"does not filter with whoop_user_id = ?: {sql!r}"
+        )
+
+    return cursor
 
 
 def open_store(path: str | Path) -> sqlite3.Connection:
@@ -231,7 +391,8 @@ def upsert_recovery(conn: sqlite3.Connection, whoop_user_id: int, record: dict[s
     extracted column below falls back to ``NULL`` on its own.
     """
     score = record.get("score") or {}
-    conn.execute(
+    _execute_scoped(
+        conn,
         """
         INSERT INTO recoveries (
             whoop_user_id, resource_id, created_at, score_state,
@@ -277,7 +438,8 @@ def get_recoveries(
     store does no reshaping.
     """
     _require_user_id(whoop_user_id)
-    rows = conn.execute(
+    rows = _execute_scoped(
+        conn,
         """
         SELECT raw_json FROM recoveries
         WHERE whoop_user_id = ?
@@ -296,7 +458,8 @@ def get_recoveries(
 def upsert_sleep(conn: sqlite3.Connection, whoop_user_id: int, record: dict[str, Any]) -> None:
     """Insert or update one sleep, keyed on (whoop_user_id, id)."""
     score = record.get("score") or {}
-    conn.execute(
+    _execute_scoped(
+        conn,
         """
         INSERT INTO sleeps (
             whoop_user_id, resource_id, start, end, score_state,
@@ -340,7 +503,8 @@ def get_sleeps(
     timestamp when given.
     """
     _require_user_id(whoop_user_id)
-    rows = conn.execute(
+    rows = _execute_scoped(
+        conn,
         """
         SELECT raw_json FROM sleeps
         WHERE whoop_user_id = ?
@@ -364,7 +528,8 @@ def upsert_cycle(conn: sqlite3.Connection, whoop_user_id: int, record: dict[str,
     primary key's column type is consistent across all four entity tables.
     """
     score = record.get("score") or {}
-    conn.execute(
+    _execute_scoped(
+        conn,
         """
         INSERT INTO cycles (
             whoop_user_id, resource_id, start, end, score_state, strain,
@@ -405,7 +570,8 @@ def get_cycles(
     timestamp when given.
     """
     _require_user_id(whoop_user_id)
-    rows = conn.execute(
+    rows = _execute_scoped(
+        conn,
         """
         SELECT raw_json FROM cycles
         WHERE whoop_user_id = ?
@@ -424,7 +590,8 @@ def get_cycles(
 def upsert_workout(conn: sqlite3.Connection, whoop_user_id: int, record: dict[str, Any]) -> None:
     """Insert or update one workout, keyed on (whoop_user_id, id)."""
     score = record.get("score") or {}
-    conn.execute(
+    _execute_scoped(
+        conn,
         """
         INSERT INTO workouts (
             whoop_user_id, resource_id, start, end, score_state, sport_name,
@@ -467,7 +634,8 @@ def get_workouts(
     timestamp when given.
     """
     _require_user_id(whoop_user_id)
-    rows = conn.execute(
+    rows = _execute_scoped(
+        conn,
         """
         SELECT raw_json FROM workouts
         WHERE whoop_user_id = ?
@@ -490,7 +658,8 @@ def upsert_body_measurement(
     conn: sqlite3.Connection, whoop_user_id: int, record: dict[str, Any]
 ) -> None:
     """Insert or update the one body-measurement row for ``whoop_user_id``."""
-    conn.execute(
+    _execute_scoped(
+        conn,
         """
         INSERT INTO body_measurements (whoop_user_id, raw_json, updated_at)
         VALUES (?, ?, ?)
@@ -507,7 +676,8 @@ def get_body_measurement(conn: sqlite3.Connection, whoop_user_id: int) -> dict[s
     """The stored body-measurement payload for ``whoop_user_id``, or ``None``
     if nothing has been synced for them yet."""
     _require_user_id(whoop_user_id)
-    row = conn.execute(
+    row = _execute_scoped(
+        conn,
         "SELECT raw_json FROM body_measurements WHERE whoop_user_id = ?",
         (whoop_user_id,),
     ).fetchone()
@@ -516,7 +686,8 @@ def get_body_measurement(conn: sqlite3.Connection, whoop_user_id: int) -> dict[s
 
 def upsert_profile(conn: sqlite3.Connection, whoop_user_id: int, record: dict[str, Any]) -> None:
     """Insert or update the one profile row for ``whoop_user_id``."""
-    conn.execute(
+    _execute_scoped(
+        conn,
         """
         INSERT INTO profiles (whoop_user_id, raw_json, updated_at)
         VALUES (?, ?, ?)
@@ -533,7 +704,8 @@ def get_profile(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str, Any] 
     """The stored profile payload for ``whoop_user_id``, or ``None`` if
     nothing has been synced for them yet."""
     _require_user_id(whoop_user_id)
-    row = conn.execute(
+    row = _execute_scoped(
+        conn,
         "SELECT raw_json FROM profiles WHERE whoop_user_id = ?",
         (whoop_user_id,),
     ).fetchone()
@@ -557,7 +729,8 @@ def set_sync_state(
     ``cursor`` is ``None`` for entities that don't paginate by cursor (e.g.
     a full-sync result for a singleton like the profile).
     """
-    conn.execute(
+    _execute_scoped(
+        conn,
         """
         INSERT INTO sync_state (whoop_user_id, entity, cursor, last_run_at, outcome)
         VALUES (?, ?, ?, ?, ?)
@@ -577,7 +750,8 @@ def get_sync_state(
     """The last recorded sync outcome for (``whoop_user_id``, ``entity``),
     or ``None`` if that pair has never been synced."""
     _require_user_id(whoop_user_id)
-    row = conn.execute(
+    row = _execute_scoped(
+        conn,
         """
         SELECT cursor, last_run_at, outcome FROM sync_state
         WHERE whoop_user_id = ? AND entity = ?
@@ -617,7 +791,8 @@ def insert_webhook_event(
     it is the ``PRIMARY KEY``'s job to make that guarantee load-bearing
     rather than advisory.
     """
-    conn.execute(
+    _execute_scoped(
+        conn,
         """
         INSERT INTO webhook_events (
             trace_id, whoop_user_id, event_type, event_body, status,
@@ -645,7 +820,8 @@ def get_webhook_event(conn: sqlite3.Connection, trace_id: str) -> dict[str, Any]
     """The webhook_events row for ``trace_id``, or ``None`` if never seen."""
     # _WEBHOOK_EVENT_COLUMNS is a fixed, internal tuple of literal column
     # names, never user input.
-    row = conn.execute(
+    row = _execute_scoped(
+        conn,
         f"SELECT {', '.join(_WEBHOOK_EVENT_COLUMNS)} FROM webhook_events WHERE trace_id = ?",  # noqa: S608
         (trace_id,),
     ).fetchone()
@@ -659,7 +835,8 @@ def mark_webhook_event_success(conn: sqlite3.Connection, trace_id: str) -> None:
     deliberately skipped: an unknown user, a *.deleted, or an out-of-order
     record). A later duplicate delivery of the same trace_id sees this
     status and is skipped without a second fetch."""
-    conn.execute(
+    _execute_scoped(
+        conn,
         "UPDATE webhook_events SET status = 'success', processed_at = ? WHERE trace_id = ?",
         (_now(), trace_id),
     )
@@ -669,7 +846,8 @@ def mark_webhook_event_success(conn: sqlite3.Connection, trace_id: str) -> None:
 def mark_webhook_event_retry(conn: sqlite3.Connection, trace_id: str, attempt_count: int) -> None:
     """Record one failed attempt at ``trace_id``, still short of the caller's
     ``max_attempts``. Status stays "pending" -- this is not a terminal state."""
-    conn.execute(
+    _execute_scoped(
+        conn,
         "UPDATE webhook_events SET status = 'pending', attempt_count = ? WHERE trace_id = ?",
         (attempt_count, trace_id),
     )
@@ -684,11 +862,89 @@ def mark_webhook_event_dead_letter(
     Terminal: a dead-lettered event is never retried again, and sits here
     for an operator to inspect (``event_body`` is the full original payload).
     """
-    conn.execute(
+    _execute_scoped(
+        conn,
         """
         UPDATE webhook_events SET status = 'dead_letter', attempt_count = ?, processed_at = ?
         WHERE trace_id = ?
         """,
         (attempt_count, _now(), trace_id),
+    )
+    conn.commit()
+
+
+# -- principal_members & tool_call_audit (#29) --------------------------------
+#
+# The join between an MCP principal and the WHOOP member it is allowed to
+# act as. Written ONLY by ``link_principal_to_member``, called ONLY from
+# ``server.whoop_complete_login`` -- see that function and ``server
+# .resolve_member_id`` for the write and read sides of this join
+# respectively. Neither table is in ``_TENANT_SCOPED_TABLES``: they ARE the
+# identity/audit layer, not member data to filter by member.
+
+
+def link_principal_to_member(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    issuer: str | None,
+    subject: str | None,
+    whoop_user_id: int,
+) -> None:
+    """Record that MCP principal (``client_id``, ``issuer``, ``subject``) may
+    act as WHOOP member ``whoop_user_id``.
+
+    An idempotent upsert: re-linking the same principal (e.g. re-authorising)
+    updates the mapping in place rather than duplicating the row. ``issuer``/
+    ``subject`` of ``None`` are stored as ``''`` -- see ``_SCHEMA_V3``'s own
+    comment for why NULL is unsafe here.
+    """
+    _execute_scoped(
+        conn,
+        """
+        INSERT INTO principal_members (client_id, issuer, subject, whoop_user_id, linked_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (client_id, issuer, subject) DO UPDATE SET
+            whoop_user_id = excluded.whoop_user_id,
+            linked_at = excluded.linked_at
+        """,
+        (client_id, issuer or "", subject or "", whoop_user_id, _now()),
+    )
+    conn.commit()
+
+
+def get_member_for_principal(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    issuer: str | None,
+    subject: str | None,
+) -> int | None:
+    """The WHOOP member id linked to this MCP principal, or ``None`` if
+    unlinked -- the caller (``server.resolve_member_id``) must treat
+    ``None`` as an error, never a default."""
+    cursor = _execute_scoped(
+        conn,
+        """
+        SELECT whoop_user_id FROM principal_members
+        WHERE client_id = ? AND issuer = ? AND subject = ?
+        """,
+        (client_id, issuer or "", subject or ""),
+    )
+    row = cursor.fetchone()
+    return row[0] if row is not None else None
+
+
+def record_tool_call(conn: sqlite3.Connection, whoop_user_id: int, tool_name: str) -> None:
+    """Audit-log one tool call: identity and tool name only, never a payload.
+
+    ``tool_call_audit``'s own schema (see ``_SCHEMA_V3``) makes "no payload"
+    a shape guarantee rather than a redaction step that could have a bug --
+    there is no column here to put one in.
+    """
+    _execute_scoped(
+        conn,
+        "INSERT INTO tool_call_audit (whoop_user_id, tool_name, called_at) VALUES (?, ?, ?)",
+        (whoop_user_id, tool_name, _now()),
     )
     conn.commit()
