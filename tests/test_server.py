@@ -10,8 +10,7 @@ from __future__ import annotations
 import inspect
 import re
 import time
-from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -27,7 +26,16 @@ from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.server import AppContext, Principal, build_server, lifespan
-from whoopmcp.store import link_principal_to_member, open_store
+from whoopmcp.store import (
+    link_principal_to_member,
+    open_store,
+    upsert_body_measurement,
+    upsert_cycle,
+    upsert_profile,
+    upsert_recovery,
+    upsert_sleep,
+    upsert_workout,
+)
 
 #: Every tool the server promises. Adding one here without registering it, or
 #: registering one without listing it here, fails the suite.
@@ -45,6 +53,7 @@ EXPECTED_TOOLS = {
     "get_sleep",
     "get_workout",
     "whoop_sync",
+    "whoop_data_coverage",
     "summarize_period",
     "metric_trend",
     "correlate_metrics",
@@ -56,25 +65,6 @@ EXPECTED_TOOLS = {
 #: to WHOOP itself, which it only ever GETs -- but that is still a real
 #: environment change per MCP's own read_only_hint semantics.
 MUTATING_TOOLS = {"whoop_complete_login", "whoop_logout", "whoop_sync"}
-
-
-def fast_forwarding_clock() -> Callable[[], float]:
-    """A clock that jumps far ahead on every call.
-
-    Since issue #11, WhoopClient._get retries a 429 with real backoff waits
-    before giving up -- against the default (real) clock, that means several
-    genuine multi-second sleeps every time one of these rate-limited-error
-    tests runs. This clock makes each retry's wait resolve after one poll
-    tick instead, since these tests only care about the final result, not
-    the actual wait duration.
-    """
-    state = {"now": 0.0}
-
-    def _clock() -> float:
-        state["now"] += 3600.0
-        return state["now"]
-
-    return _clock
 
 
 # -- fixture helpers for data-tool testing ---------------------------------
@@ -573,76 +563,80 @@ async def test_whoop_logout(server: object, config: Config, app_context: AppCont
 
 
 # -- data tool tests -------------------------------------------------------
+#
+# #16 repointed every one of these at the local store: none of them makes an
+# HTTP call any more, so none of them mocks WHOOP with respx. Every test
+# below seeds app_context.store_conn directly (via the store's own upsert_*
+# functions) instead. The two tests this file used to carry for a
+# RateLimitedError surfacing through list_recoveries/summarize_period are
+# gone outright, not just rewritten: a store-backed tool never calls
+# WhoopClient at all on its happy path, so RateLimitedError is no longer a
+# reachable outcome for either of them.
 
 
-@respx.mock
-async def test_get_profile(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
-) -> None:
-    """get_profile returns profile data and sends bearer token."""
+async def test_get_profile(app_context: AppContext, server: MCPServer[AppContext]) -> None:
+    """get_profile returns the stored profile, plus a "coverage" envelope."""
+    assert app_context.store_conn is not None
     fixture = profile_fixture()
-    route = respx.get(f"{BASE_URL}/v2/user/profile/basic").mock(
-        return_value=httpx.Response(200, json=fixture)
-    )
+    upsert_profile(app_context.store_conn, 12345, fixture)
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(server, "get_profile", {}, app_context)
+    result = await call_tool(server, "get_profile", {}, app_context)
 
-    assert result == fixture
-    assert route.called
-    request = route.calls.last.request
-    assert request.headers["Authorization"] == "Bearer fake-access-token"
+    assert {key: value for key, value in result.items() if key != "coverage"} == fixture
+    assert result["coverage"]["profile"]["synced"] is True
 
 
-@respx.mock
-async def test_get_body_measurement(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+async def test_get_profile_not_synced(
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """get_body_measurement returns measurement data and sends bearer token."""
+    """A never-synced profile is an explicit miss, not an empty dict."""
+    result = await call_tool(server, "get_profile", {}, app_context)
+
+    assert result["error"] == "not_synced"
+    assert result["coverage"]["profile"] == {"synced": False, "last_updated_at": None}
+
+
+async def test_get_body_measurement(app_context: AppContext, server: MCPServer[AppContext]) -> None:
+    """get_body_measurement returns the stored measurement, plus "coverage"."""
+    assert app_context.store_conn is not None
     fixture = body_measurement_fixture()
-    route = respx.get(f"{BASE_URL}/v2/user/measurement/body").mock(
-        return_value=httpx.Response(200, json=fixture)
-    )
+    upsert_body_measurement(app_context.store_conn, 12345, fixture)
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(server, "get_body_measurement", {}, app_context)
+    result = await call_tool(server, "get_body_measurement", {}, app_context)
 
-    assert result == fixture
-    assert route.called
-    request = route.calls.last.request
-    assert request.headers["Authorization"] == "Bearer fake-access-token"
+    assert {key: value for key, value in result.items() if key != "coverage"} == fixture
+    assert result["coverage"]["body_measurement"]["synced"] is True
 
 
-@respx.mock
 async def test_list_recoveries_happy_path(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """list_recoveries returns trimmed records with count and no next_token."""
-    recovery1 = recovery_fixture(cycle_id=100, recovery_score=65.0)
-    recovery2 = recovery_fixture(cycle_id=101, recovery_score=72.5)
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            200,
-            json={"records": [recovery1, recovery2], "next_token": None},
-        )
+    """list_recoveries returns trimmed records with count, no next_token, and coverage."""
+    assert app_context.store_conn is not None
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=100, recovery_score=65.0, created_at="2026-08-02T06:00:00Z"),
+    )
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=101, recovery_score=72.5, created_at="2026-08-03T06:00:00Z"),
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_recoveries",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "list_recoveries",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+        app_context,
+    )
 
     assert result["count"] == 2
     assert len(result["records"]) == 2
     assert result["next_token"] is None
     assert "note" not in result
+    assert result["coverage"]["recoveries"]["earliest"] == "2026-08-02T06:00:00Z"
+    assert "range_coverage" in result
     # Verify trimming: should have score fields but not extra fields
     for record in result["records"]:
         assert "recovery_score" in record
@@ -653,35 +647,29 @@ async def test_list_recoveries_happy_path(
         assert "skin_temp_celsius" not in record
 
 
-@respx.mock
 async def test_list_sleeps_happy_path(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """list_sleeps with detail="full" returns trimmed records with stage_durations mapping."""
-    sleep1 = sleep_fixture(sleep_id="sleep-1")
-    sleep2 = sleep_fixture(sleep_id="sleep-2")
-
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(
-            200,
-            json={"records": [sleep1, sleep2], "next_token": None},
-        )
+    assert app_context.store_conn is not None
+    upsert_sleep(app_context.store_conn, 12345, sleep_fixture(sleep_id="sleep-1"))
+    upsert_sleep(
+        app_context.store_conn,
+        12345,
+        sleep_fixture(sleep_id="sleep-2", created_at="2026-08-02T22:00:00Z"),
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_sleeps",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "detail": "full"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "list_sleeps",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "detail": "full"},
+        app_context,
+    )
 
     assert result["count"] == 2
     assert len(result["records"]) == 2
     assert result["next_token"] is None
     assert result["units"] == {"stage_durations": "milliseconds"}
-    # Verify trimming and field remapping
     for record in result["records"]:
         assert "sleep_performance_percentage" in record
         assert "sleep_efficiency_percentage" in record
@@ -694,29 +682,24 @@ async def test_list_sleeps_happy_path(
         assert "total_in_bed_time_milli" not in record
 
 
-@respx.mock
 async def test_list_cycles_happy_path(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """list_cycles returns trimmed records with expected fields."""
-    cycle1 = cycle_fixture(cycle_id=456, strain=12.0)
-    cycle2 = cycle_fixture(cycle_id=457, strain=14.5)
-
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(
-            200,
-            json={"records": [cycle1, cycle2], "next_token": None},
-        )
+    assert app_context.store_conn is not None
+    upsert_cycle(app_context.store_conn, 12345, cycle_fixture(cycle_id=456, strain=12.0))
+    upsert_cycle(
+        app_context.store_conn,
+        12345,
+        cycle_fixture(cycle_id=457, strain=14.5, created_at="2026-08-02T22:00:00Z"),
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_cycles",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "list_cycles",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+        app_context,
+    )
 
     assert result["count"] == 2
     assert len(result["records"]) == 2
@@ -728,29 +711,20 @@ async def test_list_cycles_happy_path(
         assert "kilojoule" in record
 
 
-@respx.mock
 async def test_list_workouts_happy_path(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """list_workouts with detail="full" returns trimmed records with zone_durations mapping."""
-    workout1 = workout_fixture(workout_id="w-1")
-    workout2 = workout_fixture(workout_id="w-2", strain=9.0)
+    assert app_context.store_conn is not None
+    upsert_workout(app_context.store_conn, 12345, workout_fixture(workout_id="w-1"))
+    upsert_workout(app_context.store_conn, 12345, workout_fixture(workout_id="w-2", strain=9.0))
 
-    respx.get(f"{BASE_URL}/v2/activity/workout").mock(
-        return_value=httpx.Response(
-            200,
-            json={"records": [workout1, workout2], "next_token": None},
-        )
+    result = await call_tool(
+        server,
+        "list_workouts",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "detail": "full"},
+        app_context,
     )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_workouts",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "detail": "full"},
-            app_context,
-        )
 
     assert result["count"] == 2
     assert len(result["records"]) == 2
@@ -766,515 +740,466 @@ async def test_list_workouts_happy_path(
         assert record["zone_durations"]["zone_five"] == 600000
 
 
-@respx.mock
 async def test_list_recoveries_with_unscored_record(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """list_recoveries includes unscored records but without score fields."""
-    scored = recovery_fixture(cycle_id=100, score_state="SCORED")
-    unscored = recovery_fixture(cycle_id=101, score_state="PENDING_SCORE")
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            200,
-            json={"records": [scored, unscored], "next_token": None},
-        )
+    assert app_context.store_conn is not None
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=100, score_state="SCORED", created_at="2026-08-01T06:00:00Z"),
+    )
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(
+            cycle_id=101, score_state="PENDING_SCORE", created_at="2026-08-02T06:00:00Z"
+        ),
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_recoveries",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "list_recoveries",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+        app_context,
+    )
 
     assert result["count"] == 2
-    # First record should have score fields
     assert "recovery_score" in result["records"][0]
     assert result["records"][0]["score_state"] == "SCORED"
-    # Second record should have score_state but no score fields
     assert result["records"][1]["score_state"] == "PENDING_SCORE"
     assert "recovery_score" not in result["records"][1]
 
 
-@respx.mock
 async def test_list_recoveries_with_pagination(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """list_recoveries with next_token includes note and next_token in response."""
-    recovery1 = recovery_fixture(cycle_id=100)
-    recovery2 = recovery_fixture(cycle_id=101)
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            200,
-            json={"records": [recovery1, recovery2], "next_token": "cursor-abc"},
-        )
+    """A limit smaller than the held rows returns a next_token and a note;
+    passing that next_token back continues from exactly where it left off."""
+    assert app_context.store_conn is not None
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=100, created_at="2026-08-01T06:00:00Z"),
+    )
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=101, created_at="2026-08-02T06:00:00Z"),
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
+    first = await call_tool(
+        server,
+        "list_recoveries",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "limit": 1},
+        app_context,
+    )
+
+    assert first["count"] == 1
+    assert first["next_token"] is not None
+    assert "note" in first
+    assert "more" in first["note"].lower()
+    assert first["records"][0]["cycle_id"] == 100
+
+    second = await call_tool(
+        server, "list_recoveries", {"next_token": first["next_token"]}, app_context
+    )
+
+    assert second["count"] == 1
+    assert second["records"][0]["cycle_id"] == 101
+    assert second["next_token"] is None
+
+
+async def test_list_recoveries_rejects_a_zero_limit(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """limit=0 is rejected outright, not silently turned into an
+    empty-page-with-a-self-referential-cursor loop: next_token encodes
+    offset + limit, so a zero limit would produce a continuation token
+    identical to the one that led to it -- an infinite empty-page walk that
+    never resolves to "no more data" (#16 review finding)."""
+    assert app_context.store_conn is not None
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=100, created_at="2026-08-01T06:00:00Z"),
+    )
+
+    with pytest.raises(ToolError, match="limit"):
+        await call_tool(
             server,
             "list_recoveries",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "limit": 0},
             app_context,
         )
 
-    assert result["count"] == 2
-    assert result["next_token"] == "cursor-abc"
-    assert "note" in result
-    assert "more records" in result["note"].lower()
+
+async def test_list_recoveries_one_sided_range_wholly_outside_coverage_is_flagged(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """A one-sided range (only `end` given) that falls wholly before the
+    held coverage window must be flagged, not silently reported as
+    "within_coverage" -- the #16 review's blocking finding: _range_status
+    special-cased the one-sided branches and each originally fell through
+    to `within_coverage` whenever the OTHER bound was unset, regardless of
+    whether the given bound actually overlapped anything held."""
+    assert app_context.store_conn is not None
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=100, created_at="2026-08-01T06:00:00Z"),
+    )
+
+    result = await call_tool(
+        server,
+        "list_recoveries",
+        {"end": "2020-06-01T00:00:00Z"},
+        app_context,
+    )
+
+    assert result["records"] == []
+    assert result["range_coverage"]["recoveries"]["status"] == "wholly_outside_coverage"
+    assert "message" in result["range_coverage"]["recoveries"]
 
 
-@respx.mock
+async def test_list_recoveries_accepts_a_timezone_naive_timestamp(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """A start/end value with no `Z`/offset (a plausible, not malicious,
+    model input that drops the documented UTC suffix) is treated as UTC,
+    not raised as an offset-naive-vs-aware comparison TypeError against the
+    store's own always-aware coverage bounds (#16 review finding)."""
+    assert app_context.store_conn is not None
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=100, created_at="2026-08-02T06:00:00Z"),
+    )
+
+    result = await call_tool(
+        server,
+        "list_recoveries",
+        {"start": "2026-08-01T00:00:00", "end": "2026-08-08T00:00:00"},
+        app_context,
+    )
+
+    # The point of this test is that offset-naive bounds compare cleanly
+    # against the store's aware coverage values at all -- pre-fix, this
+    # call never returned; it raised. Which status comes back (this range
+    # extends past the single held record, so "partly_outside_coverage" is
+    # the correct answer) is incidental to what's being regression-tested.
+    assert result["count"] == 1
+    assert result["range_coverage"]["recoveries"]["status"] in (
+        "within_coverage",
+        "partly_outside_coverage",
+    )
+
+
 async def test_list_recoveries_default_date_range(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """list_recoveries with no start/end defaults to last 7 days."""
-    recovery = recovery_fixture()
-
-    route = respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            200,
-            json={"records": [recovery], "next_token": None},
-        )
+    """list_recoveries with no start/end defaults to the last 7 days."""
+    assert app_context.store_conn is not None
+    now = datetime.now(UTC)
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=100, created_at=(now - timedelta(days=3)).isoformat()),
+    )
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=101, created_at=(now - timedelta(days=10)).isoformat()),
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(server, "list_recoveries", {}, app_context)
+    result = await call_tool(server, "list_recoveries", {}, app_context)
 
-    assert result["count"] >= 0
-    # Check that the request included start and end parameters
-    request = route.calls.last.request
-    url_str = str(request.url)
-    assert "start=" in url_str
-    assert "end=" in url_str
-    # Parse the dates from the query string and check the gap
-    parsed = parse_qs(urlparse(str(request.url)).query)
-    start_str = parsed.get("start", [None])[0]
-    end_str = parsed.get("end", [None])[0]
-    if start_str and end_str:
-        start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-        end = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-        gap_days = (end - start).days
-        assert 6 <= gap_days <= 8, f"Expected ~7 day gap, got {gap_days}"
+    assert {record["cycle_id"] for record in result["records"]} == {100}
 
 
-@respx.mock
-async def test_list_sleeps_with_explicit_next_token(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+async def test_list_sleeps_pagination_continues_with_the_returned_cursor(
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """list_sleeps threads explicit next_token to WhoopClient."""
-    sleep = sleep_fixture()
-
-    route = respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(
-            200,
-            json={"records": [sleep], "next_token": None},
-        )
+    """A store-backed list_* tool's next_token is its own opaque cursor now,
+    not a value forwarded verbatim to WHOOP -- passing it back continues the
+    walk regardless of what start/end (if anything) the caller resends."""
+    assert app_context.store_conn is not None
+    upsert_sleep(app_context.store_conn, 12345, sleep_fixture(sleep_id="sleep-1"))
+    upsert_sleep(
+        app_context.store_conn,
+        12345,
+        sleep_fixture(sleep_id="sleep-2", created_at="2026-08-02T22:00:00Z"),
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        await call_tool(server, "list_sleeps", {"next_token": "cursor-xyz"}, app_context)
+    first = await call_tool(
+        server,
+        "list_sleeps",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "limit": 1},
+        app_context,
+    )
+    assert first["next_token"] is not None
 
-    assert route.called
-    request = route.calls.last.request
-    assert "nextToken=cursor-xyz" in str(request.url)
-
-
-@respx.mock
-async def test_get_sleep(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
-) -> None:
-    """get_sleep returns trimmed single sleep record."""
-    fixture = sleep_fixture(sleep_id="sleep-123")
-
-    respx.get(f"{BASE_URL}/v2/activity/sleep/sleep-123").mock(
-        return_value=httpx.Response(200, json=fixture)
+    second = await call_tool(
+        server, "list_sleeps", {"next_token": first["next_token"]}, app_context
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(server, "get_sleep", {"sleep_id": "sleep-123"}, app_context)
+    assert second["records"][0]["id"] == "sleep-2"
+    assert second["next_token"] is None
+
+
+async def test_get_sleep(app_context: AppContext, server: MCPServer[AppContext]) -> None:
+    """get_sleep returns a trimmed single sleep record, plus coverage."""
+    assert app_context.store_conn is not None
+    upsert_sleep(app_context.store_conn, 12345, sleep_fixture(sleep_id="sleep-123"))
+
+    result = await call_tool(server, "get_sleep", {"sleep_id": "sleep-123"}, app_context)
 
     assert result["id"] == "sleep-123"
     assert "sleep_performance_percentage" in result
     assert "stage_durations" in result
     assert result["units"] == {"stage_durations": "milliseconds"}
     assert "total_in_bed_time_milli" not in result
+    assert "coverage" in result
 
 
-@respx.mock
-async def test_get_workout(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+async def test_get_sleep_not_synced(app_context: AppContext, server: MCPServer[AppContext]) -> None:
+    """No sleep has ever been synced: an explicit "not_synced" miss."""
+    result = await call_tool(server, "get_sleep", {"sleep_id": "sleep-123"}, app_context)
+
+    assert result["error"] == "not_synced"
+
+
+async def test_get_sleep_not_found_in_store(
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """get_workout returns trimmed single workout record."""
-    fixture = workout_fixture(workout_id="workout-456")
+    """Sleeps exist, but not this id: "not_found_in_store", not "not_synced"."""
+    assert app_context.store_conn is not None
+    upsert_sleep(app_context.store_conn, 12345, sleep_fixture(sleep_id="sleep-real"))
 
-    respx.get(f"{BASE_URL}/v2/activity/workout/workout-456").mock(
-        return_value=httpx.Response(200, json=fixture)
-    )
+    result = await call_tool(server, "get_sleep", {"sleep_id": "sleep-missing"}, app_context)
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(server, "get_workout", {"workout_id": "workout-456"}, app_context)
+    assert result["error"] == "not_found_in_store"
+
+
+async def test_get_workout(app_context: AppContext, server: MCPServer[AppContext]) -> None:
+    """get_workout returns a trimmed single workout record, plus coverage."""
+    assert app_context.store_conn is not None
+    upsert_workout(app_context.store_conn, 12345, workout_fixture(workout_id="workout-456"))
+
+    result = await call_tool(server, "get_workout", {"workout_id": "workout-456"}, app_context)
 
     assert result["id"] == "workout-456"
     assert "sport_name" in result
     assert "strain" in result
     assert "zone_durations" in result
     assert result["units"] == {"zone_durations": "milliseconds"}
-
-
-@respx.mock
-async def test_list_recoveries_rate_limited_error(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
-) -> None:
-    """list_recoveries returns rate_limited response on RateLimitedError.
-
-    Fast-forwarding clock: since issue #11, the real 429 gets retried with
-    backoff before _get gives up, and every mocked call here returns the same
-    429 -- so without this, the retries would run against the real clock.
-    """
-    reset_time = time.time() + 60
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            429,
-            json={"error": "rate_limited"},
-            headers={"X-RateLimit-Reset": str(int(reset_time))},
-        )
-    )
-
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_recoveries",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
-
-    assert result["error"] == "rate_limited"
-    assert "retry_after_seconds" in result
-    assert result["retry_after_seconds"] > 0
-    assert "retry" in result["message"].lower()
+    assert "coverage" in result
 
 
 # -- analysis tool tests (issue #6) ----------------------------------------
 
 
-@respx.mock
-async def test_summarize_period_fetches_each_collection_once(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
-) -> None:
-    """Summarize fetches each collection once, not once per metric."""
-    # Mock all 3 routes with 3+ SCORED records each
-    recovery1 = recovery_fixture(cycle_id=100, recovery_score=65.0)
-    recovery2 = recovery_fixture(cycle_id=101, recovery_score=72.5)
-    recovery3 = recovery_fixture(cycle_id=102, recovery_score=58.0)
-
-    sleep1 = sleep_fixture(sleep_id="sleep-1")
-    sleep2 = sleep_fixture(sleep_id="sleep-2")
-    sleep3 = sleep_fixture(sleep_id="sleep-3")
-
-    cycle1 = cycle_fixture(cycle_id=456, strain=12.0)
-    cycle2 = cycle_fixture(cycle_id=457, strain=14.5)
-    cycle3 = cycle_fixture(cycle_id=458, strain=10.0)
-
-    recovery_route = respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            200, json={"records": [recovery1, recovery2, recovery3], "next_token": None}
-        )
-    )
-    sleep_route = respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(
-            200, json={"records": [sleep1, sleep2, sleep3], "next_token": None}
-        )
-    )
-    cycle_route = respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(
-            200, json={"records": [cycle1, cycle2, cycle3], "next_token": None}
-        )
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        await call_tool(
-            server,
-            "summarize_period",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
-
-    # Each route should be called exactly once
-    assert len(recovery_route.calls) == 1
-    assert len(sleep_route.calls) == 1
-    assert len(cycle_route.calls) == 1
-
-
-@respx.mock
 async def test_summarize_period_every_result_carries_sample_size(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Every metric in summarize_period result has a count key."""
-    recovery1 = recovery_fixture(cycle_id=100, recovery_score=65.0)
-    recovery2 = recovery_fixture(cycle_id=101, recovery_score=72.5)
-    recovery3 = recovery_fixture(cycle_id=102, recovery_score=58.0)
+    """Every metric in summarize_period's result has a count key.
 
-    sleep1 = sleep_fixture(sleep_id="sleep-1")
-    sleep2 = sleep_fixture(sleep_id="sleep-2")
-    sleep3 = sleep_fixture(sleep_id="sleep-3")
-
-    cycle1 = cycle_fixture(cycle_id=456, strain=12.0)
-    cycle2 = cycle_fixture(cycle_id=457, strain=14.5)
-    cycle3 = cycle_fixture(cycle_id=458, strain=10.0)
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            200, json={"records": [recovery1, recovery2, recovery3], "next_token": None}
+    Pre-#16 this test also asserted each WHOOP route was hit exactly once,
+    to avoid a redundant live fetch per metric sharing a collection.
+    Post-#16, collections are read from the local store once per
+    _summarize_window call regardless of how many respx routes anything
+    mocks -- a redundant SQL read has no rate-limit cost worth a dedicated
+    regression test any more.
+    """
+    assert app_context.store_conn is not None
+    for i in range(3):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
+            recovery_fixture(cycle_id=100 + i, created_at=f"2026-08-{i + 1:02d}T06:00:00Z"),
         )
+        upsert_sleep(
+            app_context.store_conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            app_context.store_conn,
+            12345,
+            cycle_fixture(cycle_id=456 + i, created_at=f"2026-08-{i + 1:02d}T22:00:00Z"),
+        )
+
+    result = await call_tool(
+        server,
+        "summarize_period",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+        app_context,
     )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(
-            200, json={"records": [sleep1, sleep2, sleep3], "next_token": None}
-        )
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(
-            200, json={"records": [cycle1, cycle2, cycle3], "next_token": None}
-        )
-    )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "summarize_period",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
-
-    # Every metric should have a count key
-    metrics = [
+    for metric in (
         "recovery_score",
         "hrv",
         "resting_heart_rate",
         "sleep_performance",
         "sleep_efficiency",
         "strain",
-    ]
-    for metric in metrics:
+    ):
         assert "count" in result["summaries"][metric]
         assert isinstance(result["summaries"][metric]["count"], int)
+    assert set(result["coverage"]) == {"recoveries", "sleeps", "cycles"}
 
 
-@respx.mock
 async def test_summarize_period_insufficient_data_for_one_metric_does_not_block_others(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """One thin collection doesn't blank out all metrics."""
-    # Recovery and sleep with 3+ records each
-    recovery1 = recovery_fixture(cycle_id=100, recovery_score=65.0)
-    recovery2 = recovery_fixture(cycle_id=101, recovery_score=72.5)
-    recovery3 = recovery_fixture(cycle_id=102, recovery_score=58.0)
-
-    sleep1 = sleep_fixture(sleep_id="sleep-1")
-    sleep2 = sleep_fixture(sleep_id="sleep-2")
-    sleep3 = sleep_fixture(sleep_id="sleep-3")
-
-    # Cycle with only 1 record (insufficient for stdev, which needs >=2)
-    cycle1 = cycle_fixture(cycle_id=456, strain=12.0)
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            200, json={"records": [recovery1, recovery2, recovery3], "next_token": None}
+    assert app_context.store_conn is not None
+    for i in range(3):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
+            recovery_fixture(cycle_id=100 + i, created_at=f"2026-08-{i + 1:02d}T06:00:00Z"),
         )
-    )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(
-            200, json={"records": [sleep1, sleep2, sleep3], "next_token": None}
+        upsert_sleep(
+            app_context.store_conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z"),
         )
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(200, json={"records": [cycle1], "next_token": None})
+    # Cycle with only 1 record (insufficient for stdev, which needs >=2).
+    upsert_cycle(app_context.store_conn, 12345, cycle_fixture(cycle_id=456, strain=12.0))
+
+    result = await call_tool(
+        server,
+        "summarize_period",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+        app_context,
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "summarize_period",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
-
-    # Strain should have an error
-    assert "error" in result["summaries"]["strain"]
     assert result["summaries"]["strain"]["error"] == "insufficient_data"
     assert "message" in result["summaries"]["strain"]
-
-    # But recovery_score should still have numeric values
     assert "mean" in result["summaries"]["recovery_score"]
     assert "count" in result["summaries"]["recovery_score"]
     assert isinstance(result["summaries"]["recovery_score"]["mean"], (int, float))
 
 
-@respx.mock
 async def test_summarize_period_reports_actual_range_across_all_collections(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """The "period" reported must reflect every collection fetched, not just recovery.
-
-    _actual_range pools created_at across recovery/sleep/cycle records. Give
-    each collection a distinct, clearly-separated created_at and confirm the
-    reported period spans the true earliest-to-latest across all three, not
-    just whichever collection happens to be checked first.
-    """
-    recovery1 = recovery_fixture(cycle_id=100, created_at="2026-08-01T06:00:00Z")
-    sleep1 = sleep_fixture(sleep_id="sleep-1", created_at="2026-08-05T22:00:00Z")
-    cycle1 = cycle_fixture(cycle_id=456, created_at="2026-08-10T22:00:00Z")
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": [recovery1], "next_token": None})
+    """The "period" reported must reflect every collection fetched, not just recovery."""
+    assert app_context.store_conn is not None
+    upsert_recovery(
+        app_context.store_conn,
+        12345,
+        recovery_fixture(cycle_id=100, created_at="2026-08-01T06:00:00Z"),
     )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(200, json={"records": [sleep1], "next_token": None})
+    upsert_sleep(
+        app_context.store_conn,
+        12345,
+        sleep_fixture(sleep_id="sleep-1", created_at="2026-08-05T22:00:00Z"),
     )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(200, json={"records": [cycle1], "next_token": None})
+    upsert_cycle(
+        app_context.store_conn,
+        12345,
+        cycle_fixture(cycle_id=456, created_at="2026-08-10T22:00:00Z"),
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "summarize_period",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "summarize_period",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-12T00:00:00Z"},
+        app_context,
+    )
 
     assert result["period"]["start"] == "2026-08-01T06:00:00Z"
     assert result["period"]["end"] == "2026-08-10T22:00:00Z"
 
 
-@respx.mock
 async def test_metric_trend_happy_path(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Metric trend with 8+ records returns slope_per_day and endpoints."""
-    # Build recovery records with increasing recovery_score at different timestamps
-    recovery_records = [
-        {
-            "cycle_id": 100 + i,
-            "created_at": f"2026-08-{i + 1:02d}T06:00:00Z",
-            "score_state": "SCORED",
-            "score": {
-                "recovery_score": 60.0 + 10.0 * i,
-                "hrv_rmssd_milli": 48.5,
-                "resting_heart_rate": 55,
-            },
-        }
-        for i in range(8)
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "metric_trend",
+    assert app_context.store_conn is not None
+    for i in range(8):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
             {
-                "metric": "recovery_score",
-                "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-09T00:00:00Z",
+                "cycle_id": 100 + i,
+                "created_at": f"2026-08-{i + 1:02d}T06:00:00Z",
+                "score_state": "SCORED",
+                "score": {
+                    "recovery_score": 60.0 + 10.0 * i,
+                    "hrv_rmssd_milli": 48.5,
+                    "resting_heart_rate": 55,
+                },
             },
-            app_context,
         )
+
+    result = await call_tool(
+        server,
+        "metric_trend",
+        {
+            "metric": "recovery_score",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-09T00:00:00Z",
+        },
+        app_context,
+    )
 
     assert result["metric"] == "recovery_score"
     assert result["count"] == 8
-    assert "slope_per_day" in result
-    assert "first" in result
-    assert "last" in result
     assert result["first"] == 60.0
     assert result["last"] == 130.0
-    # Trend is +10 per day over 7 days = 10 per day
     assert result["slope_per_day"] > 0
+    assert result["coverage"]["recoveries"]["earliest"] == "2026-08-01T06:00:00Z"
+    assert "range_coverage" in result
 
 
-@respx.mock
 async def test_metric_trend_insufficient_data(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Metric trend with only 1 record returns whole-response error."""
-    recovery1 = recovery_fixture(cycle_id=100, recovery_score=65.0)
+    assert app_context.store_conn is not None
+    upsert_recovery(app_context.store_conn, 12345, recovery_fixture(cycle_id=100))
 
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": [recovery1], "next_token": None})
+    result = await call_tool(
+        server,
+        "metric_trend",
+        {
+            "metric": "recovery_score",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-04T00:00:00Z",
+        },
+        app_context,
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "metric_trend",
-            {
-                "metric": "recovery_score",
-                "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-04T00:00:00Z",
-            },
-            app_context,
-        )
-
-    # Whole response is error
     assert result["error"] == "insufficient_data"
     assert "message" in result
-    # Should not have numeric fields
     assert "slope_per_day" not in result
+    assert "coverage" in result
 
 
-@respx.mock
 async def test_metric_trend_cycle_sourced_metric(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """metric_trend must not crash for a metric sourced from Cycle records.
-
-    analysis.trend() indexes record["created_at"] unconditionally (no
-    start/end fallback) -- a Cycle-shaped record missing that field raises
-    KeyError, which nothing in the wiring catches. Regression coverage for
-    exactly that: every previous metric_trend test used "recovery_score",
-    whose fixture always carried created_at, so this path was never
-    exercised for a cycle- or sleep-sourced metric.
-    """
-    cycle_records = [
-        cycle_fixture(
-            cycle_id=100 + i,
-            strain=float(10 + i),
-            created_at=f"2026-08-{i + 1:02d}T22:00:00Z",
+    """metric_trend must not crash for a metric sourced from Cycle records."""
+    assert app_context.store_conn is not None
+    for i in range(8):
+        upsert_cycle(
+            app_context.store_conn,
+            12345,
+            cycle_fixture(
+                cycle_id=100 + i, strain=float(10 + i), created_at=f"2026-08-{i + 1:02d}T22:00:00Z"
+            ),
         )
-        for i in range(8)
-    ]
 
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(200, json={"records": cycle_records, "next_token": None})
+    result = await call_tool(
+        server,
+        "metric_trend",
+        {"metric": "strain", "start": "2026-08-01T00:00:00Z", "end": "2026-08-09T00:00:00Z"},
+        app_context,
     )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "metric_trend",
-            {"metric": "strain", "start": "2026-08-01T00:00:00Z", "end": "2026-08-09T00:00:00Z"},
-            app_context,
-        )
 
     assert result["metric"] == "strain"
     assert result["count"] == 8
@@ -1284,357 +1209,261 @@ async def test_metric_trend_cycle_sourced_metric(
     assert result["period"]["end"] is not None
 
 
-@respx.mock
 async def test_metric_trend_constant_value_returns_error_shape(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """metric_trend on a constant-value fixture returns the error shape.
-
-    Even with 8+ records, a metric where all values are identical should
-    raise InsufficientDataError from trend(), which the tool wiring converts
-    to {"error": "insufficient_data", "message": ...}.
-    """
-    # Create 8 recovery records with identical recovery_score
-    recovery_records = [
-        recovery_fixture(
-            cycle_id=100 + i,
-            recovery_score=65.0,
-            created_at=f"2026-08-{i + 1:02d}T06:00:00Z",
+    """metric_trend on a constant-value series returns the error shape."""
+    assert app_context.store_conn is not None
+    for i in range(8):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i, recovery_score=65.0, created_at=f"2026-08-{i + 1:02d}T06:00:00Z"
+            ),
         )
-        for i in range(8)
-    ]
 
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
+    result = await call_tool(
+        server,
+        "metric_trend",
+        {
+            "metric": "recovery_score",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-09T00:00:00Z",
+        },
+        app_context,
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "metric_trend",
-            {
-                "metric": "recovery_score",
-                "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-09T00:00:00Z",
-            },
-            app_context,
-        )
-
-    # Should return error shape, not numeric results
     assert result["error"] == "insufficient_data"
     assert "message" in result
-    # Numeric fields should not be present
     assert "slope_per_day" not in result
     assert "r_squared" not in result
 
 
-@respx.mock
 async def test_metric_trend_includes_r_squared_and_rolling_windows(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """metric_trend response includes r_squared and rolling_Nd fields on success.
-
-    With a well-populated (non-degenerate) series, the response should include:
-    - r_squared (a float between 0 and 1)
-    - rolling_7d, rolling_30d, rolling_90d (each a list of {"date": ..., "value": ...})
-    """
-    # Create 10 records with a clear upward trend
-    recovery_records = [
-        recovery_fixture(
-            cycle_id=100 + i,
-            recovery_score=50.0 + float(i),
-            created_at=f"2026-08-{i + 1:02d}T06:00:00Z",
+    """metric_trend response includes r_squared and rolling_Nd fields on success."""
+    assert app_context.store_conn is not None
+    for i in range(10):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i,
+                recovery_score=50.0 + float(i),
+                created_at=f"2026-08-{i + 1:02d}T06:00:00Z",
+            ),
         )
-        for i in range(10)
-    ]
 
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
+    result = await call_tool(
+        server,
+        "metric_trend",
+        {
+            "metric": "recovery_score",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-11T00:00:00Z",
+        },
+        app_context,
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "metric_trend",
-            {
-                "metric": "recovery_score",
-                "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-11T00:00:00Z",
-            },
-            app_context,
-        )
-
-    # Existing fields should be present
     assert result["metric"] == "recovery_score"
     assert result["count"] == 10
     assert "slope_per_day" in result
-    assert "first" in result
-    assert "last" in result
     assert "period" in result
-
-    # New fields from issue #22
-    assert "r_squared" in result
     assert isinstance(result["r_squared"], float)
-    assert 0.0 <= result["r_squared"] <= 1.0  # r² is always between 0 and 1
-
+    assert 0.0 <= result["r_squared"] <= 1.0
     assert result["fit_quality"] in {"strong", "moderate", "weak", "negligible"}
-
-    assert "rolling_7d" in result
-    assert isinstance(result["rolling_7d"], list)
-    # Each entry should have date and value
-    for rp in result["rolling_7d"]:
-        assert isinstance(rp, dict)
-        assert "date" in rp
-        assert "value" in rp
-        assert isinstance(rp["date"], str)
-        assert isinstance(rp["value"], (int, float))
-
-    assert "rolling_30d" in result
-    assert isinstance(result["rolling_30d"], list)
-    for rp in result["rolling_30d"]:
-        assert isinstance(rp, dict)
-        assert "date" in rp
-        assert "value" in rp
-
-    assert "rolling_90d" in result
-    assert isinstance(result["rolling_90d"], list)
-    for rp in result["rolling_90d"]:
-        assert isinstance(rp, dict)
-        assert "date" in rp
-        assert "value" in rp
+    for key in ("rolling_7d", "rolling_30d", "rolling_90d"):
+        assert isinstance(result[key], list)
+        for point in result[key]:
+            assert isinstance(point["date"], str)
+            assert isinstance(point["value"], (int, float))
 
 
-@respx.mock
 async def test_correlate_metrics_reuses_one_fetch_for_same_collection_metrics(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Correlate with both metrics from same collection fetches it only once."""
-    # recovery_score and hrv both come from /v2/recovery
-    # Need 8+ matched pairs (MIN_CORRELATION_SAMPLES)
-    recovery_records = [
-        {
-            "cycle_id": i,
-            "created_at": f"2026-08-{i:02d}T06:00:00Z",
-            "score_state": "SCORED",
-            "score": {
-                "recovery_score": float(i * 10),
-                "hrv_rmssd_milli": float(i * 5),
-                "resting_heart_rate": 55,
-            },
-        }
-        for i in range(1, 9)
-    ]
-
-    recovery_route = respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "correlate_metrics",
+    """Correlate with both metrics from the same collection produces a full sweep."""
+    assert app_context.store_conn is not None
+    for i in range(1, 9):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
             {
-                "metric_a": "recovery_score",
-                "metric_b": "hrv",
-                "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-08T00:00:00Z",
+                "cycle_id": i,
+                "created_at": f"2026-08-{i:02d}T06:00:00Z",
+                "score_state": "SCORED",
+                "score": {
+                    "recovery_score": float(i * 10),
+                    "hrv_rmssd_milli": float(i * 5),
+                    "resting_heart_rate": 55,
+                },
             },
-            app_context,
         )
 
-    # Recovery route should be called exactly once, not twice
-    assert len(recovery_route.calls) == 1
+    result = await call_tool(
+        server,
+        "correlate_metrics",
+        {
+            "metric_a": "recovery_score",
+            "metric_b": "hrv",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-09T00:00:00Z",
+        },
+        app_context,
+    )
+
     assert result["metric_a"] == "recovery_score"
     assert result["metric_b"] == "hrv"
-    # Default radius 3 -> 7 lags; this fixture has full-overlap same-day data,
-    # so lag=0 is the "no shift" case matching the old single-correlation
-    # semantics.
     by_lag = {entry["lag_days"]: entry for entry in result["sweep"]}
     assert by_lag[0]["count"] == 8
     assert "r" in by_lag[0]
+    assert set(result["coverage"]) == {"recoveries"}
 
 
-@respx.mock
 async def test_correlate_metrics_different_collections(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Correlate with metrics from different collections calls each route once."""
-    # strain comes from /v2/cycle, recovery_score from /v2/recovery
-    # Need 8+ matched pairs on cycle_id (strain is cycle-sourced, recovery is cycle-keyed)
-    recovery_records = [
-        {
-            "cycle_id": i,
-            "created_at": f"2026-08-{i:02d}T06:00:00Z",
-            "score_state": "SCORED",
-            "score": {
-                "recovery_score": float(i * 10),
-                "hrv_rmssd_milli": 48.5,
-                "resting_heart_rate": 55,
-            },
-        }
-        for i in range(1, 9)
-    ]
-
-    cycle_records = [
-        {
-            "id": i,
-            "created_at": f"2026-08-{i:02d}T22:00:00Z",
-            "start": f"2026-08-{i:02d}T22:00:00Z",
-            "end": f"2026-08-{i + 1:02d}T22:00:00Z",
-            "score_state": "SCORED",
-            "score": {
-                "strain": float(i * 2),
-                "kilojoule": 2850.0,
-                "average_heart_rate": 78,
-                "max_heart_rate": 155,
-            },
-        }
-        for i in range(1, 9)
-    ]
-
-    recovery_route = respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
-    )
-    cycle_route = respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(200, json={"records": cycle_records, "next_token": None})
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "correlate_metrics",
+    """Correlate with metrics from different collections covers both entities."""
+    assert app_context.store_conn is not None
+    for i in range(1, 9):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
             {
-                "metric_a": "strain",
-                "metric_b": "recovery_score",
-                "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-08T00:00:00Z",
+                "cycle_id": i,
+                "created_at": f"2026-08-{i:02d}T06:00:00Z",
+                "score_state": "SCORED",
+                "score": {
+                    "recovery_score": float(i * 10),
+                    "hrv_rmssd_milli": 48.5,
+                    "resting_heart_rate": 55,
+                },
             },
-            app_context,
+        )
+        upsert_cycle(
+            app_context.store_conn,
+            12345,
+            {
+                "id": i,
+                "created_at": f"2026-08-{i:02d}T22:00:00Z",
+                "start": f"2026-08-{i:02d}T22:00:00Z",
+                "end": f"2026-08-{i + 1:02d}T22:00:00Z",
+                "score_state": "SCORED",
+                "score": {
+                    "strain": float(i * 2),
+                    "kilojoule": 2850.0,
+                    "average_heart_rate": 78,
+                    "max_heart_rate": 155,
+                },
+            },
         )
 
-    # Both routes should be called exactly once
-    assert len(recovery_route.calls) == 1
-    assert len(cycle_route.calls) == 1
+    result = await call_tool(
+        server,
+        "correlate_metrics",
+        {
+            "metric_a": "strain",
+            "metric_b": "recovery_score",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-09T00:00:00Z",
+        },
+        app_context,
+    )
+
     assert result["metric_a"] == "strain"
     assert result["metric_b"] == "recovery_score"
-    # Default radius 3 -> 7 lags; this fixture has full-overlap same-day data,
-    # so lag=0 is the "no shift" case matching the old single-correlation
-    # semantics.
     by_lag = {entry["lag_days"]: entry for entry in result["sweep"]}
     assert by_lag[0]["count"] == 8
     assert "r" in by_lag[0]
+    assert set(result["coverage"]) == {"recoveries", "cycles"}
 
 
-@respx.mock
 async def test_correlate_metrics_insufficient_samples(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Correlate with fewer than 8 matched pairs returns error."""
-    # Only 3 matching pairs - below MIN_CORRELATION_SAMPLES (8)
-    recovery_records = [
-        {
-            "cycle_id": i,
-            "created_at": f"2026-08-{i:02d}T06:00:00Z",
-            "score_state": "SCORED",
-            "score": {
-                "recovery_score": float(i * 10),
-                "hrv_rmssd_milli": 48.5,
-                "resting_heart_rate": 55,
-            },
-        }
-        for i in range(1, 4)
-    ]
-
-    cycle_records = [
-        {
-            "id": i,
-            "created_at": f"2026-08-{i:02d}T22:00:00Z",
-            "start": f"2026-08-{i:02d}T22:00:00Z",
-            "end": f"2026-08-{i + 1:02d}T22:00:00Z",
-            "score_state": "SCORED",
-            "score": {
-                "strain": float(i * 2),
-                "kilojoule": 2850.0,
-                "average_heart_rate": 78,
-                "max_heart_rate": 155,
-            },
-        }
-        for i in range(1, 4)
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(200, json={"records": cycle_records, "next_token": None})
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "correlate_metrics",
+    """Correlate with fewer than 8 matched pairs refuses every lag, with no top-level error."""
+    assert app_context.store_conn is not None
+    for i in range(1, 4):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
             {
-                "metric_a": "strain",
-                "metric_b": "recovery_score",
-                "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-08T00:00:00Z",
+                "cycle_id": i,
+                "created_at": f"2026-08-{i:02d}T06:00:00Z",
+                "score_state": "SCORED",
+                "score": {
+                    "recovery_score": float(i * 10),
+                    "hrv_rmssd_milli": 48.5,
+                    "resting_heart_rate": 55,
+                },
             },
-            app_context,
+        )
+        upsert_cycle(
+            app_context.store_conn,
+            12345,
+            {
+                "id": i,
+                "created_at": f"2026-08-{i:02d}T22:00:00Z",
+                "start": f"2026-08-{i:02d}T22:00:00Z",
+                "end": f"2026-08-{i + 1:02d}T22:00:00Z",
+                "score_state": "SCORED",
+                "score": {"strain": float(i * 2), "average_heart_rate": 78, "max_heart_rate": 155},
+            },
         )
 
-    # Only 3 total matched pairs at every lag in this fixture -- below
-    # MIN_CORRELATION_SAMPLES (8) -- so every lag in the default sweep is
-    # refused; there is no longer a top-level error.
-    assert "sweep" in result
+    result = await call_tool(
+        server,
+        "correlate_metrics",
+        {
+            "metric_a": "strain",
+            "metric_b": "recovery_score",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-08T00:00:00Z",
+        },
+        app_context,
+    )
+
+    assert "error" not in result
     assert len(result["sweep"]) == 7  # default radius 3 -> lags -3..+3
     for entry in result["sweep"]:
         assert entry["refused"] is True
 
 
-@respx.mock
 async def test_correlate_metrics_explicit_lag_days_returns_full_sweep(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """An explicit lag_days sets the sweep radius: 2*lag_days+1 entries, covering
-    exactly [-lag_days, ..., +lag_days], with at least one lag not refused.
-    """
-    recovery_records = [
-        {
-            "cycle_id": i,
-            "created_at": f"2026-08-{i:02d}T06:00:00Z",
-            "score_state": "SCORED",
-            "score": {
-                "recovery_score": float(i * 10),
-                "hrv_rmssd_milli": float(i * 5),
-                "resting_heart_rate": 55,
-            },
-        }
-        for i in range(1, 16)
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "correlate_metrics",
+    """An explicit lag_days sets the sweep radius: 2*lag_days+1 entries."""
+    assert app_context.store_conn is not None
+    for i in range(1, 16):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
             {
-                "metric_a": "recovery_score",
-                "metric_b": "hrv",
-                "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-16T00:00:00Z",
-                "lag_days": 2,
+                "cycle_id": i,
+                "created_at": f"2026-08-{i:02d}T06:00:00Z",
+                "score_state": "SCORED",
+                "score": {
+                    "recovery_score": float(i * 10),
+                    "hrv_rmssd_milli": float(i * 5),
+                    "resting_heart_rate": 55,
+                },
             },
-            app_context,
         )
+
+    result = await call_tool(
+        server,
+        "correlate_metrics",
+        {
+            "metric_a": "recovery_score",
+            "metric_b": "hrv",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-16T00:00:00Z",
+            "lag_days": 2,
+        },
+        app_context,
+    )
 
     assert len(result["sweep"]) == 5
     assert sorted(entry["lag_days"] for entry in result["sweep"]) == [-2, -1, 0, 1, 2]
@@ -1644,101 +1473,50 @@ async def test_correlate_metrics_explicit_lag_days_returns_full_sweep(
     )
 
 
-@respx.mock
 async def test_correlate_metrics_constant_metric_all_lags_refused_no_top_level_error(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """A constant metric raises InsufficientDataError from analysis.correlate;
-    the sweep must never let that escape to the client -- every lag becomes
-    a refusal, and there is no top-level "error" key.
-    """
-    recovery_records = [
-        recovery_fixture(cycle_id=i, created_at=f"2026-08-{i:02d}T06:00:00Z", recovery_score=65.0)
-        for i in range(1, 10)
-    ]
-    cycle_records = [
-        cycle_fixture(cycle_id=i, created_at=f"2026-08-{i:02d}T22:00:00Z", strain=float(i * 2))
-        for i in range(1, 10)
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(200, json={"records": cycle_records, "next_token": None})
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "correlate_metrics",
-            {
-                "metric_a": "recovery_score",
-                "metric_b": "strain",
-                "start": "2026-08-01T00:00:00Z",
-                "end": "2026-08-10T00:00:00Z",
-            },
-            app_context,
+    """A constant metric makes every lag a refusal, never a top-level "error"."""
+    assert app_context.store_conn is not None
+    for i in range(1, 10):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
+            recovery_fixture(
+                cycle_id=i, created_at=f"2026-08-{i:02d}T06:00:00Z", recovery_score=65.0
+            ),
+        )
+        upsert_cycle(
+            app_context.store_conn,
+            12345,
+            cycle_fixture(cycle_id=i, created_at=f"2026-08-{i:02d}T22:00:00Z", strain=float(i * 2)),
         )
 
+    result = await call_tool(
+        server,
+        "correlate_metrics",
+        {
+            "metric_a": "recovery_score",
+            "metric_b": "strain",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-10T00:00:00Z",
+        },
+        app_context,
+    )
+
     assert "error" not in result
-    assert "sweep" in result
     for entry in result["sweep"]:
         assert entry["refused"] is True
         assert "message" in entry
 
 
 async def test_correlate_metrics_rejects_negative_lag_days(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """A negative lag_days is rejected outright, not silently turned into an
     empty sweep (range(-lag_days, lag_days + 1) for lag_days=-2 is empty)."""
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        with pytest.raises(ToolError, match="lag_days"):
-            await call_tool(
-                server,
-                "correlate_metrics",
-                {
-                    "metric_a": "recovery_score",
-                    "metric_b": "strain",
-                    "start": "2026-08-01T00:00:00Z",
-                    "end": "2026-08-10T00:00:00Z",
-                    "lag_days": -2,
-                },
-                app_context,
-            )
-
-
-@respx.mock
-async def test_correlate_metrics_clamps_an_oversized_lag_days(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
-) -> None:
-    """A caller-supplied lag_days far beyond any reasonable sweep is clamped
-    to _MAX_LAG_SWEEP_RADIUS rather than producing an enormous sweep from a
-    handful of days of input."""
-    recovery_records = [
-        recovery_fixture(
-            cycle_id=i, created_at=f"2026-08-{i:02d}T06:00:00Z", recovery_score=65.0 + i
-        )
-        for i in range(1, 10)
-    ]
-    cycle_records = [
-        cycle_fixture(cycle_id=i, created_at=f"2026-08-{i:02d}T22:00:00Z", strain=float(i * 2))
-        for i in range(1, 10)
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": recovery_records, "next_token": None})
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(200, json={"records": cycle_records, "next_token": None})
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
+    with pytest.raises(ToolError, match="lag_days"):
+        await call_tool(
             server,
             "correlate_metrics",
             {
@@ -1746,631 +1524,397 @@ async def test_correlate_metrics_clamps_an_oversized_lag_days(
                 "metric_b": "strain",
                 "start": "2026-08-01T00:00:00Z",
                 "end": "2026-08-10T00:00:00Z",
-                "lag_days": 400,
+                "lag_days": -2,
             },
             app_context,
         )
 
-    # Clamped to 14 -> 29 entries, not 801.
+
+async def test_correlate_metrics_clamps_an_oversized_lag_days(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """A caller-supplied lag_days far beyond any reasonable sweep is clamped
+    to _MAX_LAG_SWEEP_RADIUS rather than producing an enormous sweep."""
+    result = await call_tool(
+        server,
+        "correlate_metrics",
+        {
+            "metric_a": "recovery_score",
+            "metric_b": "strain",
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-10T00:00:00Z",
+            "lag_days": 400,
+        },
+        app_context,
+    )
+
     assert len(result["sweep"]) == 29
-    lags_returned = sorted(entry["lag_days"] for entry in result["sweep"])
-    assert lags_returned == list(range(-14, 15))
+    assert sorted(entry["lag_days"] for entry in result["sweep"]) == list(range(-14, 15))
 
 
-@respx.mock
 async def test_compare_periods_happy_path(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Compare periods returns summaries and delta for both windows."""
-    # Use side_effect to return different data for baseline vs comparison windows
-    # Recovery records for baseline
-    recovery_baseline = [
-        recovery_fixture(cycle_id=100, recovery_score=60.0),
-        recovery_fixture(cycle_id=101, recovery_score=65.0),
-        recovery_fixture(cycle_id=102, recovery_score=70.0),
-    ]
-    # Recovery records for comparison (higher scores)
-    recovery_comparison = [
-        recovery_fixture(cycle_id=200, recovery_score=75.0),
-        recovery_fixture(cycle_id=201, recovery_score=80.0),
-        recovery_fixture(cycle_id=202, recovery_score=85.0),
-    ]
-
-    # Sleep records for both periods
-    sleep_baseline = [
-        sleep_fixture(sleep_id="sleep-1"),
-        sleep_fixture(sleep_id="sleep-2"),
-        sleep_fixture(sleep_id="sleep-3"),
-    ]
-    sleep_comparison = [
-        sleep_fixture(sleep_id="sleep-4"),
-        sleep_fixture(sleep_id="sleep-5"),
-        sleep_fixture(sleep_id="sleep-6"),
-    ]
-
-    # Cycle records for both periods
-    cycle_baseline = [
-        cycle_fixture(cycle_id=456, strain=10.0),
-        cycle_fixture(cycle_id=457, strain=12.0),
-        cycle_fixture(cycle_id=458, strain=11.0),
-    ]
-    cycle_comparison = [
-        cycle_fixture(cycle_id=556, strain=14.0),
-        cycle_fixture(cycle_id=557, strain=15.0),
-        cycle_fixture(cycle_id=558, strain=16.0),
-    ]
-
-    # Mock recovery with side_effect for two calls (baseline, then comparison)
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": recovery_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": recovery_comparison, "next_token": None}),
-        ]
-    )
-    # Mock sleep with side_effect
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": sleep_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": sleep_comparison, "next_token": None}),
-        ]
-    )
-    # Mock cycle with side_effect
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": cycle_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": cycle_comparison, "next_token": None}),
-        ]
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "compare_periods",
-            {
-                "baseline_start": "2026-08-01T00:00:00Z",
-                "baseline_end": "2026-08-08T00:00:00Z",
-                "comparison_start": "2026-08-08T00:00:00Z",
-                "comparison_end": "2026-08-15T00:00:00Z",
-            },
-            app_context,
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    for i, score in enumerate((60.0, 65.0, 70.0)):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i, recovery_score=score, created_at=f"2026-08-{i + 1:02d}T06:00:00Z"
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-b-{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=456 + i, strain=10.0 + i, created_at=f"2026-08-{i + 1:02d}T22:00:00Z"
+            ),
+        )
+    for i, score in enumerate((75.0, 80.0, 85.0)):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=200 + i, recovery_score=score, created_at=f"2026-08-{i + 8:02d}T06:00:00Z"
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-c-{i}", created_at=f"2026-08-{i + 8:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-08-{i + 8:02d}T22:00:00Z"
+            ),
         )
 
-    # Check structure
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-08T00:00:00Z",
+            "comparison_start": "2026-08-08T00:00:00Z",
+            "comparison_end": "2026-08-15T00:00:00Z",
+        },
+        app_context,
+    )
+
     assert "baseline" in result
     assert "comparison" in result
     assert "delta" in result
-
-    # Baseline should have different recovery_score mean than comparison
     baseline_mean = result["baseline"]["summary"]["recovery_score"]["mean"]
     comparison_mean = result["comparison"]["summary"]["recovery_score"]["mean"]
     assert baseline_mean != comparison_mean
-
-    # Delta should be the difference
     delta_mean = result["delta"]["recovery_score"]["delta_mean"]
     assert delta_mean == pytest.approx(comparison_mean - baseline_mean, abs=0.1)
+    assert set(result["coverage"]) == {"recoveries", "sleeps", "cycles"}
+    assert set(result["range_coverage"]) == {"recoveries", "sleeps", "cycles"}
 
 
-@respx.mock
 async def test_compare_periods_includes_effect_size(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Compare periods includes effect_size (Cohen's d) for each metric."""
-    # Create baseline and comparison with different recovery scores
-    recovery_baseline = [
-        recovery_fixture(cycle_id=100, recovery_score=55.0, created_at="2026-08-01T06:00:00Z"),
-        recovery_fixture(cycle_id=101, recovery_score=60.0, created_at="2026-08-02T06:00:00Z"),
-        recovery_fixture(cycle_id=102, recovery_score=65.0, created_at="2026-08-03T06:00:00Z"),
-    ]
-    recovery_comparison = [
-        recovery_fixture(cycle_id=200, recovery_score=75.0, created_at="2026-08-08T06:00:00Z"),
-        recovery_fixture(cycle_id=201, recovery_score=80.0, created_at="2026-08-09T06:00:00Z"),
-        recovery_fixture(cycle_id=202, recovery_score=85.0, created_at="2026-08-10T06:00:00Z"),
-    ]
-
-    sleep_baseline = [
-        sleep_fixture(sleep_id="sleep-1", created_at="2026-08-01T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-2", created_at="2026-08-02T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-3", created_at="2026-08-03T22:00:00Z"),
-    ]
-    sleep_comparison = [
-        sleep_fixture(sleep_id="sleep-4", created_at="2026-08-08T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-5", created_at="2026-08-09T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-6", created_at="2026-08-10T22:00:00Z"),
-    ]
-
-    cycle_baseline = [
-        cycle_fixture(cycle_id=456, strain=10.0, created_at="2026-08-01T22:00:00Z"),
-        cycle_fixture(cycle_id=457, strain=12.0, created_at="2026-08-02T22:00:00Z"),
-        cycle_fixture(cycle_id=458, strain=11.0, created_at="2026-08-03T22:00:00Z"),
-    ]
-    cycle_comparison = [
-        cycle_fixture(cycle_id=556, strain=14.0, created_at="2026-08-08T22:00:00Z"),
-        cycle_fixture(cycle_id=557, strain=15.0, created_at="2026-08-09T22:00:00Z"),
-        cycle_fixture(cycle_id=558, strain=16.0, created_at="2026-08-10T22:00:00Z"),
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": recovery_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": recovery_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": sleep_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": sleep_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": cycle_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": cycle_comparison, "next_token": None}),
-        ]
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "compare_periods",
-            {
-                "baseline_start": "2026-08-01T00:00:00Z",
-                "baseline_end": "2026-08-03T23:59:59Z",
-                "comparison_start": "2026-08-08T00:00:00Z",
-                "comparison_end": "2026-08-10T23:59:59Z",
-            },
-            app_context,
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    for i, score in enumerate((55.0, 60.0, 65.0)):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i, recovery_score=score, created_at=f"2026-08-{i + 1:02d}T06:00:00Z"
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-b-{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=456 + i, strain=10.0 + i, created_at=f"2026-08-{i + 1:02d}T22:00:00Z"
+            ),
+        )
+    for i, score in enumerate((75.0, 80.0, 85.0)):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=200 + i, recovery_score=score, created_at=f"2026-08-{i + 8:02d}T06:00:00Z"
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-c-{i}", created_at=f"2026-08-{i + 8:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-08-{i + 8:02d}T22:00:00Z"
+            ),
         )
 
-    # Check that effect_size is present and is a float
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-03T23:59:59Z",
+            "comparison_start": "2026-08-08T00:00:00Z",
+            "comparison_end": "2026-08-10T23:59:59Z",
+        },
+        app_context,
+    )
+
     assert "effect_size" in result["delta"]["recovery_score"]
     assert isinstance(result["delta"]["recovery_score"]["effect_size"], (int, float))
-    # With baseline mean ~60 and comparison mean ~80, effect_size should be positive
     assert result["delta"]["recovery_score"]["effect_size"] > 0
 
 
-@respx.mock
 async def test_compare_periods_coverage_asymmetric_high_vs_low(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Compare periods flags coverage_asymmetric when one period has much less coverage."""
-    # Baseline: 30 days, all with records (100% coverage)
-    recovery_baseline = [
-        recovery_fixture(
-            cycle_id=100 + i,
-            recovery_score=65.0,
-            created_at=f"2026-08-{(i % 30) + 1:02d}T06:00:00Z",
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    for i in range(30):
+        day = (i % 30) + 1
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i, recovery_score=65.0, created_at=f"2026-08-{day:02d}T06:00:00Z"
+            ),
         )
-        for i in range(30)
-    ]
-    # Comparison: 30 days expected, but only 4 days with records (~13% coverage)
-    recovery_comparison = [
-        recovery_fixture(cycle_id=200, recovery_score=75.0, created_at="2026-09-01T06:00:00Z"),
-        recovery_fixture(cycle_id=201, recovery_score=76.0, created_at="2026-09-02T06:00:00Z"),
-        recovery_fixture(cycle_id=202, recovery_score=74.0, created_at="2026-09-03T06:00:00Z"),
-        recovery_fixture(cycle_id=203, recovery_score=77.0, created_at="2026-09-04T06:00:00Z"),
-    ]
-
-    sleep_baseline = [
-        sleep_fixture(sleep_id=f"sleep-b-{i}", created_at=f"2026-08-{(i % 30) + 1:02d}T22:00:00Z")
-        for i in range(30)
-    ]
-    sleep_comparison = [
-        sleep_fixture(sleep_id="sleep-c-1", created_at="2026-09-01T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-c-2", created_at="2026-09-02T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-c-3", created_at="2026-09-03T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-c-4", created_at="2026-09-04T22:00:00Z"),
-    ]
-
-    cycle_baseline = [
-        cycle_fixture(
-            cycle_id=456 + i, strain=12.0, created_at=f"2026-08-{(i % 30) + 1:02d}T22:00:00Z"
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-b-{i}", created_at=f"2026-08-{day:02d}T22:00:00Z"),
         )
-        for i in range(30)
-    ]
-    cycle_comparison = [
-        cycle_fixture(cycle_id=556, strain=14.0, created_at="2026-09-01T22:00:00Z"),
-        cycle_fixture(cycle_id=557, strain=15.0, created_at="2026-09-02T22:00:00Z"),
-        cycle_fixture(cycle_id=558, strain=14.5, created_at="2026-09-03T22:00:00Z"),
-        cycle_fixture(cycle_id=559, strain=15.5, created_at="2026-09-04T22:00:00Z"),
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": recovery_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": recovery_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": sleep_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": sleep_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": cycle_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": cycle_comparison, "next_token": None}),
-        ]
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "compare_periods",
-            {
-                "baseline_start": "2026-08-01T00:00:00Z",
-                "baseline_end": "2026-08-31T23:59:59Z",
-                "comparison_start": "2026-09-01T00:00:00Z",
-                "comparison_end": "2026-09-30T23:59:59Z",
-            },
-            app_context,
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(cycle_id=456 + i, strain=12.0, created_at=f"2026-08-{day:02d}T22:00:00Z"),
+        )
+    for i, day in enumerate((1, 2, 3, 4)):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=200 + i, recovery_score=75.0 + i, created_at=f"2026-09-{day:02d}T06:00:00Z"
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-c-{i}", created_at=f"2026-09-{day:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-09-{day:02d}T22:00:00Z"
+            ),
         )
 
-    # coverage_asymmetric should be True when coverage differs by more than 0.5
-    assert "coverage_asymmetric" in result["delta"]["recovery_score"]
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-31T23:59:59Z",
+            "comparison_start": "2026-09-01T00:00:00Z",
+            "comparison_end": "2026-09-30T23:59:59Z",
+        },
+        app_context,
+    )
+
     assert result["delta"]["recovery_score"]["coverage_asymmetric"] is True
 
 
-@respx.mock
 async def test_compare_periods_coverage_asymmetric_similar_coverage(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Compare periods does NOT flag coverage_asymmetric when both periods are similarly covered."""
-    # Both baseline and comparison: 3 records over 3 days (100% coverage)
-    recovery_baseline = [
-        recovery_fixture(cycle_id=100, recovery_score=65.0, created_at="2026-08-01T06:00:00Z"),
-        recovery_fixture(cycle_id=101, recovery_score=70.0, created_at="2026-08-02T06:00:00Z"),
-        recovery_fixture(cycle_id=102, recovery_score=68.0, created_at="2026-08-03T06:00:00Z"),
-    ]
-    recovery_comparison = [
-        recovery_fixture(cycle_id=200, recovery_score=75.0, created_at="2026-08-08T06:00:00Z"),
-        recovery_fixture(cycle_id=201, recovery_score=76.0, created_at="2026-08-09T06:00:00Z"),
-        recovery_fixture(cycle_id=202, recovery_score=74.0, created_at="2026-08-10T06:00:00Z"),
-    ]
-
-    sleep_baseline = [
-        sleep_fixture(sleep_id="sleep-1", created_at="2026-08-01T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-2", created_at="2026-08-02T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-3", created_at="2026-08-03T22:00:00Z"),
-    ]
-    sleep_comparison = [
-        sleep_fixture(sleep_id="sleep-4", created_at="2026-08-08T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-5", created_at="2026-08-09T22:00:00Z"),
-        sleep_fixture(sleep_id="sleep-6", created_at="2026-08-10T22:00:00Z"),
-    ]
-
-    cycle_baseline = [
-        cycle_fixture(cycle_id=456, strain=12.0, created_at="2026-08-01T22:00:00Z"),
-        cycle_fixture(cycle_id=457, strain=13.0, created_at="2026-08-02T22:00:00Z"),
-        cycle_fixture(cycle_id=458, strain=11.0, created_at="2026-08-03T22:00:00Z"),
-    ]
-    cycle_comparison = [
-        cycle_fixture(cycle_id=556, strain=14.0, created_at="2026-08-08T22:00:00Z"),
-        cycle_fixture(cycle_id=557, strain=15.0, created_at="2026-08-09T22:00:00Z"),
-        cycle_fixture(cycle_id=558, strain=16.0, created_at="2026-08-10T22:00:00Z"),
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": recovery_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": recovery_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": sleep_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": sleep_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": cycle_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": cycle_comparison, "next_token": None}),
-        ]
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "compare_periods",
-            {
-                "baseline_start": "2026-08-01T00:00:00Z",
-                "baseline_end": "2026-08-03T23:59:59Z",
-                "comparison_start": "2026-08-08T00:00:00Z",
-                "comparison_end": "2026-08-10T23:59:59Z",
-            },
-            app_context,
+    """Compare periods does NOT flag coverage_asymmetric when coverage is similar."""
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    for i, score in enumerate((65.0, 70.0, 68.0)):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i, recovery_score=score, created_at=f"2026-08-{i + 1:02d}T06:00:00Z"
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-b-{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=456 + i, strain=12.0 + i, created_at=f"2026-08-{i + 1:02d}T22:00:00Z"
+            ),
+        )
+    for i, score in enumerate((75.0, 76.0, 74.0)):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=200 + i, recovery_score=score, created_at=f"2026-08-{i + 8:02d}T06:00:00Z"
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-c-{i}", created_at=f"2026-08-{i + 8:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-08-{i + 8:02d}T22:00:00Z"
+            ),
         )
 
-    # coverage_asymmetric should be False (not True) when coverage is similar
-    assert "coverage_asymmetric" in result["delta"]["recovery_score"]
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-03T23:59:59Z",
+            "comparison_start": "2026-08-08T00:00:00Z",
+            "comparison_end": "2026-08-10T23:59:59Z",
+        },
+        app_context,
+    )
+
     assert result["delta"]["recovery_score"]["coverage_asymmetric"] is False
 
 
-@respx.mock
 async def test_compare_periods_period_length_note_non_multiple_of_7(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Compare periods sets period_length_note when period is not a multiple of 7."""
-    # Baseline: 5 days (not a multiple of 7)
-    recovery_baseline = [
-        recovery_fixture(
-            cycle_id=100 + i, recovery_score=65.0, created_at=f"2026-08-{i + 1:02d}T06:00:00Z"
-        )
-        for i in range(5)
-    ]
-    # Comparison: 7 days (multiple of 7)
-    recovery_comparison = [
-        recovery_fixture(
-            cycle_id=200 + i, recovery_score=75.0, created_at=f"2026-08-{i + 10:02d}T06:00:00Z"
-        )
-        for i in range(7)
-    ]
+    """Compare periods sets period_length_note when a period is not a multiple of 7.
 
-    sleep_baseline = [
-        sleep_fixture(sleep_id=f"sleep-b{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z")
-        for i in range(5)
-    ]
-    sleep_comparison = [
-        sleep_fixture(sleep_id=f"sleep-c{i}", created_at=f"2026-08-{i + 10:02d}T22:00:00Z")
-        for i in range(7)
-    ]
-
-    cycle_baseline = [
-        cycle_fixture(cycle_id=456 + i, strain=12.0, created_at=f"2026-08-{i + 1:02d}T22:00:00Z")
-        for i in range(5)
-    ]
-    cycle_comparison = [
-        cycle_fixture(cycle_id=556 + i, strain=14.0, created_at=f"2026-08-{i + 10:02d}T22:00:00Z")
-        for i in range(7)
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": recovery_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": recovery_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": sleep_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": sleep_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": cycle_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": cycle_comparison, "next_token": None}),
-        ]
+    period_length_note is pure date arithmetic on the requested boundaries
+    (see _period_length_note) -- it holds regardless of what data, if any,
+    the store has for either period, so this test needs no store seeding.
+    """
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-06T00:00:00Z",
+            "comparison_start": "2026-08-10T00:00:00Z",
+            "comparison_end": "2026-08-17T00:00:00Z",
+        },
+        app_context,
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "compare_periods",
-            {
-                "baseline_start": "2026-08-01T00:00:00Z",
-                "baseline_end": "2026-08-06T00:00:00Z",
-                "comparison_start": "2026-08-10T00:00:00Z",
-                "comparison_end": "2026-08-17T00:00:00Z",
-            },
-            app_context,
-        )
-
-    # period_length_note should be set (non-None) when one period is not a multiple of 7
-    assert "period_length_note" in result
     assert result["period_length_note"] is not None
     assert isinstance(result["period_length_note"], str)
 
 
-@respx.mock
 async def test_compare_periods_period_length_note_both_multiples_of_7(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Compare periods sets period_length_note to None when both periods are multiples of 7."""
-    # Baseline: 7 days
-    recovery_baseline = [
-        recovery_fixture(
-            cycle_id=100 + i, recovery_score=65.0, created_at=f"2026-08-{i + 1:02d}T06:00:00Z"
-        )
-        for i in range(7)
-    ]
-    # Comparison: 14 days
-    recovery_comparison = [
-        recovery_fixture(
-            cycle_id=200 + i, recovery_score=75.0, created_at=f"2026-08-{i + 10:02d}T06:00:00Z"
-        )
-        for i in range(14)
-    ]
-
-    sleep_baseline = [
-        sleep_fixture(sleep_id=f"sleep-b{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z")
-        for i in range(7)
-    ]
-    sleep_comparison = [
-        sleep_fixture(sleep_id=f"sleep-c{i}", created_at=f"2026-08-{i + 10:02d}T22:00:00Z")
-        for i in range(14)
-    ]
-
-    cycle_baseline = [
-        cycle_fixture(cycle_id=456 + i, strain=12.0, created_at=f"2026-08-{i + 1:02d}T22:00:00Z")
-        for i in range(7)
-    ]
-    cycle_comparison = [
-        cycle_fixture(cycle_id=556 + i, strain=14.0, created_at=f"2026-08-{i + 10:02d}T22:00:00Z")
-        for i in range(14)
-    ]
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": recovery_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": recovery_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": sleep_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": sleep_comparison, "next_token": None}),
-        ]
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        side_effect=[
-            httpx.Response(200, json={"records": cycle_baseline, "next_token": None}),
-            httpx.Response(200, json={"records": cycle_comparison, "next_token": None}),
-        ]
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-08T00:00:00Z",
+            "comparison_start": "2026-08-10T00:00:00Z",
+            "comparison_end": "2026-08-24T00:00:00Z",
+        },
+        app_context,
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "compare_periods",
-            {
-                "baseline_start": "2026-08-01T00:00:00Z",
-                "baseline_end": "2026-08-08T00:00:00Z",
-                "comparison_start": "2026-08-10T00:00:00Z",
-                "comparison_end": "2026-08-24T00:00:00Z",
-            },
-            app_context,
-        )
-
-    # period_length_note should be None when both are multiples of 7
-    assert "period_length_note" in result
     assert result["period_length_note"] is None
 
 
-@respx.mock
-async def test_summarize_period_rate_limited_error(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
-) -> None:
-    """Summarize period returns rate_limited response on RateLimitedError.
-
-    Fast-forwarding clock: see test_list_recoveries_rate_limited_error.
-    """
-    reset_time = time.time() + 60
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            429,
-            json={"error": "rate_limited"},
-            headers={"X-RateLimit-Reset": str(int(reset_time))},
-        )
-    )
-
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "summarize_period",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
-
-    assert result["error"] == "rate_limited"
-    assert "retry_after_seconds" in result
-    assert result["retry_after_seconds"] > 0
-    assert "retry" in result["message"].lower()
-
-
-@respx.mock
 async def test_summarize_period_includes_median_and_days_missing(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Summarize period response includes median and days_missing for each metric."""
-    recovery1 = recovery_fixture(
-        cycle_id=100, recovery_score=60.0, created_at="2026-08-01T06:00:00Z"
-    )
-    recovery2 = recovery_fixture(
-        cycle_id=101, recovery_score=70.0, created_at="2026-08-02T06:00:00Z"
-    )
-    recovery3 = recovery_fixture(
-        cycle_id=102, recovery_score=80.0, created_at="2026-08-03T06:00:00Z"
-    )
-
-    sleep1 = sleep_fixture(sleep_id="sleep-1", created_at="2026-08-01T22:00:00Z")
-    sleep2 = sleep_fixture(sleep_id="sleep-2", created_at="2026-08-02T22:00:00Z")
-    sleep3 = sleep_fixture(sleep_id="sleep-3", created_at="2026-08-03T22:00:00Z")
-
-    cycle1 = cycle_fixture(cycle_id=456, strain=12.0, created_at="2026-08-01T22:00:00Z")
-    cycle2 = cycle_fixture(cycle_id=457, strain=14.5, created_at="2026-08-02T22:00:00Z")
-    cycle3 = cycle_fixture(cycle_id=458, strain=10.0, created_at="2026-08-03T22:00:00Z")
-
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(
-            200, json={"records": [recovery1, recovery2, recovery3], "next_token": None}
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    for i, score in enumerate((60.0, 70.0, 80.0)):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i, recovery_score=score, created_at=f"2026-08-{i + 1:02d}T06:00:00Z"
+            ),
         )
-    )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(
-            200, json={"records": [sleep1, sleep2, sleep3], "next_token": None}
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z"),
         )
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(
-            200, json={"records": [cycle1, cycle2, cycle3], "next_token": None}
-        )
-    )
-
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "summarize_period",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-03T23:59:59Z"},
-            app_context,
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=456 + i, strain=12.0 + i, created_at=f"2026-08-{i + 1:02d}T22:00:00Z"
+            ),
         )
 
-    # Check that recovery_score has median and days_missing
+    result = await call_tool(
+        server,
+        "summarize_period",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-03T23:59:59Z"},
+        app_context,
+    )
+
     assert "median" in result["summaries"]["recovery_score"]
     assert "days_missing" in result["summaries"]["recovery_score"]
-    # Median of [60, 70, 80] should be 70
     assert result["summaries"]["recovery_score"]["median"] == pytest.approx(70.0)
-    # All 3 days covered out of 3
     assert result["summaries"]["recovery_score"]["days_missing"] == 0
 
 
-@respx.mock
 async def test_summarize_period_zero_records_all_metrics_insufficient(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Summarize period with no matching records returns insufficient_data for all metrics."""
-    # Empty collections
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": [], "next_token": None})
-    )
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(200, json={"records": [], "next_token": None})
-    )
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(200, json={"records": [], "next_token": None})
+    result = await call_tool(
+        server,
+        "summarize_period",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+        app_context,
     )
 
-    async with WhoopClient(config, app_context.auth) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "summarize_period",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
-
-    # Should not raise, should return clean dict with errors for each metric
     assert isinstance(result, dict)
     assert "summaries" in result
-    # Every metric should show insufficient_data, not crash
-    for metric in [
+    for metric in (
         "recovery_score",
         "hrv",
         "resting_heart_rate",
         "sleep_performance",
         "sleep_efficiency",
         "strain",
-    ]:
-        assert "error" in result["summaries"][metric]
+    ):
         assert result["summaries"][metric]["error"] == "insufficient_data"
 
 
@@ -2396,6 +1940,7 @@ _PRINCIPAL_GATED_TOOLS = {
     "get_sleep",
     "get_workout",
     "whoop_sync",
+    "whoop_data_coverage",
     "summarize_period",
     "metric_trend",
     "correlate_metrics",

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #16: the 8 data tools and 4 analysis tools now answer from the
+  local store (#13/#14/#15), not the live WHOOP API -- a miss is a coverage
+  gap, reported explicitly, never a live fetch. Every response carries a
+  `coverage` envelope (earliest/latest activity date held, last backfill
+  outcome, last successful incremental-sync time -- or, for the profile and
+  body-measurement singletons, `{synced, last_updated_at}`); every
+  date-range tool additionally carries `range_coverage`, flagging a request
+  that is wholly or partly outside what has been synced instead of
+  returning a silently short result. A new `whoop_data_coverage` tool
+  reports this directly for all six entities in one call. `store.py` gained
+  `include_deleted`-gated filtering on the four collection getters (soft-
+  deleted rows no longer resurface through a repointed tool; a data-subject
+  export still sees them, via `include_deleted=True`), single-record
+  `get_sleep_by_id`/`get_workout_by_id` lookups, four `get_*_coverage`
+  earliest/latest queries keyed off each entity's own activity-date column
+  (`created_at` for recoveries, `start`/`end` for sleeps/cycles/workouts --
+  never `updated_at`), and `get_profile_updated_at`/
+  `get_body_measurement_updated_at`. `client.py` is unchanged: the live API
+  path still exists for `whoop_sync` alone.
 - Issue #15: incremental sync from an `updated_at` high-water mark. A new
   `sync.py` (`run_sync`) walks the same four collections `backfill.py` (#14)
   does -- recoveries, sleeps, cycles, workouts -- forward from each one's own

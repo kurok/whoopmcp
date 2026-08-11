@@ -16,12 +16,21 @@ import pytest
 
 from whoopmcp.store import (
     CURRENT_SCHEMA_VERSION,
+    export_member_data,
     get_body_measurement,
+    get_body_measurement_updated_at,
+    get_cycle_coverage,
     get_cycles,
     get_profile,
+    get_profile_updated_at,
     get_recoveries,
+    get_recovery_coverage,
+    get_sleep_by_id,
+    get_sleep_coverage,
     get_sleeps,
     get_sync_state,
+    get_workout_by_id,
+    get_workout_coverage,
     get_workouts,
     open_store,
     set_sync_state,
@@ -32,6 +41,15 @@ from whoopmcp.store import (
     upsert_sleep,
     upsert_workout,
 )
+
+# -- #16: names this module's new tests below require, but that do not yet
+# exist on store.py -- get_recovery_coverage, get_sleep_coverage,
+# get_cycle_coverage, get_workout_coverage, get_sleep_by_id, get_workout_by_id,
+# get_profile_updated_at, get_body_measurement_updated_at, and the
+# include_deleted/limit/offset parameters on get_recoveries/get_sleeps/
+# get_cycles/get_workouts. The import above deliberately fails (ImportError)
+# until #16 adds them -- this file's whole new "#16" section is written
+# test-first, before that implementation exists.
 
 # -- Schema and version tests ------------------------------------------------
 
@@ -740,4 +758,439 @@ def test_workout_date_range_filtering() -> None:
     assert len(results) == 1
     assert results[0]["id"] == "uuid-wo-2"
 
+    conn.close()
+
+
+# -- #16: include_deleted on the 4 collection getters -------------------------
+#
+# Pre-#16, get_recoveries/get_sleeps/get_cycles/get_workouts do not filter on
+# deleted_at at all (see the module's own comment on deleted_at being
+# "reserved for #18; never written or filtered on in this issue"). #16 adds a
+# deleted_at IS NULL filter by default, with include_deleted=True as the
+# explicit opt-out export_member_data needs (a soft-delete is not erasure).
+
+
+def _soft_delete(conn: Any, table: str, whoop_user_id: int, resource_id: str) -> None:
+    """Set deleted_at directly via raw SQL, bypassing store.py's own upsert
+    functions entirely -- mirrors tests/test_webhook_processing.py's own
+    comment about avoiding a store getter/setter that "could itself filter
+    member data" for this kind of test setup."""
+    conn.execute(
+        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608
+        ("2026-08-05T00:00:00Z", whoop_user_id, resource_id),
+    )
+    conn.commit()
+
+
+def test_get_recoveries_excludes_soft_deleted_by_default() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 20
+    upsert_recovery(
+        conn,
+        whoop_user_id,
+        {"cycle_id": 5001, "created_at": "2026-08-01T08:00:00Z", "score_state": "SCORED"},
+    )
+    upsert_recovery(
+        conn,
+        whoop_user_id,
+        {"cycle_id": 5002, "created_at": "2026-08-02T08:00:00Z", "score_state": "SCORED"},
+    )
+    _soft_delete(conn, "recoveries", whoop_user_id, "5002")
+
+    results = get_recoveries(conn, whoop_user_id)
+
+    assert {r["cycle_id"] for r in results} == {5001}
+    conn.close()
+
+
+def test_get_recoveries_include_deleted_true_still_returns_soft_deleted() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 21
+    upsert_recovery(
+        conn,
+        whoop_user_id,
+        {"cycle_id": 5003, "created_at": "2026-08-01T08:00:00Z", "score_state": "SCORED"},
+    )
+    _soft_delete(conn, "recoveries", whoop_user_id, "5003")
+
+    results = get_recoveries(conn, whoop_user_id, include_deleted=True)
+
+    assert {r["cycle_id"] for r in results} == {5003}
+    conn.close()
+
+
+def test_get_sleeps_excludes_soft_deleted_by_default() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 22
+    upsert_sleep(
+        conn,
+        whoop_user_id,
+        {"id": "sleep-a", "start": "2026-08-01T23:00:00Z", "end": "2026-08-02T07:00:00Z"},
+    )
+    upsert_sleep(
+        conn,
+        whoop_user_id,
+        {"id": "sleep-b", "start": "2026-08-02T23:00:00Z", "end": "2026-08-03T07:00:00Z"},
+    )
+    _soft_delete(conn, "sleeps", whoop_user_id, "sleep-b")
+
+    results = get_sleeps(conn, whoop_user_id)
+
+    assert {r["id"] for r in results} == {"sleep-a"}
+    conn.close()
+
+
+def test_get_cycles_excludes_soft_deleted_by_default() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 23
+    upsert_cycle(
+        conn,
+        whoop_user_id,
+        {"id": 6001, "start": "2026-08-01T00:00:00Z", "end": "2026-08-02T00:00:00Z"},
+    )
+    upsert_cycle(
+        conn,
+        whoop_user_id,
+        {"id": 6002, "start": "2026-08-02T00:00:00Z", "end": "2026-08-03T00:00:00Z"},
+    )
+    _soft_delete(conn, "cycles", whoop_user_id, "6002")
+
+    results = get_cycles(conn, whoop_user_id)
+
+    assert {r["id"] for r in results} == {6001}
+    conn.close()
+
+
+def test_get_workouts_excludes_soft_deleted_by_default() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 24
+    upsert_workout(
+        conn,
+        whoop_user_id,
+        {"id": "wo-a", "start": "2026-08-01T06:00:00Z", "end": "2026-08-01T07:00:00Z"},
+    )
+    upsert_workout(
+        conn,
+        whoop_user_id,
+        {"id": "wo-b", "start": "2026-08-02T06:00:00Z", "end": "2026-08-02T07:00:00Z"},
+    )
+    _soft_delete(conn, "workouts", whoop_user_id, "wo-b")
+
+    results = get_workouts(conn, whoop_user_id)
+
+    assert {r["id"] for r in results} == {"wo-a"}
+    conn.close()
+
+
+def test_export_member_data_still_includes_soft_deleted_rows() -> None:
+    """export_member_data (#32's data-subject export) must keep showing a
+    record WHOOP told this server was deleted, until an operator actually
+    erases it -- a soft-delete is not erasure. Its 4 getter calls must pass
+    include_deleted=True even though the default flipped to False."""
+    conn = open_store(":memory:")
+    whoop_user_id = 25
+    upsert_sleep(
+        conn,
+        whoop_user_id,
+        {"id": "sleep-export", "start": "2026-08-01T23:00:00Z", "end": "2026-08-02T07:00:00Z"},
+    )
+    _soft_delete(conn, "sleeps", whoop_user_id, "sleep-export")
+
+    export = export_member_data(conn, whoop_user_id)
+
+    assert {r["id"] for r in export["sleeps"]} == {"sleep-export"}
+    conn.close()
+
+
+# -- #16: single-record lookups by id -----------------------------------------
+
+
+def test_get_sleep_by_id_returns_none_for_unknown_id() -> None:
+    conn = open_store(":memory:")
+    assert get_sleep_by_id(conn, 30, "nonexistent") is None
+    conn.close()
+
+
+def test_get_sleep_by_id_returns_the_record() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 31
+    upsert_sleep(
+        conn,
+        whoop_user_id,
+        {"id": "sleep-x", "start": "2026-08-01T23:00:00Z", "end": "2026-08-02T07:00:00Z"},
+    )
+
+    result = get_sleep_by_id(conn, whoop_user_id, "sleep-x")
+
+    assert result is not None
+    assert result["id"] == "sleep-x"
+    conn.close()
+
+
+def test_get_sleep_by_id_excludes_soft_deleted_by_default() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 32
+    upsert_sleep(
+        conn,
+        whoop_user_id,
+        {"id": "sleep-y", "start": "2026-08-01T23:00:00Z", "end": "2026-08-02T07:00:00Z"},
+    )
+    _soft_delete(conn, "sleeps", whoop_user_id, "sleep-y")
+
+    assert get_sleep_by_id(conn, whoop_user_id, "sleep-y") is None
+    assert get_sleep_by_id(conn, whoop_user_id, "sleep-y", include_deleted=True) is not None
+    conn.close()
+
+
+def test_get_workout_by_id_returns_none_for_unknown_id() -> None:
+    conn = open_store(":memory:")
+    assert get_workout_by_id(conn, 33, "nonexistent") is None
+    conn.close()
+
+
+def test_get_workout_by_id_returns_the_record() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 34
+    upsert_workout(
+        conn,
+        whoop_user_id,
+        {"id": "wo-x", "start": "2026-08-01T06:00:00Z", "end": "2026-08-01T07:00:00Z"},
+    )
+
+    result = get_workout_by_id(conn, whoop_user_id, "wo-x")
+
+    assert result is not None
+    assert result["id"] == "wo-x"
+    conn.close()
+
+
+def test_get_workout_by_id_excludes_soft_deleted_by_default() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 35
+    upsert_workout(
+        conn,
+        whoop_user_id,
+        {"id": "wo-y", "start": "2026-08-01T06:00:00Z", "end": "2026-08-01T07:00:00Z"},
+    )
+    _soft_delete(conn, "workouts", whoop_user_id, "wo-y")
+
+    assert get_workout_by_id(conn, whoop_user_id, "wo-y") is None
+    assert get_workout_by_id(conn, whoop_user_id, "wo-y", include_deleted=True) is not None
+    conn.close()
+
+
+# -- #16: per-entity coverage (earliest/latest) queries -----------------------
+#
+# Per the module's own date-column mapping: recoveries key their activity
+# date on created_at; sleeps/cycles/workouts key theirs on start/end (the
+# record's full span, latest = MAX(end), not MAX(start)) -- never updated_at,
+# which is sync/rescore bookkeeping, not an activity date.
+
+
+def test_get_recovery_coverage_empty_table_returns_none_none() -> None:
+    conn = open_store(":memory:")
+    assert get_recovery_coverage(conn, 40) == (None, None)
+    conn.close()
+
+
+def test_get_recovery_coverage_returns_min_max_created_at() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 41
+    for cycle_id, created_at in (
+        (1, "2026-08-01T08:00:00Z"),
+        (2, "2026-08-05T08:00:00Z"),
+        (3, "2026-08-03T08:00:00Z"),
+    ):
+        upsert_recovery(
+            conn,
+            whoop_user_id,
+            {"cycle_id": cycle_id, "created_at": created_at, "score_state": "SCORED"},
+        )
+
+    earliest, latest = get_recovery_coverage(conn, whoop_user_id)
+
+    assert earliest == "2026-08-01T08:00:00Z"
+    assert latest == "2026-08-05T08:00:00Z"
+    conn.close()
+
+
+def test_get_recovery_coverage_excludes_soft_deleted_from_the_window() -> None:
+    """A soft-deleted row at either edge must not anchor the reported window."""
+    conn = open_store(":memory:")
+    whoop_user_id = 42
+    upsert_recovery(
+        conn,
+        whoop_user_id,
+        {"cycle_id": 1, "created_at": "2026-08-01T08:00:00Z", "score_state": "SCORED"},
+    )
+    upsert_recovery(
+        conn,
+        whoop_user_id,
+        {"cycle_id": 2, "created_at": "2026-08-10T08:00:00Z", "score_state": "SCORED"},
+    )
+    _soft_delete(conn, "recoveries", whoop_user_id, "2")
+
+    earliest, latest = get_recovery_coverage(conn, whoop_user_id)
+
+    assert earliest == "2026-08-01T08:00:00Z"
+    assert latest == "2026-08-01T08:00:00Z"
+    conn.close()
+
+
+def test_get_sleep_coverage_uses_start_and_end() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 43
+    upsert_sleep(
+        conn,
+        whoop_user_id,
+        {"id": "s1", "start": "2026-08-01T23:00:00Z", "end": "2026-08-02T07:00:00Z"},
+    )
+    upsert_sleep(
+        conn,
+        whoop_user_id,
+        {"id": "s2", "start": "2026-08-05T23:00:00Z", "end": "2026-08-06T07:00:00Z"},
+    )
+
+    earliest, latest = get_sleep_coverage(conn, whoop_user_id)
+
+    assert earliest == "2026-08-01T23:00:00Z"
+    assert latest == "2026-08-06T07:00:00Z"
+    conn.close()
+
+
+def test_get_cycle_coverage_empty_table_returns_none_none() -> None:
+    conn = open_store(":memory:")
+    assert get_cycle_coverage(conn, 44) == (None, None)
+    conn.close()
+
+
+def test_get_cycle_coverage_uses_start_and_end() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 45
+    upsert_cycle(
+        conn,
+        whoop_user_id,
+        {"id": 1, "start": "2026-08-01T00:00:00Z", "end": "2026-08-02T00:00:00Z"},
+    )
+    upsert_cycle(
+        conn,
+        whoop_user_id,
+        {"id": 2, "start": "2026-08-05T00:00:00Z", "end": "2026-08-06T00:00:00Z"},
+    )
+
+    earliest, latest = get_cycle_coverage(conn, whoop_user_id)
+
+    assert earliest == "2026-08-01T00:00:00Z"
+    assert latest == "2026-08-06T00:00:00Z"
+    conn.close()
+
+
+def test_get_workout_coverage_uses_start_and_end() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 46
+    upsert_workout(
+        conn,
+        whoop_user_id,
+        {"id": "w1", "start": "2026-08-01T06:00:00Z", "end": "2026-08-01T07:00:00Z"},
+    )
+    upsert_workout(
+        conn,
+        whoop_user_id,
+        {"id": "w2", "start": "2026-08-05T06:00:00Z", "end": "2026-08-05T08:00:00Z"},
+    )
+
+    earliest, latest = get_workout_coverage(conn, whoop_user_id)
+
+    assert earliest == "2026-08-01T06:00:00Z"
+    assert latest == "2026-08-05T08:00:00Z"
+    conn.close()
+
+
+def test_get_workout_coverage_empty_table_returns_none_none() -> None:
+    conn = open_store(":memory:")
+    assert get_workout_coverage(conn, 47) == (None, None)
+    conn.close()
+
+
+# -- #16: singleton (profile / body_measurement) freshness -------------------
+
+
+def test_get_profile_updated_at_none_when_never_synced() -> None:
+    conn = open_store(":memory:")
+    assert get_profile_updated_at(conn, 50) is None
+    conn.close()
+
+
+def test_get_profile_updated_at_returns_the_stored_updated_at() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 51
+    upsert_profile(conn, whoop_user_id, {"user_id": whoop_user_id, "email": "a@example.com"})
+
+    updated_at = get_profile_updated_at(conn, whoop_user_id)
+
+    assert updated_at is not None
+    # Round-trips as an ISO 8601 string, same shape store._now() writes.
+    from datetime import datetime
+
+    datetime.fromisoformat(updated_at)
+    conn.close()
+
+
+def test_get_body_measurement_updated_at_none_when_never_synced() -> None:
+    conn = open_store(":memory:")
+    assert get_body_measurement_updated_at(conn, 52) is None
+    conn.close()
+
+
+def test_get_body_measurement_updated_at_returns_the_stored_updated_at() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 53
+    upsert_body_measurement(conn, whoop_user_id, {"height_meter": 1.8})
+
+    updated_at = get_body_measurement_updated_at(conn, whoop_user_id)
+
+    assert updated_at is not None
+    conn.close()
+
+
+# -- #16: limit/offset pagination on the 4 collection getters ----------------
+
+
+def test_get_sleeps_limit_returns_the_oldest_n() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 60
+    for i, day in enumerate((1, 2, 3), start=1):
+        upsert_sleep(
+            conn,
+            whoop_user_id,
+            {
+                "id": f"sleep-{i}",
+                "start": f"2026-08-0{day}T23:00:00Z",
+                "end": f"2026-08-0{day + 1}T07:00:00Z",
+            },
+        )
+
+    results = get_sleeps(conn, whoop_user_id, limit=2)
+
+    assert [r["id"] for r in results] == ["sleep-1", "sleep-2"]
+    conn.close()
+
+
+def test_get_sleeps_offset_skips_the_first_n() -> None:
+    conn = open_store(":memory:")
+    whoop_user_id = 61
+    for i, day in enumerate((1, 2, 3), start=1):
+        upsert_sleep(
+            conn,
+            whoop_user_id,
+            {
+                "id": f"sleep-{i}",
+                "start": f"2026-08-0{day}T23:00:00Z",
+                "end": f"2026-08-0{day + 1}T07:00:00Z",
+            },
+        )
+
+    results = get_sleeps(conn, whoop_user_id, limit=2, offset=2)
+
+    assert [r["id"] for r in results] == ["sleep-3"]
     conn.close()

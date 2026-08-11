@@ -472,6 +472,9 @@ def get_recoveries(
     *,
     start: str | None = None,
     end: str | None = None,
+    include_deleted: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Recoveries for ``whoop_user_id``, oldest first.
 
@@ -479,20 +482,54 @@ def get_recoveries(
     are ignored (i.e. no filtering on that bound) when left as ``None``.
     Returns each record's raw payload exactly as it was written -- this
     store does no reshaping.
+
+    ``include_deleted`` (#16/#18): soft-deleted rows (``deleted_at`` set by
+    the ``*.deleted`` webhook path) are excluded by default -- a repointed
+    MCP tool must never resurrect one. Pass ``True`` only for a caller that
+    deliberately wants a deleted-but-not-erased row too, e.g.
+    ``export_member_data`` (#32): a soft-delete is not erasure.
+
+    ``limit``/``offset`` (#16): store-backed pagination for the list_*
+    tools. ``offset`` is ignored unless ``limit`` is also given.
     """
     _require_user_id(whoop_user_id)
-    rows = _execute_scoped(
-        conn,
-        """
+    sql = """
         SELECT raw_json FROM recoveries
         WHERE whoop_user_id = ?
+          AND (? OR deleted_at IS NULL)
           AND (? IS NULL OR created_at >= ?)
           AND (? IS NULL OR created_at <= ?)
         ORDER BY created_at
-        """,
-        (whoop_user_id, start, start, end, end),
-    ).fetchall()
+    """
+    params: tuple[Any, ...] = (whoop_user_id, include_deleted, start, start, end, end)
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params = (*params, limit, offset)
+    rows = _execute_scoped(conn, sql, params).fetchall()
     return [json.loads(row[0]) for row in rows]
+
+
+def get_recovery_coverage(
+    conn: sqlite3.Connection, whoop_user_id: int
+) -> tuple[str | None, str | None]:
+    """The (earliest, latest) ``created_at`` held for ``whoop_user_id``'s
+    recoveries, excluding soft-deleted rows -- ``(None, None)`` if the table
+    holds nothing live for this member.
+
+    ``created_at`` (the activity date), never ``updated_at`` (sync/rescore
+    bookkeeping, per this module's own schema comment) -- see #16's own
+    notes on why conflating the two would be the inverted form of #15's bug.
+    """
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        """
+        SELECT MIN(created_at), MAX(created_at) FROM recoveries
+        WHERE whoop_user_id = ? AND deleted_at IS NULL
+        """,
+        (whoop_user_id,),
+    ).fetchone()
+    return (row[0], row[1]) if row is not None else (None, None)
 
 
 # -- sleeps ---------------------------------------------------------------
@@ -539,25 +576,74 @@ def get_sleeps(
     *,
     start: str | None = None,
     end: str | None = None,
+    include_deleted: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Sleeps for ``whoop_user_id``, oldest first.
 
     ``start``/``end`` (inclusive) filter on the sleep's own ``start``
-    timestamp when given.
+    timestamp when given. See ``get_recoveries`` for ``include_deleted``/
+    ``limit``/``offset``.
     """
     _require_user_id(whoop_user_id)
-    rows = _execute_scoped(
-        conn,
-        """
+    sql = """
         SELECT raw_json FROM sleeps
         WHERE whoop_user_id = ?
+          AND (? OR deleted_at IS NULL)
           AND (? IS NULL OR start >= ?)
           AND (? IS NULL OR start <= ?)
         ORDER BY start
-        """,
-        (whoop_user_id, start, start, end, end),
-    ).fetchall()
+    """
+    params: tuple[Any, ...] = (whoop_user_id, include_deleted, start, start, end, end)
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params = (*params, limit, offset)
+    rows = _execute_scoped(conn, sql, params).fetchall()
     return [json.loads(row[0]) for row in rows]
+
+
+def get_sleep_coverage(
+    conn: sqlite3.Connection, whoop_user_id: int
+) -> tuple[str | None, str | None]:
+    """The (earliest ``start``, latest ``end``) held for ``whoop_user_id``'s
+    sleeps, excluding soft-deleted rows -- ``(None, None)`` if none are held.
+
+    The record's full span (``MIN(start)``/``MAX(end)``), not ``MAX(start)``:
+    the latest-held sleep may still be ongoing well past its own start.
+    """
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        """
+        SELECT MIN(start), MAX(end) FROM sleeps
+        WHERE whoop_user_id = ? AND deleted_at IS NULL
+        """,
+        (whoop_user_id,),
+    ).fetchone()
+    return (row[0], row[1]) if row is not None else (None, None)
+
+
+def get_sleep_by_id(
+    conn: sqlite3.Connection,
+    whoop_user_id: int,
+    resource_id: str,
+    *,
+    include_deleted: bool = False,
+) -> dict[str, Any] | None:
+    """The stored sleep ``resource_id`` for ``whoop_user_id``, or ``None`` if
+    unknown -- or soft-deleted and ``include_deleted`` is left ``False``."""
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        """
+        SELECT raw_json FROM sleeps
+        WHERE whoop_user_id = ? AND resource_id = ?
+          AND (? OR deleted_at IS NULL)
+        """,
+        (whoop_user_id, resource_id, include_deleted),
+    ).fetchone()
+    return json.loads(row[0]) if row is not None else None
 
 
 # -- cycles ---------------------------------------------------------------
@@ -606,25 +692,49 @@ def get_cycles(
     *,
     start: str | None = None,
     end: str | None = None,
+    include_deleted: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Cycles for ``whoop_user_id``, oldest first.
 
     ``start``/``end`` (inclusive) filter on the cycle's own ``start``
-    timestamp when given.
+    timestamp when given. See ``get_recoveries`` for ``include_deleted``/
+    ``limit``/``offset``.
     """
     _require_user_id(whoop_user_id)
-    rows = _execute_scoped(
-        conn,
-        """
+    sql = """
         SELECT raw_json FROM cycles
         WHERE whoop_user_id = ?
+          AND (? OR deleted_at IS NULL)
           AND (? IS NULL OR start >= ?)
           AND (? IS NULL OR start <= ?)
         ORDER BY start
-        """,
-        (whoop_user_id, start, start, end, end),
-    ).fetchall()
+    """
+    params: tuple[Any, ...] = (whoop_user_id, include_deleted, start, start, end, end)
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params = (*params, limit, offset)
+    rows = _execute_scoped(conn, sql, params).fetchall()
     return [json.loads(row[0]) for row in rows]
+
+
+def get_cycle_coverage(
+    conn: sqlite3.Connection, whoop_user_id: int
+) -> tuple[str | None, str | None]:
+    """The (earliest ``start``, latest ``end``) held for ``whoop_user_id``'s
+    cycles, excluding soft-deleted rows -- ``(None, None)`` if none are held.
+    """
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        """
+        SELECT MIN(start), MAX(end) FROM cycles
+        WHERE whoop_user_id = ? AND deleted_at IS NULL
+        """,
+        (whoop_user_id,),
+    ).fetchone()
+    return (row[0], row[1]) if row is not None else (None, None)
 
 
 # -- workouts ---------------------------------------------------------------
@@ -670,25 +780,71 @@ def get_workouts(
     *,
     start: str | None = None,
     end: str | None = None,
+    include_deleted: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Workouts for ``whoop_user_id``, oldest first.
 
     ``start``/``end`` (inclusive) filter on the workout's own ``start``
-    timestamp when given.
+    timestamp when given. See ``get_recoveries`` for ``include_deleted``/
+    ``limit``/``offset``.
     """
     _require_user_id(whoop_user_id)
-    rows = _execute_scoped(
-        conn,
-        """
+    sql = """
         SELECT raw_json FROM workouts
         WHERE whoop_user_id = ?
+          AND (? OR deleted_at IS NULL)
           AND (? IS NULL OR start >= ?)
           AND (? IS NULL OR start <= ?)
         ORDER BY start
-        """,
-        (whoop_user_id, start, start, end, end),
-    ).fetchall()
+    """
+    params: tuple[Any, ...] = (whoop_user_id, include_deleted, start, start, end, end)
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params = (*params, limit, offset)
+    rows = _execute_scoped(conn, sql, params).fetchall()
     return [json.loads(row[0]) for row in rows]
+
+
+def get_workout_coverage(
+    conn: sqlite3.Connection, whoop_user_id: int
+) -> tuple[str | None, str | None]:
+    """The (earliest ``start``, latest ``end``) held for ``whoop_user_id``'s
+    workouts, excluding soft-deleted rows -- ``(None, None)`` if none are held.
+    """
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        """
+        SELECT MIN(start), MAX(end) FROM workouts
+        WHERE whoop_user_id = ? AND deleted_at IS NULL
+        """,
+        (whoop_user_id,),
+    ).fetchone()
+    return (row[0], row[1]) if row is not None else (None, None)
+
+
+def get_workout_by_id(
+    conn: sqlite3.Connection,
+    whoop_user_id: int,
+    resource_id: str,
+    *,
+    include_deleted: bool = False,
+) -> dict[str, Any] | None:
+    """The stored workout ``resource_id`` for ``whoop_user_id``, or ``None``
+    if unknown -- or soft-deleted and ``include_deleted`` is left ``False``."""
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        """
+        SELECT raw_json FROM workouts
+        WHERE whoop_user_id = ? AND resource_id = ?
+          AND (? OR deleted_at IS NULL)
+        """,
+        (whoop_user_id, resource_id, include_deleted),
+    ).fetchone()
+    return json.loads(row[0]) if row is not None else None
 
 
 # -- body measurements & profile ---------------------------------------------
@@ -727,6 +883,20 @@ def get_body_measurement(conn: sqlite3.Connection, whoop_user_id: int) -> dict[s
     return json.loads(row[0]) if row is not None else None
 
 
+def get_body_measurement_updated_at(conn: sqlite3.Connection, whoop_user_id: int) -> str | None:
+    """When ``whoop_user_id``'s body-measurement row was last written here, or
+    ``None`` if it has never been synced -- the singleton-shaped freshness
+    signal #16's ``whoop_data_coverage`` reports for this entity, since it
+    has no earliest/latest activity range to speak of."""
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        "SELECT updated_at FROM body_measurements WHERE whoop_user_id = ?",
+        (whoop_user_id,),
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
 def upsert_profile(conn: sqlite3.Connection, whoop_user_id: int, record: dict[str, Any]) -> None:
     """Insert or update the one profile row for ``whoop_user_id``."""
     _execute_scoped(
@@ -753,6 +923,19 @@ def get_profile(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str, Any] 
         (whoop_user_id,),
     ).fetchone()
     return json.loads(row[0]) if row is not None else None
+
+
+def get_profile_updated_at(conn: sqlite3.Connection, whoop_user_id: int) -> str | None:
+    """When ``whoop_user_id``'s profile row was last written here, or
+    ``None`` if it has never been synced -- see
+    ``get_body_measurement_updated_at`` for the analogous singleton."""
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        "SELECT updated_at FROM profiles WHERE whoop_user_id = ?",
+        (whoop_user_id,),
+    ).fetchone()
+    return row[0] if row is not None else None
 
 
 # -- sync_state ---------------------------------------------------------------
@@ -1145,6 +1328,12 @@ def export_member_data(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str
     four small ``get_*_for_member`` helpers above), so every field is already
     enforced member-scoped by ``_execute_scoped`` -- there is no separate
     query in this function for a second member's data to leak through.
+
+    ``include_deleted=True`` on the four collection getters (#16): a
+    soft-delete (the ``*.deleted`` webhook path) is not erasure -- see this
+    module's own comment on ``erase_member_data`` -- so a data-subject
+    export must still show a record WHOOP told this server was deleted,
+    until an operator actually erases it.
     """
     _require_user_id(whoop_user_id)
     return {
@@ -1152,10 +1341,10 @@ def export_member_data(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str
         "exported_at": _now(),
         "profile": get_profile(conn, whoop_user_id),
         "body_measurement": get_body_measurement(conn, whoop_user_id),
-        "recoveries": get_recoveries(conn, whoop_user_id),
-        "sleeps": get_sleeps(conn, whoop_user_id),
-        "cycles": get_cycles(conn, whoop_user_id),
-        "workouts": get_workouts(conn, whoop_user_id),
+        "recoveries": get_recoveries(conn, whoop_user_id, include_deleted=True),
+        "sleeps": get_sleeps(conn, whoop_user_id, include_deleted=True),
+        "cycles": get_cycles(conn, whoop_user_id, include_deleted=True),
+        "workouts": get_workouts(conn, whoop_user_id, include_deleted=True),
         "sync_state": get_all_sync_state_for_member(conn, whoop_user_id),
         "webhook_events": get_webhook_events_for_member(conn, whoop_user_id),
         "tool_call_audit": get_tool_call_audit_for_member(conn, whoop_user_id),

@@ -13,7 +13,9 @@ they state what the data is not (a diagnosis).
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import logging
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -40,7 +42,7 @@ from whoopmcp.analysis import (
     trend,
 )
 from whoopmcp.auth import Authenticator, AuthError, build_store
-from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_params
+from whoopmcp.client import WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.context_budget import strip_nulls
 from whoopmcp.store import open_store
@@ -68,10 +70,21 @@ INSTRUCTIONS = """\
 Read-only access to the signed-in user's own WHOOP data: recovery, sleep,
 strain, cycles and workouts.
 
+Every data and analysis tool below answers from a local, persistent store
+(``WHOOPMCP_CACHE=true``, off by default -- see PRIVACY.md), not from a live
+WHOOP call: this makes ordinary reads cost zero WHOOP API requests, but it
+also means the store has to actually hold the data first. ``whoop_sync``
+(and, for a brand-new user, the operator-run ``whoopmcp backfill`` CLI
+command) is what fills it; a miss is never silently retried against the live
+API. Call ``whoop_data_coverage`` first when in doubt about what is held --
+every other tool's own response also carries a "coverage" (and, for a
+date-range tool, "range_coverage") field describing exactly what backs its
+answer, so "no records" and "not imported yet" are never confused.
+
 Guidance:
-- Timestamps are ISO 8601 UTC. Ask for an explicit date range; do not fetch
-  unbounded history, as WHOOP allows 100 requests/minute and long ranges
-  will exhaust both the rate limit and the context window.
+- Timestamps are ISO 8601 UTC. Ask for an explicit date range; unbounded
+  history is still a large context-window cost even though it no longer
+  costs a live rate-limit budget.
 - A WHOOP "cycle" is a physiological day, which does not align with midnight.
   Join sleep and recovery to strain through cycle_id, not calendar date.
   Exception: correlate_metrics' lag sweep matches by calendar date instead,
@@ -614,23 +627,328 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
 _DEFAULT_LOOKBACK = timedelta(days=7)
 
 
-async def _guard_rate_limit(
-    build_response: Callable[[], Awaitable[dict[str, Any]]],
-) -> dict[str, Any]:
-    """Run a data-tool body, turning a RateLimitedError into something a model can act on.
+#: Response-shape convention every repointed data/analysis tool below
+#: follows (#16), stated once here rather than re-derived per tool:
+#:
+#: - Every response carries a top-level "coverage" dict, keyed by the
+#:   entity name(s) the tool drew from -- "recoveries"/"sleeps"/"cycles"/
+#:   "workouts" (the store's own table names, including for the
+#:   metric-sourced analysis tools, which key by entity table name rather
+#:   than the singular friendly collection name) or "profile"/
+#:   "body_measurement" for the two singletons. Collection entities get
+#:   ``_entity_coverage``'s shape; singletons get ``_singleton_coverage``'s.
+#: - Every range-taking tool (the 4 list_* tools, plus summarize_period/
+#:   metric_trend/correlate_metrics/compare_periods) additionally carries a
+#:   "range_coverage" dict, entity-keyed the same way, each a flat
+#:   ``_range_coverage_entry``: comparing the tool's own resolved request
+#:   range against that entity's coverage window. compare_periods has two
+#:   ranges (baseline/comparison) but still reports one flat entry per
+#:   entity -- see ``_merge_range_coverage``.
+#: - get_sleep/get_workout/get_profile/get_body_measurement are point/
+#:   singleton lookups, not ranges: they carry "coverage" but no
+#:   "range_coverage". A miss is never a live fetch -- ``{"error":
+#:   "not_synced", ...}`` when the entity has no coverage at all, or (for
+#:   get_sleep/get_workout only, since the singletons have no "which id"
+#:   question) ``{"error": "not_found_in_store", ...}`` when the entity has
+#:   *some* coverage but not this particular id.
+#:
+#: This is a deliberate, chosen convention -- the issue's own text calls the
+#: exact field shape a normal implementation detail, not something it
+#: resolves -- applied consistently across all 12 repointed tools plus
+#: whoop_data_coverage.
 
-    A raw RateLimitedError would otherwise propagate as an opaque ToolError;
-    a model can't retry sensibly without knowing when to.
+
+def _require_store(app: AppContext) -> sqlite3.Connection:
+    """The persistent store every repointed data/analysis tool reads from.
+
+    ``_ensure_matches_live_grant`` (via ``resolve_member_id``) already raises
+    before this is ever reached if ``app.store_conn`` is ``None`` -- this
+    exists so mypy can narrow the type at each tool's own call site, not
+    because this branch is actually reachable in practice.
     """
-    try:
-        return await build_response()
-    except RateLimitedError as exc:
-        message = (
-            f"WHOOP rate limit hit; retry after {exc.retry_after:.0f} seconds."
-            if exc.retry_after is not None
-            else "WHOOP rate limit hit; retry after a short delay."
+    if app.store_conn is None:
+        raise RuntimeError(
+            "this tool requires a persistent store (AppContext.store_conn must be set); "
+            "this is always opened by lifespan(), so this error only occurs if AppContext "
+            "is constructed outside that context"
         )
-        return {"error": "rate_limited", "retry_after_seconds": exc.retry_after, "message": message}
+    return app.store_conn
+
+
+def _iso(value: datetime | str | None) -> str | None:
+    """``value`` as an ISO 8601 string, same normalisation ``client._iso``
+    applies -- a ``datetime`` (from ``_default_range``'s own default) or an
+    already-string bound both need to be one consistent string shape before
+    they reach a store query or a coverage message."""
+    if value is None:
+        return None
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+#: Every collection entity a repointed tool can consult, mapped to the
+#: store's own (earliest, latest) coverage query for it. Keys are the
+#: store's own table names -- what every coverage/range_coverage envelope in
+#: this module is keyed by, per this file's own response-shape convention
+#: (see ``_entity_coverage``'s docstring).
+_COLLECTION_COVERAGE_FN: dict[
+    str, Callable[[sqlite3.Connection, int], tuple[str | None, str | None]]
+] = {
+    "recoveries": store.get_recovery_coverage,
+    "sleeps": store.get_sleep_coverage,
+    "cycles": store.get_cycle_coverage,
+    "workouts": store.get_workout_coverage,
+}
+
+#: Friendly analysis-tool collection name (``_METRIC_COLLECTION``'s own
+#: values) -> the store's table name it corresponds to. Every coverage/
+#: range_coverage envelope in this module keys by the table name, never the
+#: singular friendly collection name -- see this module's response-shape note.
+_COLLECTION_TO_ENTITY: dict[str, str] = {
+    "recovery": "recoveries",
+    "sleep": "sleeps",
+    "cycle": "cycles",
+}
+
+_COLLECTION_GETTER: dict[str, Callable[..., list[dict[str, Any]]]] = {
+    "recovery": store.get_recoveries,
+    "sleep": store.get_sleeps,
+    "cycle": store.get_cycles,
+}
+
+
+def _entity_coverage(conn: sqlite3.Connection, whoop_user_id: int, entity: str) -> dict[str, Any]:
+    """The coverage envelope for one of the four collection entities.
+
+    ``{"earliest": iso|None, "latest": iso|None, "backfill": {...},
+    "incremental_sync": {...}}`` -- earliest/latest come from the entity's
+    own activity-date columns (``created_at``, or ``start``/``end`` -- see
+    store.py's schema comment and its own coverage-query docstrings), never
+    ``updated_at``. ``backfill`` reads ``sync_state``'s bare entity-name row
+    (backfill.py's own key, ``_EntitySpec.name``); ``incremental_sync`` reads
+    the ``f"{entity}:incremental"`` row (sync.py's own
+    ``_incremental_entity_key`` format, inlined here rather than imported
+    since that helper is private to sync.py -- see its own module docstring
+    for why the two keys must never collide). ``last_successful_at`` is only
+    populated when the incremental row's own outcome is "complete": an
+    "in_progress" row's ``last_run_at`` is that run's own timestamp, not a
+    prior completion's, and reporting it as if it were one would be exactly
+    the kind of confidently-wrong answer this issue exists to prevent.
+    """
+    earliest, latest = _COLLECTION_COVERAGE_FN[entity](conn, whoop_user_id)
+    backfill_state = store.get_sync_state(conn, whoop_user_id, entity)
+    incremental_state = store.get_sync_state(conn, whoop_user_id, f"{entity}:incremental")
+    return {
+        "earliest": earliest,
+        "latest": latest,
+        "backfill": {
+            "status": backfill_state["outcome"] if backfill_state is not None else "never_run",
+            "last_run_at": backfill_state["last_run_at"] if backfill_state is not None else None,
+        },
+        "incremental_sync": {
+            "status": incremental_state["outcome"]
+            if incremental_state is not None
+            else "never_run",
+            "last_successful_at": (
+                incremental_state["last_run_at"]
+                if incremental_state is not None and incremental_state["outcome"] == "complete"
+                else None
+            ),
+        },
+    }
+
+
+def _singleton_coverage(updated_at: str | None) -> dict[str, Any]:
+    """The coverage envelope for a singleton entity (profile, body
+    measurement): ``{"synced": bool, "last_updated_at": iso|None}`` --
+    deliberately not the earliest/latest shape ``_entity_coverage`` returns,
+    since neither singleton has an activity range to report."""
+    return {"synced": updated_at is not None, "last_updated_at": updated_at}
+
+
+def _parse_iso(value: str) -> datetime:
+    """Parse a stored or requested timestamp, accepting the trailing ``Z``
+    WHOOP's own payloads use, the ``+00:00`` offset this store's ``_now()``
+    writes, and a bare offset-less string.
+
+    Every tool docstring in this module asks for "ISO 8601 UTC" and shows a
+    ``Z``-suffixed example, but a model that drops the offset and sends a
+    naive string is a plausible, not a malicious, input -- treated as UTC
+    (the documented convention) rather than raised as a comparison error
+    against this function's always-aware stored values. Without this, two
+    naive/aware ``datetime`` objects compared in ``_range_status`` raise an
+    unstructured ``TypeError`` that surfaces as an opaque tool error instead
+    of a coverage-status response.
+    """
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _range_status(
+    earliest: str | None, latest: str | None, start: str | None, end: str | None
+) -> tuple[str, str | None]:
+    """Compare a requested ``[start, end]`` against a held ``[earliest,
+    latest]`` coverage window, returning one of four statuses and, for
+    every status but ``"within_coverage"``, an explicit human-readable
+    message -- see this module's own response-shape note for the full
+    convention every range tool follows.
+    """
+    if earliest is None or latest is None:
+        return "no_data_synced_yet", (
+            "Nothing has ever been synced for this entity; run whoop_sync "
+            "(after an initial backfill) before requesting a range."
+        )
+    held_earliest, held_latest = _parse_iso(earliest), _parse_iso(latest)
+
+    # Handle one-sided range: only end specified
+    if start is None and end is not None:
+        req_end = _parse_iso(end)
+        if req_end < held_earliest:
+            return "wholly_outside_coverage", (
+                f"The requested range ends at {end}, which is before the earliest held record "
+                f"({earliest}) for this entity."
+            )
+        if req_end > held_latest:
+            return "partly_outside_coverage", (
+                f"The requested range ends after the coverage window held for this entity "
+                f"({earliest} to {latest}); results below reflect only what has been synced."
+            )
+        return "within_coverage", None
+
+    # Handle one-sided range: only start specified
+    if end is None and start is not None:
+        req_start = _parse_iso(start)
+        if req_start > held_latest:
+            return "wholly_outside_coverage", (
+                f"The requested range starts at {start}, which is after the latest held record "
+                f"({latest}) for this entity."
+            )
+        if req_start < held_earliest:
+            return "partly_outside_coverage", (
+                f"The requested range starts before the coverage window held for this entity "
+                f"({earliest} to {latest}); results below reflect only what has been synced."
+            )
+        return "within_coverage", None
+
+    # Both are None or both are specified; both are None only if _default_range was
+    # skipped (e.g., continuation pages that don't reset bounds).
+    if start is None or end is None:
+        # Both are None - no meaningful comparison
+        return "within_coverage", None
+
+    # Both start and end are specified
+    req_start, req_end = _parse_iso(start), _parse_iso(end)
+    if req_end < held_earliest or req_start > held_latest:
+        return "wholly_outside_coverage", (
+            f"The requested range ({start} to {end}) does not overlap the coverage window "
+            f"held for this entity ({earliest} to {latest})."
+        )
+    if req_start < held_earliest or req_end > held_latest:
+        return "partly_outside_coverage", (
+            f"The requested range ({start} to {end}) extends beyond the coverage window held "
+            f"for this entity ({earliest} to {latest}); results below reflect only what has "
+            "been synced."
+        )
+    return "within_coverage", None
+
+
+def _range_coverage_entry(
+    earliest: str | None, latest: str | None, start: str | None, end: str | None
+) -> dict[str, Any]:
+    """One entity's ``range_coverage`` entry: ``{"status": ..., "message":
+    ...}``, with ``"message"`` present only when ``status`` is not
+    ``"within_coverage"`` -- see ``_range_status``."""
+    status, message = _range_status(earliest, latest, start, end)
+    entry: dict[str, Any] = {"status": status}
+    if message is not None:
+        entry["message"] = message
+    return entry
+
+
+#: Worst-to-best ordering ``_merge_range_coverage`` picks the worse status
+#: from -- lower is worse. A tool with more than one range to reconcile into
+#: one flat entry (compare_periods' baseline vs. comparison) surfaces the
+#: worse of the two rather than picking one arbitrarily or inventing a
+#: nested shape the generic "every range tool's range_coverage is
+#: entity -> {status, message}" convention (see this module's own
+#: response-shape note) doesn't otherwise have.
+_RANGE_STATUS_PRIORITY: dict[str, int] = {
+    "no_data_synced_yet": 0,
+    "wholly_outside_coverage": 1,
+    "partly_outside_coverage": 2,
+    "within_coverage": 3,
+}
+
+
+def _merge_range_coverage(entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Reconcile more than one ``_range_coverage_entry`` for the same entity
+    (e.g. compare_periods' baseline and comparison windows) into the one
+    flat entry every range tool's own ``range_coverage`` reports -- the
+    worse status of the two, with every distinct message carried along."""
+    worst_status = min(entries, key=lambda entry: _RANGE_STATUS_PRIORITY[entry["status"]])["status"]
+    messages = [entry["message"] for entry in entries if "message" in entry]
+    merged: dict[str, Any] = {"status": worst_status}
+    if messages:
+        merged["message"] = " ".join(dict.fromkeys(messages))
+    return merged
+
+
+def _with_created_at_fallback(record: dict[str, Any]) -> dict[str, Any]:
+    """``record``, guaranteed to carry a ``created_at`` key.
+
+    Every real WHOOP payload -- recovery, sleep, cycle and workout alike --
+    carries ``created_at`` (analysis.py has always assumed this uniformly;
+    see e.g. its own ``_dated_means`` docstring), so a genuine sync's raw_json
+    already has it. This only matters for a record that was written some
+    other way without one; falling back to the entity's own ``start`` (the
+    nearest thing sleep/cycle/workout rows have to an activity timestamp)
+    keeps analysis.py itself unchanged rather than teaching it a second,
+    per-collection date field.
+    """
+    if record.get("created_at") is not None:
+        return record
+    return {**record, "created_at": record.get("start")}
+
+
+def _decode_store_cursor(next_token: str | None) -> tuple[int, str | None, str | None]:
+    """This module's own opaque store-pagination cursor: ``(offset, start,
+    end)``. Bounds are baked into the cursor at the page that created it,
+    not re-derived from whatever the caller resends as ``start``/``end`` on
+    a continuation call -- an offset is only valid against the exact same
+    WHERE clause that produced it, so the bounds must travel with it, not be
+    re-guessed. No cursor (a first page) is ``(0, None, None)``.
+
+    base64-encoded, not a bare JSON string: every ``next_token`` parameter
+    in this module is typed ``str | None``, and the MCP SDK's own
+    ``FuncMetadata.pre_parse_json`` helpfully (and, here, wrongly) attempts
+    ``json.loads`` on any string argument whose field annotation is not
+    exactly ``str`` -- a bare ``{"offset": ...}`` token would silently arrive
+    at this function as an already-parsed ``dict``, not the string this
+    signature (and pydantic's own arg validation) expects. base64 text is
+    never valid JSON syntax, so it always survives that pre-parse untouched.
+    """
+    if next_token is None:
+        return 0, None, None
+    payload = json.loads(base64.urlsafe_b64decode(next_token.encode("ascii")).decode("utf-8"))
+    return int(payload["offset"]), payload["start"], payload["end"]
+
+
+def _encode_store_cursor(offset: int, start: str | None, end: str | None) -> str:
+    payload = json.dumps({"offset": offset, "start": start, "end": end})
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _require_positive_limit(limit: int) -> None:
+    """Reject ``limit <= 0`` before it reaches a store query.
+
+    ``limit=0`` is not merely "return nothing": every list tool's
+    ``next_token`` encodes ``offset + limit``, so a zero limit produces a
+    cursor identical to the one that led to it -- an empty page whose own
+    continuation token loops back to itself forever, never resolving to
+    "no more data." Raising here surfaces one clear error instead of a
+    silent infinite-continuation trap.
+    """
+    if limit <= 0:
+        raise ValueError(f"limit must be a positive integer, got {limit}")
 
 
 def _default_range(
@@ -747,25 +1065,44 @@ def _trim_workout(record: dict[str, Any], *, detail: str = "full") -> dict[str, 
 def _register_data_tools(server: MCPServer[AppContext]) -> None:
     @server.tool(name="get_profile", title="Get WHOOP profile", annotations=READ_ONLY)
     async def get_profile(ctx: Context[AppContext, Any]) -> dict[str, Any]:
-        """Return the user's WHOOP profile: user id, email, first and last name."""
+        """Return the user's WHOOP profile: user id, email, first and last name.
+
+        Served from the local store, never a live call -- a miss is reported
+        as ``{"error": "not_synced", ...}``, never a live fetch. Every
+        response (success or miss) carries a "coverage" key: ``{"synced":
+        bool, "last_updated_at": iso|None}``.
+        """
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-
-        async def _fetch() -> dict[str, Any]:
-            return strip_nulls(await app.client.get_profile())
-
-        return await _guard_rate_limit(_fetch)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        record = store.get_profile(conn, whoop_user_id)
+        if record is None:
+            return {"error": "not_synced", "coverage": {"profile": _singleton_coverage(None)}}
+        updated_at = store.get_profile_updated_at(conn, whoop_user_id)
+        result = strip_nulls(record)
+        result["coverage"] = {"profile": _singleton_coverage(updated_at)}
+        return result
 
     @server.tool(name="get_body_measurement", title="Get body measurements", annotations=READ_ONLY)
     async def get_body_measurement(ctx: Context[AppContext, Any]) -> dict[str, Any]:
-        """Return height in metres, weight in kilograms and max heart rate in bpm."""
+        """Return height in metres, weight in kilograms and max heart rate in bpm.
+
+        Served from the local store -- see ``get_profile`` for the miss
+        shape and the "coverage" envelope, which this tool carries too.
+        """
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-
-        async def _fetch() -> dict[str, Any]:
-            return strip_nulls(await app.client.get_body_measurement())
-
-        return await _guard_rate_limit(_fetch)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        record = store.get_body_measurement(conn, whoop_user_id)
+        if record is None:
+            return {
+                "error": "not_synced",
+                "coverage": {"body_measurement": _singleton_coverage(None)},
+            }
+        updated_at = store.get_body_measurement_updated_at(conn, whoop_user_id)
+        result = strip_nulls(record)
+        result["coverage"] = {"body_measurement": _singleton_coverage(updated_at)}
+        return result
 
     @server.tool(name="list_recoveries", title="List recoveries", annotations=READ_ONLY)
     async def list_recoveries(
@@ -774,41 +1111,66 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         end: str | None = None,
         limit: int = 25,
         next_token: str | None = None,
+        include_raw: bool = False,
     ) -> dict[str, Any]:
         """List recovery records: recovery score (%), HRV (ms) and resting heart rate (bpm).
+
+        Served from the local store, never a live call. Every response
+        carries "coverage" (the recoveries entity's own held earliest/
+        latest and sync state) and "range_coverage" (how the requested
+        range compares to that window: "within_coverage",
+        "partly_outside_coverage", "wholly_outside_coverage", or
+        "no_data_synced_yet") -- a range wholly or partly outside what has
+        been synced says so explicitly rather than returning a silently
+        short list.
 
         Args:
             start: ISO 8601 start of the range, e.g. "2026-07-01T00:00:00Z".
                 Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
-            limit: Records to return, capped at 25 per page by WHOOP.
-            next_token: Cursor from a previous truncated response, to continue
-                that page.
+            limit: Records to return per page.
+            next_token: Cursor from a previous truncated response, to
+                continue that page.
+            include_raw: When true, each record additionally carries a
+                "raw" key with the complete stored record, beyond the
+                curated fields below.
         """
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-        range_start, range_end = _default_range(start, end, next_token)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        _require_positive_limit(limit)
+        offset, range_start, range_end = _decode_store_cursor(next_token)
+        if next_token is None:
+            resolved_start, resolved_end = _default_range(start, end, None)
+            range_start, range_end = _iso(resolved_start), _iso(resolved_end)
 
-        async def _fetch() -> dict[str, Any]:
-            page = await app.client.list_recoveries(
-                start=range_start, end=range_end, limit=limit, next_token=next_token
+        rows = store.get_recoveries(
+            conn, whoop_user_id, start=range_start, end=range_end, limit=limit + 1, offset=offset
+        )
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        records = []
+        for raw in page_rows:
+            trimmed = strip_nulls(_trim_recovery(raw))
+            if include_raw:
+                trimmed["raw"] = raw
+            records.append(trimmed)
+        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}
+        if has_more:
+            result["next_token"] = _encode_store_cursor(offset + limit, range_start, range_end)
+            result["note"] = (
+                f"Only {len(records)} record(s) in this range were returned; more are held "
+                f"locally. Pass next_token={result['next_token']!r} to this tool to continue, "
+                "or narrow the date range."
             )
-            records = [strip_nulls(_trim_recovery(r)) for r in page.records]
-            result: dict[str, Any] = {
-                "records": records,
-                "count": len(records),
-                "next_token": page.next_token,
-            }
-            if page.next_token is not None:
-                result["note"] = (
-                    f"Only {len(records)} record(s) in this range were returned; WHOOP "
-                    "paginates and has more records. Pass "
-                    f"next_token={page.next_token!r} to this tool to continue, "
-                    "or narrow the date range."
-                )
-            return result
-
-        return await _guard_rate_limit(_fetch)
+        coverage = _entity_coverage(conn, whoop_user_id, "recoveries")
+        result["coverage"] = {"recoveries": coverage}
+        result["range_coverage"] = {
+            "recoveries": _range_coverage_entry(
+                coverage["earliest"], coverage["latest"], range_start, range_end
+            )
+        }
+        return result
 
     @server.tool(name="list_sleeps", title="List sleeps", annotations=READ_ONLY)
     async def list_sleeps(
@@ -818,49 +1180,67 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         limit: int = 25,
         next_token: str | None = None,
         detail: Literal["summary", "full"] = "summary",
+        include_raw: bool = False,
     ) -> dict[str, Any]:
         """List sleep records: performance (%), efficiency, and stage durations in milliseconds.
+
+        Served from the local store -- see ``list_recoveries`` for the
+        "coverage"/"range_coverage" envelope every list_* tool carries.
 
         Args:
             start: ISO 8601 start of the range.
                 Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
-            limit: Records to return, capped at 25 per page by WHOOP.
-            next_token: Cursor from a previous truncated response, to continue
-                that page.
+            limit: Records to return per page.
+            next_token: Cursor from a previous truncated response, to
+                continue that page.
             detail: "summary" (default) omits the per-stage sleep-duration
                 breakdown to keep the response small; "full" includes it
                 under "stage_durations", with the units declared once in a
                 top-level "units" key.
+            include_raw: When true, each record additionally carries a
+                "raw" key with the complete stored record.
         """
         if detail not in ("summary", "full"):
             raise ValueError(f"detail must be 'summary' or 'full', got {detail!r}")
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-        range_start, range_end = _default_range(start, end, next_token)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        _require_positive_limit(limit)
+        offset, range_start, range_end = _decode_store_cursor(next_token)
+        if next_token is None:
+            resolved_start, resolved_end = _default_range(start, end, None)
+            range_start, range_end = _iso(resolved_start), _iso(resolved_end)
 
-        async def _fetch() -> dict[str, Any]:
-            page = await app.client.list_sleeps(
-                start=range_start, end=range_end, limit=limit, next_token=next_token
+        rows = store.get_sleeps(
+            conn, whoop_user_id, start=range_start, end=range_end, limit=limit + 1, offset=offset
+        )
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        records = []
+        for raw in page_rows:
+            trimmed = strip_nulls(_trim_sleep(raw, detail=detail))
+            if include_raw:
+                trimmed["raw"] = raw
+            records.append(trimmed)
+        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}
+        if detail == "full":
+            result["units"] = {"stage_durations": "milliseconds"}
+        if has_more:
+            result["next_token"] = _encode_store_cursor(offset + limit, range_start, range_end)
+            result["note"] = (
+                f"Only {len(records)} record(s) in this range were returned; more are held "
+                f"locally. Pass next_token={result['next_token']!r} to this tool to continue, "
+                "or narrow the date range."
             )
-            records = [strip_nulls(_trim_sleep(r, detail=detail)) for r in page.records]
-            result: dict[str, Any] = {
-                "records": records,
-                "count": len(records),
-                "next_token": page.next_token,
-            }
-            if detail == "full":
-                result["units"] = {"stage_durations": "milliseconds"}
-            if page.next_token is not None:
-                result["note"] = (
-                    f"Only {len(records)} record(s) in this range were returned; WHOOP "
-                    "paginates and has more records. Pass "
-                    f"next_token={page.next_token!r} to this tool to continue, "
-                    "or narrow the date range."
-                )
-            return result
-
-        return await _guard_rate_limit(_fetch)
+        coverage = _entity_coverage(conn, whoop_user_id, "sleeps")
+        result["coverage"] = {"sleeps": coverage}
+        result["range_coverage"] = {
+            "sleeps": _range_coverage_entry(
+                coverage["earliest"], coverage["latest"], range_start, range_end
+            )
+        }
+        return result
 
     @server.tool(name="list_cycles", title="List cycles", annotations=READ_ONLY)
     async def list_cycles(
@@ -869,44 +1249,61 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         end: str | None = None,
         limit: int = 25,
         next_token: str | None = None,
+        include_raw: bool = False,
     ) -> dict[str, Any]:
         """List physiological cycles: day strain (0-21), average and max heart rate, kilojoules.
 
         A cycle is WHOOP's notion of a day, bounded by sleep rather than by
-        midnight, and is the key other records join on.
+        midnight, and is the key other records join on. Served from the
+        local store -- see ``list_recoveries`` for the "coverage"/
+        "range_coverage" envelope every list_* tool carries.
 
         Args:
             start: ISO 8601 start of the range.
                 Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
-            limit: Records to return, capped at 25 per page by WHOOP.
-            next_token: Cursor from a previous truncated response, to continue
-                that page.
+            limit: Records to return per page.
+            next_token: Cursor from a previous truncated response, to
+                continue that page.
+            include_raw: When true, each record additionally carries a
+                "raw" key with the complete stored record.
         """
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-        range_start, range_end = _default_range(start, end, next_token)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        _require_positive_limit(limit)
+        offset, range_start, range_end = _decode_store_cursor(next_token)
+        if next_token is None:
+            resolved_start, resolved_end = _default_range(start, end, None)
+            range_start, range_end = _iso(resolved_start), _iso(resolved_end)
 
-        async def _fetch() -> dict[str, Any]:
-            page = await app.client.list_cycles(
-                start=range_start, end=range_end, limit=limit, next_token=next_token
+        rows = store.get_cycles(
+            conn, whoop_user_id, start=range_start, end=range_end, limit=limit + 1, offset=offset
+        )
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        records = []
+        for raw in page_rows:
+            trimmed = strip_nulls(_trim_cycle(raw))
+            if include_raw:
+                trimmed["raw"] = raw
+            records.append(trimmed)
+        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}
+        if has_more:
+            result["next_token"] = _encode_store_cursor(offset + limit, range_start, range_end)
+            result["note"] = (
+                f"Only {len(records)} record(s) in this range were returned; more are held "
+                f"locally. Pass next_token={result['next_token']!r} to this tool to continue, "
+                "or narrow the date range."
             )
-            records = [strip_nulls(_trim_cycle(r)) for r in page.records]
-            result: dict[str, Any] = {
-                "records": records,
-                "count": len(records),
-                "next_token": page.next_token,
-            }
-            if page.next_token is not None:
-                result["note"] = (
-                    f"Only {len(records)} record(s) in this range were returned; WHOOP "
-                    "paginates and has more records. Pass "
-                    f"next_token={page.next_token!r} to this tool to continue, "
-                    "or narrow the date range."
-                )
-            return result
-
-        return await _guard_rate_limit(_fetch)
+        coverage = _entity_coverage(conn, whoop_user_id, "cycles")
+        result["coverage"] = {"cycles": coverage}
+        result["range_coverage"] = {
+            "cycles": _range_coverage_entry(
+                coverage["earliest"], coverage["latest"], range_start, range_end
+            )
+        }
+        return result
 
     @server.tool(name="list_workouts", title="List workouts", annotations=READ_ONLY)
     async def list_workouts(
@@ -916,77 +1313,153 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         limit: int = 25,
         next_token: str | None = None,
         detail: Literal["summary", "full"] = "summary",
+        include_raw: bool = False,
     ) -> dict[str, Any]:
         """List workouts: sport, strain, average and max heart rate, and heart-rate zone durations.
+
+        Served from the local store -- see ``list_recoveries`` for the
+        "coverage"/"range_coverage" envelope every list_* tool carries.
 
         Args:
             start: ISO 8601 start of the range.
                 Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
-            limit: Records to return, capped at 25 per page by WHOOP.
-            next_token: Cursor from a previous truncated response, to continue
-                that page.
+            limit: Records to return per page.
+            next_token: Cursor from a previous truncated response, to
+                continue that page.
             detail: "summary" (default) omits the per-zone heart-rate
                 duration breakdown to keep the response small; "full"
                 includes it under "zone_durations", with the units declared
                 once in a top-level "units" key.
+            include_raw: When true, each record additionally carries a
+                "raw" key with the complete stored record.
         """
         if detail not in ("summary", "full"):
             raise ValueError(f"detail must be 'summary' or 'full', got {detail!r}")
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-        range_start, range_end = _default_range(start, end, next_token)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        _require_positive_limit(limit)
+        offset, range_start, range_end = _decode_store_cursor(next_token)
+        if next_token is None:
+            resolved_start, resolved_end = _default_range(start, end, None)
+            range_start, range_end = _iso(resolved_start), _iso(resolved_end)
 
-        async def _fetch() -> dict[str, Any]:
-            page = await app.client.list_workouts(
-                start=range_start, end=range_end, limit=limit, next_token=next_token
+        rows = store.get_workouts(
+            conn, whoop_user_id, start=range_start, end=range_end, limit=limit + 1, offset=offset
+        )
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        records = []
+        for raw in page_rows:
+            trimmed = strip_nulls(_trim_workout(raw, detail=detail))
+            if include_raw:
+                trimmed["raw"] = raw
+            records.append(trimmed)
+        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}
+        if detail == "full":
+            result["units"] = {"zone_durations": "milliseconds"}
+        if has_more:
+            result["next_token"] = _encode_store_cursor(offset + limit, range_start, range_end)
+            result["note"] = (
+                f"Only {len(records)} record(s) in this range were returned; more are held "
+                f"locally. Pass next_token={result['next_token']!r} to this tool to continue, "
+                "or narrow the date range."
             )
-            records = [strip_nulls(_trim_workout(r, detail=detail)) for r in page.records]
-            result: dict[str, Any] = {
-                "records": records,
-                "count": len(records),
-                "next_token": page.next_token,
-            }
-            if detail == "full":
-                result["units"] = {"zone_durations": "milliseconds"}
-            if page.next_token is not None:
-                result["note"] = (
-                    f"Only {len(records)} record(s) in this range were returned; WHOOP "
-                    "paginates and has more records. Pass "
-                    f"next_token={page.next_token!r} to this tool to continue, "
-                    "or narrow the date range."
-                )
-            return result
-
-        return await _guard_rate_limit(_fetch)
+        coverage = _entity_coverage(conn, whoop_user_id, "workouts")
+        result["coverage"] = {"workouts": coverage}
+        result["range_coverage"] = {
+            "workouts": _range_coverage_entry(
+                coverage["earliest"], coverage["latest"], range_start, range_end
+            )
+        }
+        return result
 
     @server.tool(name="get_sleep", title="Get one sleep", annotations=READ_ONLY)
-    async def get_sleep(sleep_id: str, ctx: Context[AppContext, Any]) -> dict[str, Any]:
-        """Return a single sleep by its v2 UUID."""
+    async def get_sleep(
+        sleep_id: str, ctx: Context[AppContext, Any], include_raw: bool = False
+    ) -> dict[str, Any]:
+        """Return a single sleep by its v2 UUID.
+
+        Served from the local store. A miss is ``{"error": "not_synced",
+        ...}`` when no sleep has ever been synced at all, or ``{"error":
+        "not_found_in_store", ...}`` when sleeps have been synced but not
+        this id -- never a live fetch either way.
+        """
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-
-        async def _fetch() -> dict[str, Any]:
-            record = await app.client.get_sleep(sleep_id)
-            trimmed = strip_nulls(_trim_sleep(record))
-            trimmed["units"] = {"stage_durations": "milliseconds"}
-            return trimmed
-
-        return await _guard_rate_limit(_fetch)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        coverage = {"sleeps": _entity_coverage(conn, whoop_user_id, "sleeps")}
+        if coverage["sleeps"]["earliest"] is None:
+            return {"error": "not_synced", "coverage": coverage}
+        record = store.get_sleep_by_id(conn, whoop_user_id, sleep_id)
+        if record is None:
+            return {"error": "not_found_in_store", "coverage": coverage}
+        trimmed = strip_nulls(_trim_sleep(record))
+        trimmed["units"] = {"stage_durations": "milliseconds"}
+        if include_raw:
+            trimmed["raw"] = record
+        trimmed["coverage"] = coverage
+        return trimmed
 
     @server.tool(name="get_workout", title="Get one workout", annotations=READ_ONLY)
-    async def get_workout(workout_id: str, ctx: Context[AppContext, Any]) -> dict[str, Any]:
-        """Return a single workout by its v2 UUID."""
+    async def get_workout(
+        workout_id: str, ctx: Context[AppContext, Any], include_raw: bool = False
+    ) -> dict[str, Any]:
+        """Return a single workout by its v2 UUID.
+
+        Served from the local store -- see ``get_sleep`` for the two
+        distinct miss shapes ("not_synced" vs "not_found_in_store").
+        """
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        coverage = {"workouts": _entity_coverage(conn, whoop_user_id, "workouts")}
+        if coverage["workouts"]["earliest"] is None:
+            return {"error": "not_synced", "coverage": coverage}
+        record = store.get_workout_by_id(conn, whoop_user_id, workout_id)
+        if record is None:
+            return {"error": "not_found_in_store", "coverage": coverage}
+        trimmed = strip_nulls(_trim_workout(record))
+        trimmed["units"] = {"zone_durations": "milliseconds"}
+        if include_raw:
+            trimmed["raw"] = record
+        trimmed["coverage"] = coverage
+        return trimmed
 
-        async def _fetch() -> dict[str, Any]:
-            record = await app.client.get_workout(workout_id)
-            trimmed = strip_nulls(_trim_workout(record))
-            trimmed["units"] = {"zone_durations": "milliseconds"}
-            return trimmed
+    @server.tool(
+        name="whoop_data_coverage",
+        title="Report locally-held data coverage",
+        annotations=READ_ONLY,
+    )
+    async def whoop_data_coverage(ctx: Context[AppContext, Any]) -> dict[str, Any]:
+        """Report, per entity, what the local store holds and how fresh it is.
 
-        return await _guard_rate_limit(_fetch)
+        This is the way to check whether "no records" means "nothing
+        happened" or "nothing has been imported yet" -- every other data and
+        analysis tool's own "coverage"/"range_coverage" fields are built from
+        exactly the same underlying state this tool reports directly. Call
+        this first when in doubt, and before assuming a range tool's result
+        is complete.
+
+        For recoveries, sleeps, cycles and workouts: the earliest and latest
+        activity date held, the last backfill outcome, and the last
+        successful incremental sync time. For the profile and body
+        measurement (which have no date range of their own): whether each
+        has ever been synced, and when.
+        """
+        app = ctx.request_context.lifespan_context
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        result: dict[str, Any] = {
+            entity: _entity_coverage(conn, whoop_user_id, entity)
+            for entity in ("recoveries", "sleeps", "cycles", "workouts")
+        }
+        result["profile"] = _singleton_coverage(store.get_profile_updated_at(conn, whoop_user_id))
+        result["body_measurement"] = _singleton_coverage(
+            store.get_body_measurement_updated_at(conn, whoop_user_id)
+        )
+        return result
 
     @server.tool(name="whoop_sync", title="Sync recent WHOOP data", annotations=SYNCS_LOCAL_STORE)
     async def whoop_sync(ctx: Context[AppContext, Any]) -> dict[str, Any]:
@@ -1049,13 +1522,6 @@ _METRIC_COLLECTION: dict[str, str] = {
     "strain": "cycle",
 }
 
-#: Collection name -> its WHOOP v2 list endpoint.
-_COLLECTION_PATH: dict[str, str] = {
-    "recovery": "/v2/recovery",
-    "sleep": "/v2/activity/sleep",
-    "cycle": "/v2/cycle",
-}
-
 
 def _resolve_collection(metric: str) -> str:
     """Resolve a friendly metric name to the collection it is sourced from."""
@@ -1065,43 +1531,47 @@ def _resolve_collection(metric: str) -> str:
         raise ValueError(f"unknown metric: {metric!r}") from None
 
 
-#: Cap passed to WhoopClient.paginate() for every analysis-tool fetch. Also
-#: the number quoted in the truncation "note" below, so the two stay in
-#: sync without threading the value through every call site.
+#: Cap passed to every analysis-tool store read. Also the number quoted in
+#: the truncation "note" below, so the two stay in sync without threading
+#: the value through every call site.
 _ANALYSIS_MAX_RECORDS = 1000
 
 
 async def _fetch_collection(
-    app: AppContext,
+    conn: sqlite3.Connection,
+    whoop_user_id: int,
     collection: str,
     start: str,
     end: str,
     *,
     max_records: int = _ANALYSIS_MAX_RECORDS,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Walk every page of one collection over a range via WhoopClient.paginate.
+    """Read one collection over a range from the local store.
 
-    Analysis tools need raw WHOOP records (score_state, nested score dicts)
-    -- the same shape analysis.py's extract_metric/summarize/trend/correlate
-    already know how to read -- not the trimmed shapes the data tools return,
-    so this goes straight to paginate() rather than through list_recoveries etc.
+    Repointed from ``WhoopClient.paginate()`` (#16): analysis tools need raw
+    WHOOP records (score_state, nested score dicts) -- the same shape
+    analysis.py's extract_metric/summarize/trend/correlate already know how
+    to read -- not the trimmed shapes the data tools return, so this reads
+    the store's own collection getter directly rather than going through
+    list_recoveries etc. Never falls through to the live API on a miss: an
+    empty or partial result here is a coverage gap, reported by the caller's
+    own "coverage"/"range_coverage" envelope, not retried against WHOOP.
 
-    Returns the records and a ``truncated`` flag: true if the collection may
-    hold more than ``max_records`` matched the range requested. Checking
-    ``len(records) >= max_records`` is an approximation -- a collection with
-    exactly that many real records and no more would be a false positive --
-    but paginate() doesn't otherwise say whether it stopped because the
-    cursor ran out or because the cap did, and that's an accepted tradeoff
-    rather than a bug to fix.
+    Over-fetches by one row (``max_records + 1`` at the call site) to detect
+    ``truncated`` without a second query -- true if the store may hold more
+    than ``max_records`` matching the range requested.
+
+    Every record gets ``_with_created_at_fallback`` applied: analysis.py
+    indexes ``record["created_at"]`` unconditionally regardless of which
+    collection a record came from, and a genuine WHOOP payload always has
+    it, but this store read makes no assumption about how a record arrived
+    here.
     """
-    params = build_collection_params(start=start, end=end)
-    records = [
-        record
-        async for record in app.client.paginate(
-            _COLLECTION_PATH[collection], params, max_records=max_records
-        )
-    ]
-    return records, len(records) >= max_records
+    getter = _COLLECTION_GETTER[collection]
+    rows = getter(conn, whoop_user_id, start=start, end=end, limit=max_records + 1)
+    truncated = len(rows) > max_records
+    records = [_with_created_at_fallback(r) for r in rows[:max_records]]
+    return records, truncated
 
 
 def _actual_range(records: Sequence[dict[str, Any]]) -> tuple[str | None, str | None]:
@@ -1115,12 +1585,13 @@ def _actual_range(records: Sequence[dict[str, Any]]) -> tuple[str | None, str | 
 
 
 async def _summarize_window(
-    app: AppContext, start: str, end: str
+    conn: sqlite3.Connection, whoop_user_id: int, start: str, end: str
 ) -> tuple[dict[str, Any], tuple[str | None, str | None], bool, int]:
-    """Fetch each of the 3 collections once, then analysis.summarize per metric.
+    """Read each of the 3 collections once from the store, then
+    analysis.summarize per metric.
 
-    6 metrics share only 3 collections -- fetching once per metric here would
-    be 6 requests instead of 3, and summarize_period's whole point is not
+    6 metrics share only 3 collections -- reading once per metric here would
+    be 6 store reads instead of 3, and summarize_period's whole point is not
     doing that. A metric whose collection can't produce enough SCORED records
     for analysis.summarize gets its own {"error": "insufficient_data", ...}
     entry rather than failing the other 5 metrics that DID have enough data.
@@ -1133,7 +1604,7 @@ async def _summarize_window(
     """
     expected_days = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).days
     fetched = {
-        collection: await _fetch_collection(app, collection, start, end)
+        collection: await _fetch_collection(conn, whoop_user_id, collection, start, end)
         for collection in ("recovery", "sleep", "cycle")
     }
     records_by_collection = {collection: records for collection, (records, _) in fetched.items()}
@@ -1196,33 +1667,43 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         scored record for that metric, a coverage gap rather than a record
         count.
 
+        Served from the local store. Every response carries "coverage" and
+        "range_coverage", each keyed by "recoveries"/"sleeps"/"cycles" (the
+        3 entities behind the 6 metrics), reporting what the store holds for
+        each and how the requested range compares to it.
+
         Args:
             start: ISO 8601 start of the range.
             end: ISO 8601 end of the range.
         """
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-
-        async def _fetch() -> dict[str, Any]:
-            (
-                summaries,
-                (range_start, range_end),
-                truncated,
-                _expected_days,
-            ) = await _summarize_window(app, start, end)
-            result: dict[str, Any] = {
-                "summaries": summaries,
-                "period": {"start": range_start, "end": range_end},
-                "truncated": truncated,
-            }
-            if truncated:
-                result["note"] = (
-                    f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
-                    "narrow the date range for a complete summary."
-                )
-            return result
-
-        return await _guard_rate_limit(_fetch)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        (
+            summaries,
+            (range_start, range_end),
+            truncated,
+            _expected_days,
+        ) = await _summarize_window(conn, whoop_user_id, start, end)
+        result: dict[str, Any] = {
+            "summaries": summaries,
+            "period": {"start": range_start, "end": range_end},
+            "truncated": truncated,
+        }
+        if truncated:
+            result["note"] = (
+                f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
+                "narrow the date range for a complete summary."
+            )
+        coverage: dict[str, Any] = {}
+        range_coverage: dict[str, Any] = {}
+        for entity in dict.fromkeys(_COLLECTION_TO_ENTITY.values()):
+            ec = _entity_coverage(conn, whoop_user_id, entity)
+            coverage[entity] = ec
+            range_coverage[entity] = _range_coverage_entry(ec["earliest"], ec["latest"], start, end)
+        result["coverage"] = coverage
+        result["range_coverage"] = range_coverage
+        return result
 
     @server.tool(name="metric_trend", title="Trend of one metric", annotations=READ_ONLY)
     async def metric_trend(
@@ -1241,42 +1722,54 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         r² fit-quality figure for that slope -- both as the number and as a
         word ("strong"/"moderate"/"weak"/"negligible") -- and 7/30/90-day
         rolling means of the metric over calendar days.
+
+        Served from the local store. Every response (including an
+        "insufficient_data" one) carries "coverage" and "range_coverage",
+        keyed by the metric's own entity ("recoveries"/"sleeps"/"cycles").
         """
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-
-        async def _fetch() -> dict[str, Any]:
-            collection = _resolve_collection(metric)
-            records, truncated = await _fetch_collection(app, collection, start, end)
-            try:
-                result = trend(records, metric)
-            except InsufficientDataError as exc:
-                # No records worth speaking of on this path -- truncated/note
-                # would be noise, not signal.
-                return {"error": "insufficient_data", "message": str(exc)}
-            range_start, range_end = _actual_range(records)
-            response: dict[str, Any] = {
-                "metric": result.metric,
-                "count": result.count,
-                "slope_per_day": result.slope_per_day,
-                "first": result.first,
-                "last": result.last,
-                "r_squared": result.r_squared,
-                "fit_quality": result.fit_quality,
-                "rolling_7d": [{"date": p.date, "value": p.value} for p in result.rolling_7d],
-                "rolling_30d": [{"date": p.date, "value": p.value} for p in result.rolling_30d],
-                "rolling_90d": [{"date": p.date, "value": p.value} for p in result.rolling_90d],
-                "period": {"start": range_start, "end": range_end},
-                "truncated": truncated,
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        collection = _resolve_collection(metric)
+        entity = _COLLECTION_TO_ENTITY[collection]
+        records, truncated = await _fetch_collection(conn, whoop_user_id, collection, start, end)
+        ec = _entity_coverage(conn, whoop_user_id, entity)
+        coverage = {entity: ec}
+        range_coverage = {entity: _range_coverage_entry(ec["earliest"], ec["latest"], start, end)}
+        try:
+            result = trend(records, metric)
+        except InsufficientDataError as exc:
+            # No records worth speaking of on this path -- truncated/note
+            # would be noise, not signal.
+            return {
+                "error": "insufficient_data",
+                "message": str(exc),
+                "coverage": coverage,
+                "range_coverage": range_coverage,
             }
-            if truncated:
-                response["note"] = (
-                    f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
-                    "narrow the date range for a complete trend."
-                )
-            return response
-
-        return await _guard_rate_limit(_fetch)
+        range_start, range_end = _actual_range(records)
+        response: dict[str, Any] = {
+            "metric": result.metric,
+            "count": result.count,
+            "slope_per_day": result.slope_per_day,
+            "first": result.first,
+            "last": result.last,
+            "r_squared": result.r_squared,
+            "fit_quality": result.fit_quality,
+            "rolling_7d": [{"date": p.date, "value": p.value} for p in result.rolling_7d],
+            "rolling_30d": [{"date": p.date, "value": p.value} for p in result.rolling_30d],
+            "rolling_90d": [{"date": p.date, "value": p.value} for p in result.rolling_90d],
+            "period": {"start": range_start, "end": range_end},
+            "truncated": truncated,
+        }
+        if truncated:
+            response["note"] = (
+                f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
+                "narrow the date range for a complete trend."
+            )
+        response["coverage"] = coverage
+        response["range_coverage"] = range_coverage
+        return response
 
     @server.tool(name="correlate_metrics", title="Correlate two metrics", annotations=READ_ONLY)
     async def correlate_metrics(
@@ -1309,6 +1802,11 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             lag_days: Sweep radius in days (default 3, capped at 14); the
                 sweep covers every integer lag from -lag_days to +lag_days.
 
+        Served from the local store. Every response carries "coverage" and
+        "range_coverage", keyed by the entities metric_a/metric_b are sourced
+        from (one entry, or two when the metrics come from different
+        collections).
+
         Raises:
             ValueError: if lag_days is negative.
         """
@@ -1317,51 +1815,62 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         lag_days = min(lag_days, _MAX_LAG_SWEEP_RADIUS)
 
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-
-        async def _fetch() -> dict[str, Any]:
-            collection_a = _resolve_collection(metric_a)
-            collection_b = _resolve_collection(metric_b)
-            records_a, truncated_a = await _fetch_collection(app, collection_a, start, end)
-            # Two metrics can share a collection (e.g. recovery_score and hrv are
-            # both "recovery") -- fetch it once and reuse rather than twice.
-            if collection_b == collection_a:
-                records_b, truncated_b = records_a, truncated_a
-            else:
-                records_b, truncated_b = await _fetch_collection(app, collection_b, start, end)
-            truncated = truncated_a or truncated_b
-            sweep_results = correlate_lag_sweep(
-                records_a, metric_a, records_b, metric_b, lags=range(-lag_days, lag_days + 1)
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        collection_a = _resolve_collection(metric_a)
+        collection_b = _resolve_collection(metric_b)
+        entity_a = _COLLECTION_TO_ENTITY[collection_a]
+        entity_b = _COLLECTION_TO_ENTITY[collection_b]
+        records_a, truncated_a = await _fetch_collection(
+            conn, whoop_user_id, collection_a, start, end
+        )
+        # Two metrics can share a collection (e.g. recovery_score and hrv are
+        # both "recovery") -- fetch it once and reuse rather than twice.
+        if collection_b == collection_a:
+            records_b, truncated_b = records_a, truncated_a
+        else:
+            records_b, truncated_b = await _fetch_collection(
+                conn, whoop_user_id, collection_b, start, end
             )
-            response: dict[str, Any] = {
-                "metric_a": metric_a,
-                "metric_b": metric_b,
-                "sweep": [
-                    {
-                        "lag_days": entry.lag_days,
-                        "refused": entry.correlation is None,
-                        **(
-                            {
-                                "count": entry.correlation.count,
-                                "r": entry.correlation.r,
-                                "spearman_r": entry.correlation.spearman_r,
-                            }
-                            if entry.correlation is not None
-                            else {"message": entry.refused_reason}
-                        ),
-                    }
-                    for entry in sweep_results
-                ],
-                "truncated": truncated,
-            }
-            if truncated:
-                response["note"] = (
-                    f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
-                    "narrow the date range for a complete correlation."
-                )
-            return response
-
-        return await _guard_rate_limit(_fetch)
+        truncated = truncated_a or truncated_b
+        sweep_results = correlate_lag_sweep(
+            records_a, metric_a, records_b, metric_b, lags=range(-lag_days, lag_days + 1)
+        )
+        response: dict[str, Any] = {
+            "metric_a": metric_a,
+            "metric_b": metric_b,
+            "sweep": [
+                {
+                    "lag_days": entry.lag_days,
+                    "refused": entry.correlation is None,
+                    **(
+                        {
+                            "count": entry.correlation.count,
+                            "r": entry.correlation.r,
+                            "spearman_r": entry.correlation.spearman_r,
+                        }
+                        if entry.correlation is not None
+                        else {"message": entry.refused_reason}
+                    ),
+                }
+                for entry in sweep_results
+            ],
+            "truncated": truncated,
+        }
+        if truncated:
+            response["note"] = (
+                f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
+                "narrow the date range for a complete correlation."
+            )
+        coverage: dict[str, Any] = {}
+        range_coverage: dict[str, Any] = {}
+        for entity in dict.fromkeys((entity_a, entity_b)):
+            ec = _entity_coverage(conn, whoop_user_id, entity)
+            coverage[entity] = ec
+            range_coverage[entity] = _range_coverage_entry(ec["earliest"], ec["latest"], start, end)
+        response["coverage"] = coverage
+        response["range_coverage"] = range_coverage
+        return response
 
     @server.tool(name="compare_periods", title="Compare two periods", annotations=READ_ONLY)
     async def compare_periods(
@@ -1383,72 +1892,88 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             comparison_end: ISO 8601 end of the comparison period.
         """
         app = ctx.request_context.lifespan_context
-        _ensure_matches_live_grant(ctx)
-
-        async def _fetch() -> dict[str, Any]:
-            # Sequential, not concurrent (no asyncio.gather): each window's fetch
-            # completes before the next window's starts.
-            (
-                baseline_summaries,
-                baseline_range,
-                baseline_truncated,
-                baseline_expected_days,
-            ) = await _summarize_window(app, baseline_start, baseline_end)
-            (
-                comparison_summaries,
-                comparison_range,
-                comparison_truncated,
-                comparison_expected_days,
-            ) = await _summarize_window(app, comparison_start, comparison_end)
-            truncated = baseline_truncated or comparison_truncated
-            delta: dict[str, Any] = {}
-            for metric in _METRIC_COLLECTION:
-                b = baseline_summaries[metric]
-                c = comparison_summaries[metric]
-                if "error" in b or "error" in c:
-                    delta[metric] = {"error": "insufficient_data"}
-                    continue
-                try:
-                    effect_size: float | None = standardized_effect_size(
-                        b["mean"], b["stdev"], b["count"], c["mean"], c["stdev"], c["count"]
-                    )
-                except InsufficientDataError:
-                    effect_size = None
-                coverage_b = (
-                    1 - b["days_missing"] / baseline_expected_days
-                    if baseline_expected_days
-                    else 0.0
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        # Sequential, not concurrent (no asyncio.gather): each window's read
+        # completes before the next window's starts.
+        (
+            baseline_summaries,
+            baseline_range,
+            baseline_truncated,
+            baseline_expected_days,
+        ) = await _summarize_window(conn, whoop_user_id, baseline_start, baseline_end)
+        (
+            comparison_summaries,
+            comparison_range,
+            comparison_truncated,
+            comparison_expected_days,
+        ) = await _summarize_window(conn, whoop_user_id, comparison_start, comparison_end)
+        truncated = baseline_truncated or comparison_truncated
+        delta: dict[str, Any] = {}
+        for metric in _METRIC_COLLECTION:
+            b = baseline_summaries[metric]
+            c = comparison_summaries[metric]
+            if "error" in b or "error" in c:
+                delta[metric] = {"error": "insufficient_data"}
+                continue
+            try:
+                effect_size: float | None = standardized_effect_size(
+                    b["mean"], b["stdev"], b["count"], c["mean"], c["stdev"], c["count"]
                 )
-                coverage_c = (
-                    1 - c["days_missing"] / comparison_expected_days
-                    if comparison_expected_days
-                    else 0.0
-                )
-                delta[metric] = {
-                    "delta_mean": c["mean"] - b["mean"],
-                    "effect_size": effect_size,
-                    "coverage_asymmetric": abs(coverage_b - coverage_c) > 0.5,
-                }
-            response: dict[str, Any] = {
-                "baseline": {
-                    "summary": baseline_summaries,
-                    "period": {"start": baseline_range[0], "end": baseline_range[1]},
-                },
-                "comparison": {
-                    "summary": comparison_summaries,
-                    "period": {"start": comparison_range[0], "end": comparison_range[1]},
-                },
-                "delta": delta,
-                "truncated": truncated,
-                "period_length_note": _period_length_note(
-                    baseline_expected_days, comparison_expected_days
-                ),
+            except InsufficientDataError:
+                effect_size = None
+            coverage_b = (
+                1 - b["days_missing"] / baseline_expected_days if baseline_expected_days else 0.0
+            )
+            coverage_c = (
+                1 - c["days_missing"] / comparison_expected_days
+                if comparison_expected_days
+                else 0.0
+            )
+            delta[metric] = {
+                "delta_mean": c["mean"] - b["mean"],
+                "effect_size": effect_size,
+                "coverage_asymmetric": abs(coverage_b - coverage_c) > 0.5,
             }
-            if truncated:
-                response["note"] = (
-                    f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
-                    "narrow the date range for a complete comparison."
-                )
-            return response
-
-        return await _guard_rate_limit(_fetch)
+        response: dict[str, Any] = {
+            "baseline": {
+                "summary": baseline_summaries,
+                "period": {"start": baseline_range[0], "end": baseline_range[1]},
+            },
+            "comparison": {
+                "summary": comparison_summaries,
+                "period": {"start": comparison_range[0], "end": comparison_range[1]},
+            },
+            "delta": delta,
+            "truncated": truncated,
+            "period_length_note": _period_length_note(
+                baseline_expected_days, comparison_expected_days
+            ),
+        }
+        if truncated:
+            response["note"] = (
+                f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
+                "narrow the date range for a complete comparison."
+            )
+        # Two ranges, not one -- range_coverage still reports one flat entry
+        # per entity, like every other range tool (see this module's own
+        # response-shape note), by merging the baseline and comparison
+        # windows' own statuses into the worse of the two.
+        coverage: dict[str, Any] = {}
+        range_coverage: dict[str, Any] = {}
+        for entity in dict.fromkeys(_COLLECTION_TO_ENTITY.values()):
+            ec = _entity_coverage(conn, whoop_user_id, entity)
+            coverage[entity] = ec
+            range_coverage[entity] = _merge_range_coverage(
+                [
+                    _range_coverage_entry(
+                        ec["earliest"], ec["latest"], baseline_start, baseline_end
+                    ),
+                    _range_coverage_entry(
+                        ec["earliest"], ec["latest"], comparison_start, comparison_end
+                    ),
+                ]
+            )
+        response["coverage"] = coverage
+        response["range_coverage"] = range_coverage
+        return response
