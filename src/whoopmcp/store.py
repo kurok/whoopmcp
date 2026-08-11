@@ -26,7 +26,7 @@ from typing import Any
 
 #: Bump this and append to ``_MIGRATIONS`` when the schema changes. Never
 #: edit an already-shipped migration -- append a new one instead.
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 # -- schema ------------------------------------------------------------------
 #
@@ -208,13 +208,37 @@ CREATE TABLE IF NOT EXISTS tool_call_audit (
 CREATE INDEX IF NOT EXISTS ix_tool_call_audit_whoop_user_id ON tool_call_audit (whoop_user_id);
 """
 
+#: Version 4 (#19): per-user last-webhook-delivery time, so #31 can later
+#: alert on silence relative to that user's own baseline (a dead webhook
+#: integration and a user on holiday look identical otherwise).
+#:
+#: One row per ``whoop_user_id`` (its own PRIMARY KEY, not a composite key
+#: the way ``sync_state`` uses) -- deliberately its own table rather than a
+#: third concept crammed into ``sync_state``, which #14 and #15 already
+#: double up (a bare entity key, and ``f"{entity}:incremental"``); a third,
+#: differently-shaped key in that same table risks exactly the kind of
+#: entity-key collision #14/#15 had to carefully design around.
+#: ``record_webhook_delivery`` upserts ``last_delivered_at`` to "now" on
+#: every successfully-processed delivery (including the two vacuous-success
+#: skips in ``webhook_processor._apply_event`` -- see that module -- since
+#: both are still genuine, completed deliveries and therefore real liveness
+#: signal); it is never called on the #66 not-yet-actionable
+#: ``MemberNotLinkedError`` path.
+_SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS webhook_delivery_state (
+    whoop_user_id INTEGER NOT NULL PRIMARY KEY,
+    last_delivered_at TEXT NOT NULL
+);
+"""
+
 #: Migration ladder: version N's script, applied when the database's
 #: `PRAGMA user_version` is below N. Keyed by the version it produces, so
-#: appending a real migration later is `_MIGRATIONS[4] = "ALTER TABLE ..."`.
+#: appending a real migration later is `_MIGRATIONS[5] = "ALTER TABLE ..."`.
 _MIGRATIONS: dict[int, str] = {
     1: _SCHEMA_V1,
     2: _SCHEMA_V2,
     3: _SCHEMA_V3,
+    4: _SCHEMA_V4,
 }
 
 #: Tables filtered by ``whoop_user_id`` that ``_execute_scoped`` enforces a
@@ -234,6 +258,7 @@ _TENANT_SCOPED_TABLES: frozenset[str] = frozenset(
         "body_measurements",
         "profiles",
         "sync_state",
+        "webhook_delivery_state",
     }
 )
 
@@ -269,6 +294,7 @@ _RETENTION_TIMESTAMP_COLUMNS: dict[str, str] = {
     "sync_state": "last_run_at",
     "webhook_events": "created_at",
     "tool_call_audit": "called_at",
+    "webhook_delivery_state": "last_delivered_at",
 }
 
 
@@ -990,6 +1016,52 @@ def get_sync_state(
     return {"cursor": cursor, "last_run_at": last_run_at, "outcome": outcome}
 
 
+# -- webhook_delivery_state (#19) ---------------------------------------------
+#
+# One row per whoop_user_id, upserted every time a webhook delivery for that
+# user finishes processing (see webhook_processor.process_webhook_event's
+# success branch). Exists purely so #31 can later alert on a member who has
+# gone quiet relative to their own baseline -- see _SCHEMA_V4's own comment.
+
+
+def record_webhook_delivery(conn: sqlite3.Connection, whoop_user_id: int) -> None:
+    """Record that a webhook delivery for ``whoop_user_id`` just completed,
+    advancing ``last_delivered_at`` to now."""
+    _execute_scoped(
+        conn,
+        """
+        INSERT INTO webhook_delivery_state (whoop_user_id, last_delivered_at)
+        VALUES (?, ?)
+        ON CONFLICT (whoop_user_id) DO UPDATE SET
+            last_delivered_at = excluded.last_delivered_at
+        """,
+        (whoop_user_id, _now()),
+    )
+    conn.commit()
+
+
+def get_last_webhook_delivery(conn: sqlite3.Connection, whoop_user_id: int) -> str | None:
+    """The last recorded webhook-delivery time for ``whoop_user_id``, or
+    ``None`` if no delivery has ever completed for them."""
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        "SELECT last_delivered_at FROM webhook_delivery_state WHERE whoop_user_id = ?",
+        (whoop_user_id,),
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
+def get_webhook_delivery_state_for_member(
+    conn: sqlite3.Connection, whoop_user_id: int
+) -> dict[str, Any]:
+    """``{"last_delivered_at": ...}`` for ``whoop_user_id``, or ``{}`` if no
+    delivery has ever completed for them -- for ``export_member_data``."""
+    _require_user_id(whoop_user_id)
+    last_delivered_at = get_last_webhook_delivery(conn, whoop_user_id)
+    return {} if last_delivered_at is None else {"last_delivered_at": last_delivered_at}
+
+
 # -- webhook_events (#18) -----------------------------------------------------
 #
 # Unlike every table above, this one is never upserted: a row is inserted
@@ -1349,6 +1421,7 @@ def export_member_data(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str
         "webhook_events": get_webhook_events_for_member(conn, whoop_user_id),
         "tool_call_audit": get_tool_call_audit_for_member(conn, whoop_user_id),
         "principal_links": get_principal_links_for_member(conn, whoop_user_id),
+        "webhook_delivery_state": get_webhook_delivery_state_for_member(conn, whoop_user_id),
     }
 
 

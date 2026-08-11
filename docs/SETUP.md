@@ -143,6 +143,90 @@ fetches for the same data across a session.
 
 > "Is my HRV correlated with total sleep time this month?"
 
+## 6. Webhooks (optional)
+
+Webhooks let WHOOP push a change instead of this server having to poll for
+one. They are an optimisation over polling, **never a replacement for it** --
+see the reconciliation backstop below.
+
+### Registering the endpoint
+
+1. In the WHOOP developer dashboard, on the same app you created in step 1,
+   find the webhook endpoint URL field and point it at this server's
+   publicly-reachable `https://<host>/webhooks/whoop`.
+2. That route only responds to anything other than a `404` when the server
+   is actually serving it. It needs all three of:
+   - `--transport streamable-http` (webhooks arrive as an ordinary inbound
+     HTTP POST; `stdio` has nothing listening for one),
+   - `WHOOPMCP_WEBHOOKS_ENABLED=true`,
+   - `WHOOPMCP_CACHE=true` -- webhook processing writes the fetched
+     resource into the persistent store; without it there is nowhere for
+     the result to go.
+
+### Rotating the signing secret
+
+**The signing secret is not a separate value -- it is `WHOOP_CLIENT_SECRET`,
+the same client secret step 1 gave you for the OAuth token exchange.**
+Rotating it to fix a compromised webhook secret is therefore a full-outage
+operation, not a quiet webhook-only fix: it simultaneously breaks the OAuth
+refresh flow every already-linked member depends on. Concretely, rotating:
+
+1. Rotate the secret in the WHOOP developer dashboard.
+2. Update `WHOOP_CLIENT_SECRET` everywhere it is configured (every MCP
+   client config, every environment this server runs in).
+3. Every already-issued refresh token starts failing immediately with
+   `invalid_client` -- this is expected, not a bug.
+4. Every user who was logged in needs to run `whoop_logout` then
+   `whoop_login` again to re-authorise against the new secret.
+
+There is no way to rotate only the webhook half of this secret; plan the
+rotation as a scheduled outage for every linked member, not a background fix.
+
+### Local development: replaying a stored event
+
+`whoopmcp replay-webhook --trace-id ID` re-runs a previously-received
+event (looked up in `webhook_events` by `trace_id`) through the same
+processing pipeline a live delivery would go through. It never re-POSTs to
+`/webhooks/whoop` and never re-signs anything -- it calls straight into the
+processing code with the event's own stored body, so a code change can be
+tested against a real, previously-captured event without a deploy per
+change. Replaying an event already marked `success` (or `dead_letter`) is a
+safe no-op; a `pending` row (mid-retry, or an event that arrived before its
+member had logged in) is genuinely reprocessed.
+
+### The reconciliation backstop
+
+Webhooks are best-effort: WHOOP does not guarantee delivery, and a lost
+`*.deleted` event leaves a permanent hole that #15's own incremental sync
+can never notice by itself (a forward `updated_at` walk has no way to
+detect that a record disappeared). `whoopmcp reconcile-webhooks
+--whoop-user-id ID [--window-days N]` (default `--window-days 30`) is the
+backstop: it re-lists the last N days directly from WHOOP and soft-deletes
+any locally-held record that listing no longer mentions.
+
+There is no in-process scheduler in this server (see the `doctor`
+subcommand's own notes) -- wire this into cron or a systemd timer, the same
+way `enforce-retention` documents:
+
+```cron
+# Nightly at 03:00
+0 3 * * * WHOOPMCP_CACHE=true whoopmcp reconcile-webhooks --whoop-user-id 12345678
+```
+
+Run it alongside your existing `whoop_sync`/backfill schedule, not instead
+of it -- reconciliation only ever closes deletion holes; it does not pick up
+new or updated records the way #15's sync does.
+
+### Per-user last-delivery time
+
+Every successfully-processed webhook delivery now advances a per-member
+"last delivered at" timestamp, recorded so a future alert (#31, not
+implemented here) can notice a member who has gone quiet relative to their
+*own* baseline -- a dead integration and a user on holiday look identical
+otherwise. There is no dedicated tool or check surfacing this yet; today it
+is visible only inside the document `whoopmcp export-member` produces, under
+`webhook_delivery_state`.
+
 ---
 
 ## Troubleshooting

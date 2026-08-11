@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #19: webhook registration, local replay and the reconciliation
+  backstop. `docs/SETUP.md` gained a "Webhooks (optional)" section covering
+  endpoint registration and the signing-secret rotation gotcha -- the
+  signing secret verified in `webhooks.py` IS `WHOOP_CLIENT_SECRET`, so
+  rotating it also breaks the OAuth token flow for every already-linked
+  member, not just webhooks. A new `webhook_processor.replay_webhook_event`
+  re-runs a stored `webhook_events` row's own `event_body` through
+  `process_webhook_event` directly -- never re-POSTing or re-signing
+  anything -- raising a new `UnknownTraceIdError` for a trace_id never seen;
+  idempotency (#18) makes replaying an already-`success`/`dead_letter` row a
+  safe no-op and a `pending` row a genuine reprocess. A new
+  `reconciliation.py` module (`run_reconciliation`) supplies the one thing
+  #15's own incremental sync can never catch by construction -- a dropped
+  `*.deleted` webhook: it diffs a fresh WHOOP listing of the last
+  `--window-days` (default 30) against the store and soft-deletes any
+  locally-live recovery/sleep/workout the listing no longer mentions, reusing
+  `webhook_processor.set_deleted_at` (promoted from the private
+  `_set_deleted_at`) rather than a second mechanism; every fetch goes out at
+  `RequestPriority.BACKFILL`. Per-user last-webhook-delivery time is now
+  recorded on every successfully-processed delivery, in a new
+  `webhook_delivery_state` table (schema v4) via `store.record_webhook_delivery`/
+  `get_last_webhook_delivery` (plus `get_webhook_delivery_state_for_member`,
+  wired into `export_member_data`), so #31 can later alert on a member who
+  has gone quiet relative to their own baseline. Two new CLI-only
+  subcommands, neither an MCP tool: `whoopmcp replay-webhook --trace-id ID`
+  and `whoopmcp reconcile-webhooks --whoop-user-id ID [--window-days N]` --
+  there is no in-process scheduler, so an operator wires the latter into
+  cron/systemd, alongside (never instead of) #15's own sync.
 - Issue #16: the 8 data tools and 4 analysis tools now answer from the
   local store (#13/#14/#15), not the live WHOOP API -- a miss is a coverage
   gap, reported explicitly, never a live fetch. Every response carries a

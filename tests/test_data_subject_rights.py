@@ -178,6 +178,15 @@ def _seed_principal_link(conn: sqlite3.Connection, user_id: int, client_id: str)
     )
 
 
+def _seed_webhook_delivery_state(conn: sqlite3.Connection, user_id: int) -> None:
+    """#19's per-user last-delivery timestamp -- no tag to embed (the table
+    carries only ``last_delivered_at``, nothing member-identifying beyond
+    the row's own ``whoop_user_id`` key), so it is exercised by the generic
+    ``_ERASURE_TABLES``/retention sweeps below by presence alone, not by a
+    substring search the way the tagged tables are."""
+    store.record_webhook_delivery(conn, user_id)
+
+
 def _seed_every_entity_table(conn: sqlite3.Connection, user_id: int, tag: str) -> None:
     """Seed one row for ``user_id`` in every table the anchor names, tagged
     distinctly so a cross-member leak or a survivor after erasure is
@@ -192,6 +201,7 @@ def _seed_every_entity_table(conn: sqlite3.Connection, user_id: int, tag: str) -
     _seed_webhook_event(conn, user_id, f"trace-{user_id}", tag)
     _seed_tool_call_audit(conn, user_id, f"tool-{tag}")
     _seed_principal_link(conn, user_id, f"client-{user_id}")
+    _seed_webhook_delivery_state(conn, user_id)
 
 
 # =============================================================================
@@ -237,6 +247,7 @@ def test_export_returns_every_entity_held_for_the_member(store_conn: sqlite3.Con
     assert len(export["webhook_events"]) == 1
     assert len(export["tool_call_audit"]) == 1
     assert len(export["principal_links"]) == 1
+    assert export["webhook_delivery_state"]["last_delivered_at"] is not None
 
 
 def test_export_never_leaks_a_second_members_data(store_conn: sqlite3.Connection) -> None:
@@ -271,6 +282,7 @@ def test_export_of_a_member_with_nothing_synced_yet_has_empty_collections_not_er
     assert export["webhook_events"] == []
     assert export["tool_call_audit"] == []
     assert export["principal_links"] == []
+    assert export["webhook_delivery_state"] == {}
 
 
 # =============================================================================
@@ -758,6 +770,33 @@ def test_enforce_retention_only_touches_rows_past_the_window_for_their_own_membe
     assert b_remaining == 0
 
 
+def test_enforce_retention_covers_webhook_delivery_state(store_conn: sqlite3.Connection) -> None:
+    """#19's ``webhook_delivery_state`` must have its own entry in
+    ``_RETENTION_TIMESTAMP_COLUMNS`` (ages off its own ``last_delivered_at``)
+    exactly like every other ``_ERASURE_TABLES`` entry -- a table added to
+    that registry without a matching retention column raises ``KeyError``
+    the first time ``enforce_retention`` actually runs, rather than at
+    schema-load time, so nothing else catches this until this test does."""
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    max_age_days = 30
+
+    _seed_webhook_delivery_state(store_conn, MEMBER_A)
+    old_at = _iso(now - timedelta(days=max_age_days) - timedelta(seconds=1))
+    store_conn.execute(
+        "UPDATE webhook_delivery_state SET last_delivered_at = ? WHERE whoop_user_id = ?",
+        (old_at, MEMBER_A),
+    )
+    store_conn.commit()
+
+    store.enforce_retention(store_conn, max_age_days=max_age_days, now=now)
+
+    remaining = store_conn.execute(
+        "SELECT whoop_user_id FROM webhook_delivery_state WHERE whoop_user_id = ?",
+        (MEMBER_A,),
+    ).fetchall()
+    assert remaining == [], "a past-window webhook_delivery_state row must be aged out too"
+
+
 def test_enforce_retention_returns_per_table_counts(store_conn: sqlite3.Connection) -> None:
     now = datetime(2026, 1, 1, tzinfo=UTC)
     max_age_days = 30
@@ -925,7 +964,7 @@ def test_erase_member_data_never_references_deleted_at() -> None:
 
 
 def test_webhook_processor_never_calls_into_erasure_or_retention() -> None:
-    """The *.deleted webhook path (`_set_deleted_at`) and real member erasure
+    """The *.deleted webhook path (`set_deleted_at`) and real member erasure
     must never call into each other -- an AST-free, source-level check (the
     module is small and stable enough that a substring check on function
     names is sufficient and avoids over-engineering an AST walk that store.py
@@ -937,8 +976,11 @@ def test_webhook_processor_never_calls_into_erasure_or_retention() -> None:
 
 def test_set_deleted_at_and_erase_member_data_are_different_functions() -> None:
     """The plainest possible version of "these are two paths, not one":
-    erasure's own function is not webhook_processor's soft-delete helper,
-    and neither calls the other by name in its source."""
-    assert store.erase_member_data is not webhook_processor._set_deleted_at
+    erasure's own function is not webhook_processor's soft-delete helper
+    (renamed from the private `_set_deleted_at` by #19, so
+    `reconciliation.py` can reuse the exact same mechanism instead of
+    inventing a second one -- same body, still not erasure), and neither
+    calls the other by name in its source."""
+    assert store.erase_member_data is not webhook_processor.set_deleted_at
     erase_source = inspect.getsource(store.erase_member_data)
-    assert "_set_deleted_at" not in erase_source
+    assert "set_deleted_at" not in erase_source

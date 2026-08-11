@@ -37,6 +37,7 @@ from whoopmcp.store import (
     mark_webhook_event_retry,
     mark_webhook_event_success,
     principal_is_linked_to_member,
+    record_webhook_delivery,
     upsert_recovery,
     upsert_sleep,
     upsert_workout,
@@ -74,6 +75,16 @@ _BACKOFF_MAX_SECONDS = 30.0
 #: lets a test's fast-forwarding clock resolve a wait in one tick instead of
 #: the full logical duration.
 _POLL_INTERVAL_SECONDS = 0.02
+
+
+class UnknownTraceIdError(ValueError):
+    """`replay_webhook_event` was asked to replay a `trace_id` this store has
+    never seen -- there is no stored `event_body` to re-run.
+
+    Same family as `UnresolvableEventError`: both mean "there is nothing
+    usable to process", just discovered at a different point (before ever
+    parsing a body, versus before ever looking one up).
+    """
 
 
 class UnresolvableEventError(ValueError):
@@ -255,9 +266,17 @@ def _upsert_if_not_older(
         upsert_recovery(conn, whoop_user_id, record)
 
 
-def _set_deleted_at(
+def set_deleted_at(
     conn: sqlite3.Connection, resource: str, whoop_user_id: int, resource_id: str
 ) -> None:
+    """Soft-delete one row: set its `deleted_at` to now.
+
+    Public (no leading underscore, unlike every other helper in this
+    module) because #19's `reconciliation.py` reuses this exact mechanism
+    for a detected-deletion hole rather than inventing a second one --
+    every other cross-module primitive this codebase reuses (`upsert_sleep`,
+    `get_sleeps`, `mark_webhook_event_success`, ...) is public too.
+    """
     table = _TABLE_BY_RESOURCE[resource]
     conn.execute(
         f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- see _stored_updated_at
@@ -305,9 +324,9 @@ async def _apply_event(conn: sqlite3.Connection, client: WhoopClient, event: Web
                     event.resource_id,
                 )
                 return
-            _set_deleted_at(conn, "recovery", event.whoop_user_id, str(cycle_id))
+            set_deleted_at(conn, "recovery", event.whoop_user_id, str(cycle_id))
         else:
-            _set_deleted_at(conn, event.resource, event.whoop_user_id, event.resource_id)
+            set_deleted_at(conn, event.resource, event.whoop_user_id, event.resource_id)
         return
 
     if event.resource == "recovery":
@@ -428,7 +447,58 @@ async def process_webhook_event(
             continue
         else:
             mark_webhook_event_success(conn, event.trace_id)
+            # Every path that reaches here is a genuinely completed
+            # delivery for event.whoop_user_id -- including the two vacuous
+            # skips inside _apply_event (recovery.deleted with no locally-
+            # resolvable cycle_id, and an out-of-order stale record in
+            # _upsert_if_not_older) -- so it is real liveness signal for
+            # #31, not just a "real" fetch-and-upsert. Never reached by the
+            # MemberNotLinkedError branch above: no delivery has resolved to
+            # an actionable identity yet.
+            record_webhook_delivery(conn, event.whoop_user_id)
             return
+
+
+async def replay_webhook_event(
+    conn: sqlite3.Connection,
+    client: WhoopClient,
+    trace_id: str,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    clock: Callable[[], float] | None = None,
+) -> bool:
+    """Re-run `process_webhook_event` against a stored event's own
+    `event_body`, never re-POSTing or re-signing anything (#19).
+
+    `webhook_events.event_body` already holds the exact raw JSON bytes #17
+    verified when the event first arrived; re-encoding it and calling
+    `process_webhook_event` directly re-exercises this module's own
+    processing logic without ever touching #17's signature verification or
+    issuing an HTTP request back to this server's own `/webhooks/whoop` --
+    so development can iterate on a code change without a deploy per
+    change, and #66's not-yet-actionable rows can be recovered once their
+    member has actually logged in.
+
+    Raises `UnknownTraceIdError` for a `trace_id` this store has never seen,
+    touching neither `client` nor the store otherwise. Because
+    `process_webhook_event`'s own idempotency gate treats both "success" and
+    "dead_letter" as terminal, replaying an event already in either state is
+    a safe no-op -- exactly what makes "replay reproduces the same store
+    state" assertable -- while a `pending` row (mid-retry, or #66's
+    not-yet-actionable state) is genuinely reprocessed. Returns `True` when
+    this call actually reprocessed the event, `False` when it found an
+    already-terminal row and short-circuited -- the caller (the CLI) must
+    not report a no-op as "replayed" (a real operational need: re-running an
+    event that dead-lettered under a since-fixed bug does nothing here, and
+    the operator needs to be told that plainly, not congratulated).
+    """
+    existing = get_webhook_event(conn, trace_id)
+    if existing is None:
+        raise UnknownTraceIdError(trace_id)
+    was_terminal = existing["status"] in ("success", "dead_letter")
+    raw_body = existing["event_body"].encode("utf-8")
+    await process_webhook_event(conn, client, raw_body, max_attempts=max_attempts, clock=clock)
+    return not was_terminal
 
 
 async def _consume_webhooks(

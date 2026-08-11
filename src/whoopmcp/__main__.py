@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     import sqlite3
 
     from whoopmcp.auth import Authenticator
+    from whoopmcp.reconciliation import ReconciliationResult
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -169,6 +170,56 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    replay_webhook_parser = subparsers.add_parser(
+        "replay-webhook",
+        help=(
+            "Re-run a stored webhook event (#19) through the processing pipeline, "
+            "from its own recorded event_body -- never re-POSTs or re-signs anything, "
+            "so development does not require a deploy per change. Idempotent on an "
+            "already-'success'/'dead_letter' row (a safe no-op, reported as such rather "
+            "than as a replay); genuinely reprocesses a 'pending' one. Requires "
+            "WHOOPMCP_CACHE=true. Deliberately CLI-only, never an MCP tool."
+        ),
+    )
+    replay_webhook_parser.add_argument(
+        "--trace-id",
+        required=True,
+        help="The webhook_events.trace_id to replay.",
+    )
+
+    reconcile_webhooks_parser = subparsers.add_parser(
+        "reconcile-webhooks",
+        help=(
+            "Periodic full reconciliation (#19): the webhook backstop. Diffs a fresh "
+            "WHOOP listing of the last --window-days against what the store holds and "
+            "soft-deletes any locally-live record the listing no longer mentions -- the "
+            "one thing #15's own incremental sync can never catch, a dropped deletion. "
+            "There is no scheduler in this process -- an operator wires this subcommand "
+            "into their own cron or systemd timer, alongside (never instead of) #15's "
+            "own sync; webhooks and reconciliation are both an optimisation over "
+            "polling, never a replacement for it."
+        ),
+    )
+    reconcile_webhooks_parser.add_argument(
+        "--whoop-user-id",
+        type=int,
+        required=True,
+        help=(
+            "Must match the WHOOP member id already linked in principal_members -- a "
+            "confirmation guard against operator error, not a selector among several "
+            "grants: there is exactly one live grant per process today."
+        ),
+    )
+    reconcile_webhooks_parser.add_argument(
+        "--window-days",
+        type=int,
+        default=30,
+        help=(
+            "Recent window to reconcile, in days. Defaults to 30 -- see "
+            "reconciliation.py's own module docstring for why."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     # stderr, never stdout: on stdio transport stdout carries the JSON-RPC
@@ -207,6 +258,10 @@ def main(argv: list[str] | None = None) -> int:
         return _enforce_retention(config, args.max_age_days)
     if args.command == "backfill":
         return _backfill(config, args.whoop_user_id)
+    if args.command == "replay-webhook":
+        return _replay_webhook(config, args.trace_id)
+    if args.command == "reconcile-webhooks":
+        return _reconcile_webhooks(config, args.whoop_user_id, args.window_days)
 
     from whoopmcp.server import build_server
 
@@ -532,6 +587,128 @@ def _backfill(config: Config, whoop_user_id: int) -> int:
     summary = ", ".join(f"{entity}={count}" for entity, count in sorted(imported.items()))
     print(
         f"whoopmcp: backfill finished for whoop-user-id {whoop_user_id}: {summary}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _replay_webhook(config: Config, trace_id: str) -> int:
+    """Handle ``whoopmcp replay-webhook --trace-id ID`` (#19).
+
+    No ``--whoop-user-id`` guard, unlike ``backfill``/``erase-member``: the
+    stored event already carries its own ``whoop_user_id`` in
+    ``webhook_events``, and the #66 not-yet-actionable use case specifically
+    requires replaying an event for a member who may only just now be
+    linked. Prints only a one-line summary to stderr, never the event body
+    (never a token, never health data) -- mirrors ``webhooks.py``'s own
+    no-payload-in-logs rule.
+
+    Refuses -- before opening anything -- unless ``config.cache_enabled`` is
+    set, exactly like ``backfill``/``reconcile-webhooks``: a pending row's
+    replay fetches from WHOOP and writes into the persistent store, which
+    PRIVACY.md promises is off by default. An operator with an old store
+    file left over from an earlier ``WHOOPMCP_CACHE=true`` period must not
+    have this subcommand quietly keep writing to it after disabling caching.
+    """
+    from whoopmcp.auth import Authenticator, AuthError
+    from whoopmcp.client import WhoopAPIError, WhoopClient
+    from whoopmcp.store import open_store
+    from whoopmcp.webhook_processor import UnknownTraceIdError, replay_webhook_event
+
+    if not config.cache_enabled:
+        print(
+            "whoopmcp: replay requires the persistent store, which is off by "
+            "default; set WHOOPMCP_CACHE=true to enable it (see PRIVACY.md)",
+            file=sys.stderr,
+        )
+        return 2
+
+    conn = open_store(config.cache_path)
+    try:
+        auth = Authenticator(config)
+
+        async def _run() -> bool:
+            async with WhoopClient(config, auth) as client:
+                return await replay_webhook_event(conn, client, trace_id)
+
+        try:
+            reprocessed = asyncio.run(_run())
+        except UnknownTraceIdError:
+            print(f"whoopmcp: no webhook event recorded for trace_id {trace_id!r}", file=sys.stderr)
+            return 2
+        except (AuthError, WhoopAPIError) as exc:
+            print(f"whoopmcp: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+    if reprocessed:
+        print(f"whoopmcp: replayed webhook event trace_id={trace_id}", file=sys.stderr)
+    else:
+        print(
+            f"whoopmcp: trace_id={trace_id} was already terminal (success or "
+            "dead_letter); nothing was reprocessed",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _reconcile_webhooks(config: Config, whoop_user_id: int, window_days: int) -> int:
+    """Handle ``whoopmcp reconcile-webhooks --whoop-user-id N [--window-days N]`` (#19).
+
+    The periodic full-reconciliation backstop: refuses -- before opening
+    anything -- unless ``config.cache_enabled`` is set (mirrors
+    ``_backfill``'s own guard: this reads and writes the persistent store),
+    and guards with the same ``principal_is_linked_to_member`` confirmation
+    check every other operator-only subcommand uses. Prints a one-line
+    per-resource ``fetched=M closed=N`` summary to stderr -- never stdout,
+    never a token value.
+    """
+    from whoopmcp.auth import Authenticator, AuthError
+    from whoopmcp.client import WhoopAPIError, WhoopClient
+    from whoopmcp.reconciliation import run_reconciliation
+    from whoopmcp.store import open_store, principal_is_linked_to_member
+
+    if not config.cache_enabled:
+        print(
+            "whoopmcp: reconciliation requires the persistent store, which is off by "
+            "default; set WHOOPMCP_CACHE=true to enable it (see PRIVACY.md)",
+            file=sys.stderr,
+        )
+        return 2
+
+    conn = open_store(config.cache_path)
+    try:
+        if not principal_is_linked_to_member(conn, whoop_user_id):
+            print(
+                f"whoopmcp: no principal is linked to whoop-user-id {whoop_user_id}",
+                file=sys.stderr,
+            )
+            return 2
+
+        auth = Authenticator(config)
+
+        async def _run() -> dict[str, ReconciliationResult]:
+            async with WhoopClient(config, auth) as client:
+                return await run_reconciliation(
+                    conn, client, config, whoop_user_id, window_days=window_days
+                )
+
+        try:
+            results = asyncio.run(_run())
+        except (AuthError, WhoopAPIError) as exc:
+            print(f"whoopmcp: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+    summary = ", ".join(
+        f"{resource}=(fetched={result.fetched}, closed={result.closed})"
+        for resource, result in sorted(results.items())
+    )
+    print(
+        f"whoopmcp: reconciliation finished for whoop-user-id {whoop_user_id} "
+        f"(window_days={window_days}): {summary}",
         file=sys.stderr,
     )
     return 0

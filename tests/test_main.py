@@ -464,3 +464,56 @@ def test_backfill_subcommand_runs_backfill_for_a_linked_member(
     # No token value on any output path.
     assert "access-tok" not in captured.err
     assert "refresh-tok" not in captured.err
+
+
+def test_replay_webhook_subcommand_refuses_when_cache_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Same resolved-blocker gate as backfill/reconcile-webhooks: a pending
+    # row's replay fetches from WHOOP and writes into the persistent store,
+    # which PRIVACY.md promises is off by default (#19 review finding).
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    monkeypatch.delenv("WHOOPMCP_CACHE", raising=False)
+
+    with respx.mock:
+        exit_code = main(["replay-webhook", "--trace-id", "some-trace-id"])
+        assert respx.calls.call_count == 0
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    assert "WHOOPMCP_CACHE" in err
+    assert "Traceback" not in err
+
+
+def test_replay_webhook_subcommand_reports_a_terminal_replay_as_a_no_op(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # replay_webhook_event returns False for an already-success/dead_letter
+    # row (a safe no-op, per its own idempotency contract) -- the CLI must
+    # say so plainly rather than reporting "replayed" for a call that
+    # reprocessed nothing (#19 review finding: an operator re-running a
+    # dead-lettered event after fixing the bug that caused it must be able
+    # to tell whether their fix was actually exercised).
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("WHOOPMCP_CACHE", "true")
+
+    async def fake_replay_webhook_event(
+        conn: object, client: object, trace_id: str, **kwargs: object
+    ) -> bool:
+        del conn, client, kwargs
+        assert trace_id == "already-done"
+        return False  # already terminal -- nothing reprocessed
+
+    monkeypatch.setattr(
+        "whoopmcp.webhook_processor.replay_webhook_event", fake_replay_webhook_event
+    )
+
+    exit_code = main(["replay-webhook", "--trace-id", "already-done"])
+
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert "already-done" in err
+    assert "already terminal" in err
+    assert "nothing was reprocessed" in err
+    # Must not claim a replay happened when it didn't.
+    assert "whoopmcp: replayed" not in err
