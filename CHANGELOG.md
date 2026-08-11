@@ -197,6 +197,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disabled gets the same `404` a genuinely unregistered path would. No log
   statement on any path -- accepted, rejected, or disabled -- includes the
   body, the signature, or the secret.
+- New `webhook_processor.py`: drains #17's queue and makes it idempotent (#18).
+  A new `store.py` schema v2 table, `webhook_events`, keyed uniquely on
+  `trace_id`, is written before an event is processed and doubles as a
+  replay log; a duplicate delivery is recognised there before a second
+  fetch ever happens. Every fetch goes through `WhoopClient`'s own rate
+  limiter, one request per event, and an unknown `user_id` is dropped
+  (counted, not an error). Handles the v2 API's sharpest trap: `recovery.updated`
+  and `recovery.deleted` carry the associated *sleep's* UUID, not a cycle id
+  and not a recovery id (recoveries have none) -- resolved by fetching the
+  sleep and reading its own `cycle_id`, never by treating the payload's `id`
+  as a cycle or recovery id directly. `*.deleted` never fetches (the
+  resource is already gone); the recovery variant instead resolves its
+  cycle from a sleep already sitting in the store, since a fetch-free
+  lookup is the only kind `*.deleted` is allowed. Out-of-order deliveries
+  are protected by comparing the fetched record's own `updated_at` against
+  what's already stored, so a late delivery of stale data can't clobber a
+  newer record. A permanently-failing event retries with capped exponential
+  backoff and full jitter before landing in `dead_letter` after 5 attempts,
+  so one poisoned event can't wedge the queue for every event behind it.
+  The consumer task is started by `server.lifespan` only when
+  `webhooks_enabled` is true, reading the queue `build_server()` stashes on
+  the server instance it returns (`_webhook_queue`) -- the only channel
+  available to reach `build_server()`'s scope from inside `lifespan`, which
+  the SDK calls back with just the server itself as its argument.
 
 ### Changed
 

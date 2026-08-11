@@ -26,7 +26,7 @@ from typing import Any
 
 #: Bump this and append to ``_MIGRATIONS`` when the schema changes. Never
 #: edit an already-shipped migration -- append a new one instead.
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 # -- schema ------------------------------------------------------------------
 #
@@ -131,11 +131,40 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 """
 
+#: Version 2 (#18): a webhook_events table, keyed uniquely on trace_id. It
+#: is what makes webhook processing idempotent -- a duplicate delivery of
+#: the same trace_id hits this table's PRIMARY KEY before it ever reaches an
+#: upsert -- and it doubles as a replay log: every verified webhook body is
+#: recorded here before it is processed, so the four entity tables above
+#: could in principle be rebuilt from a full API backfill plus a replay of
+#: this table, after a bad migration or a bug in an upsert function.
+#:
+#: `status` is one of "pending" (queued or mid-retry), "success", or
+#: "dead_letter" (gave up after too many attempts). `attempt_count` and
+#: `whoop_user_id` are plain columns, not extracted into their own index,
+#: since the only query this table serves today is a point lookup by
+#: `trace_id`; `ix_webhook_events_status` exists for an operator inspecting
+#: what's stuck, not for anything this issue's own code queries by status.
+_SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS webhook_events (
+    trace_id TEXT NOT NULL PRIMARY KEY,
+    whoop_user_id INTEGER,
+    event_type TEXT NOT NULL,
+    event_body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    processed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_webhook_events_status ON webhook_events (status);
+"""
+
 #: Migration ladder: version N's script, applied when the database's
 #: `PRAGMA user_version` is below N. Keyed by the version it produces, so
-#: appending a real migration later is `_MIGRATIONS[2] = "ALTER TABLE ..."`.
+#: appending a real migration later is `_MIGRATIONS[3] = "ALTER TABLE ..."`.
 _MIGRATIONS: dict[int, str] = {
     1: _SCHEMA_V1,
+    2: _SCHEMA_V2,
 }
 
 
@@ -559,3 +588,107 @@ def get_sync_state(
         return None
     cursor, last_run_at, outcome = row
     return {"cursor": cursor, "last_run_at": last_run_at, "outcome": outcome}
+
+
+# -- webhook_events (#18) -----------------------------------------------------
+#
+# Unlike every table above, this one is never upserted: a row is inserted
+# exactly once, when a trace_id is first seen (the INSERT itself is how
+# idempotency is enforced -- a second insert of the same trace_id violates
+# the PRIMARY KEY), and only ever updated in place afterwards to advance its
+# own status/attempt_count as processing proceeds or retries.
+
+
+def insert_webhook_event(
+    conn: sqlite3.Connection,
+    trace_id: str,
+    whoop_user_id: int | None,
+    event_type: str,
+    event_body: str,
+) -> None:
+    """Record a newly-seen webhook event as pending, before it is processed.
+
+    Written first, unconditionally -- before the fetch-and-upsert this event
+    triggers even starts -- so the replay log is complete even for an event
+    whose processing later fails outright. Raises ``sqlite3.IntegrityError``
+    if ``trace_id`` already exists; the caller (``webhook_processor``) checks
+    with ``get_webhook_event`` first and only calls this for a trace_id it
+    has not seen, so that error should never actually surface in practice --
+    it is the ``PRIMARY KEY``'s job to make that guarantee load-bearing
+    rather than advisory.
+    """
+    conn.execute(
+        """
+        INSERT INTO webhook_events (
+            trace_id, whoop_user_id, event_type, event_body, status,
+            attempt_count, created_at
+        ) VALUES (?, ?, ?, ?, 'pending', 0, ?)
+        """,
+        (trace_id, whoop_user_id, event_type, event_body, _now()),
+    )
+    conn.commit()
+
+
+_WEBHOOK_EVENT_COLUMNS = (
+    "trace_id",
+    "whoop_user_id",
+    "event_type",
+    "event_body",
+    "status",
+    "attempt_count",
+    "created_at",
+    "processed_at",
+)
+
+
+def get_webhook_event(conn: sqlite3.Connection, trace_id: str) -> dict[str, Any] | None:
+    """The webhook_events row for ``trace_id``, or ``None`` if never seen."""
+    # _WEBHOOK_EVENT_COLUMNS is a fixed, internal tuple of literal column
+    # names, never user input.
+    row = conn.execute(
+        f"SELECT {', '.join(_WEBHOOK_EVENT_COLUMNS)} FROM webhook_events WHERE trace_id = ?",  # noqa: S608
+        (trace_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(zip(_WEBHOOK_EVENT_COLUMNS, row, strict=True))
+
+
+def mark_webhook_event_success(conn: sqlite3.Connection, trace_id: str) -> None:
+    """Record that ``trace_id`` finished processing -- fetched, upserted (or
+    deliberately skipped: an unknown user, a *.deleted, or an out-of-order
+    record). A later duplicate delivery of the same trace_id sees this
+    status and is skipped without a second fetch."""
+    conn.execute(
+        "UPDATE webhook_events SET status = 'success', processed_at = ? WHERE trace_id = ?",
+        (_now(), trace_id),
+    )
+    conn.commit()
+
+
+def mark_webhook_event_retry(conn: sqlite3.Connection, trace_id: str, attempt_count: int) -> None:
+    """Record one failed attempt at ``trace_id``, still short of the caller's
+    ``max_attempts``. Status stays "pending" -- this is not a terminal state."""
+    conn.execute(
+        "UPDATE webhook_events SET status = 'pending', attempt_count = ? WHERE trace_id = ?",
+        (attempt_count, trace_id),
+    )
+    conn.commit()
+
+
+def mark_webhook_event_dead_letter(
+    conn: sqlite3.Connection, trace_id: str, attempt_count: int
+) -> None:
+    """Give up on ``trace_id`` after ``attempt_count`` failed attempts.
+
+    Terminal: a dead-lettered event is never retried again, and sits here
+    for an operator to inspect (``event_body`` is the full original payload).
+    """
+    conn.execute(
+        """
+        UPDATE webhook_events SET status = 'dead_letter', attempt_count = ?, processed_at = ?
+        WHERE trace_id = ?
+        """,
+        (attempt_count, _now(), trace_id),
+    )
+    conn.commit()
