@@ -69,6 +69,21 @@ EXPECTED_TOOLS = {
 #: environment change per MCP's own read_only_hint semantics.
 MUTATING_TOOLS = {"whoop_complete_login", "whoop_logout", "whoop_sync"}
 
+#: Every prompt the server promises (#26). Same contract as EXPECTED_TOOLS:
+#: adding one here without registering it, or vice versa, fails the suite.
+EXPECTED_PROMPTS = {
+    "morning_readiness_briefing",
+    "weekly_training_review",
+    "sleep_debt_investigation",
+}
+
+#: The one resource surface the server promises (#26): a single URI template
+#: dispatching on its trailing `item` segment, not four static resources --
+#: this SDK's `MCPServer.resource()` rejects a `Context`-typed parameter on
+#: any URI with no `{param}` at registration time, so a per-user identity
+#: gate could never run inside a static resource's function.
+EXPECTED_RESOURCE_TEMPLATES = {"whoop://user/{item}"}
+
 
 # -- fixture helpers for data-tool testing ---------------------------------
 
@@ -306,6 +321,38 @@ async def tools() -> dict[str, object]:
 
 async def test_registers_exactly_the_expected_tools(tools: dict[str, object]) -> None:
     assert set(tools) == EXPECTED_TOOLS
+
+
+@pytest.fixture
+async def prompts() -> dict[str, object]:
+    listed = await build_server().list_prompts()
+    return {prompt.name: prompt for prompt in listed}
+
+
+@pytest.fixture
+async def resources() -> dict[str, object]:
+    listed = await build_server().list_resources()
+    return {str(resource.uri): resource for resource in listed}
+
+
+@pytest.fixture
+async def resource_templates() -> dict[str, object]:
+    listed = await build_server().list_resource_templates()
+    return {template.uri_template: template for template in listed}
+
+
+async def test_registers_exactly_the_expected_prompts(prompts: dict[str, object]) -> None:
+    assert set(prompts) == EXPECTED_PROMPTS
+
+
+async def test_registers_exactly_the_expected_resources(
+    resources: dict[str, object], resource_templates: dict[str, object]
+) -> None:
+    # Templates are never concrete resources -- list_resources() stays empty
+    # by design, so a later concrete resource would show up here instead of
+    # being silently ignored.
+    assert resources == {}
+    assert set(resource_templates) == EXPECTED_RESOURCE_TEMPLATES
 
 
 async def test_data_tools_are_annotated_read_only(tools: dict[str, object]) -> None:
