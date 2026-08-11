@@ -763,6 +763,121 @@ def get_cycle_coverage(
     return (row[0], row[1]) if row is not None else (None, None)
 
 
+# -- metric time series (#20) -------------------------------------------------
+#
+# One generic aggregation function, not one per entity: table/value_column/
+# date_column names cannot be bound as SQL parameters, only interpolated, so
+# (as with the erasure/retention tables above) they must come from a fixed,
+# internal allow-list, never from the raw caller-supplied metric string.
+# server.py's own metric->column resolution never lets an unrecognised name
+# reach this function; the allow-lists below are defense in depth on top of
+# that, not the primary check.
+
+#: Tables ``get_metric_series`` is allowed to aggregate over.
+_METRIC_TIMESERIES_TABLES: frozenset[str] = frozenset({"recoveries", "sleeps", "cycles"})
+
+#: Value columns ``get_metric_series`` is allowed to aggregate, per table.
+_METRIC_TIMESERIES_COLUMNS: dict[str, frozenset[str]] = {
+    "recoveries": frozenset({"recovery_score", "hrv_rmssd_milli", "resting_heart_rate"}),
+    "sleeps": frozenset({"sleep_performance_percentage", "sleep_efficiency_percentage"}),
+    "cycles": frozenset({"strain"}),
+}
+
+#: The activity-date column ``get_metric_series`` buckets by, per table --
+#: ``created_at`` for recoveries, ``start`` for sleeps/cycles, never
+#: ``updated_at`` (sync/rescore bookkeeping) -- same distinction this
+#: module's own coverage queries above already draw.
+_METRIC_TIMESERIES_DATE_COLUMNS: dict[str, str] = {
+    "recoveries": "created_at",
+    "sleeps": "start",
+    "cycles": "start",
+}
+
+#: SQLite bucket-boundary expression per granularity, keyed against
+#: ``{date_column}`` at format time.
+#:
+#: - day: the calendar date, verbatim.
+#: - month: the 1st of the record's own calendar month -- a real, unambiguous
+#:   date (not a bare "YYYY-MM"), so it round-trips like every other bucket.
+#: - week: the Monday that starts the ISO-style week containing the record.
+#:   ``strftime('%w', ...)`` gives 0=Sunday..6=Saturday; ``(w + 6) % 7`` is
+#:   the number of days since the most recent Monday (0 for Monday itself).
+#:   Chosen over a bare week-of-year number because this response is read by
+#:   a model, not a spreadsheet: a week's own start date needs no side table
+#:   to become a real calendar date.
+_BUCKET_EXPR: dict[str, str] = {
+    "day": "strftime('%Y-%m-%d', {date_column})",
+    "week": (
+        "date({date_column}, '-' || "
+        "((CAST(strftime('%w', {date_column}) AS INTEGER) + 6) % 7) || ' days')"
+    ),
+    "month": "strftime('%Y-%m-01', {date_column})",
+}
+
+
+def get_metric_series(
+    conn: sqlite3.Connection,
+    whoop_user_id: int,
+    *,
+    table: str,
+    value_column: str,
+    date_column: str,
+    granularity: str,
+    start: str | None,
+    end: str | None,
+    limit: int,
+) -> list[tuple[str, float]]:
+    """One metric's ``[(bucket_date, mean_value), ...]`` series, aggregated
+    in SQL at the given ``granularity`` ("day"/"week"/"month") -- ordered by
+    date, already ``score_state = 'SCORED'``-filtered (the same rule
+    ``analysis._filtered_records`` applies in Python, reproduced here as a
+    SQL predicate), and already gap-free: a bucket with no scored row simply
+    produces no ``GROUP BY`` row, never a zero-valued one.
+
+    Multiple records landing in one bucket (e.g. two workouts' strain the
+    same day) are averaged (``AVG()``), not summed.
+
+    ``table``/``value_column``/``date_column`` must come from this module's
+    own allow-lists (``_METRIC_TIMESERIES_TABLES``/``_METRIC_TIMESERIES_COLUMNS``/
+    ``_METRIC_TIMESERIES_DATE_COLUMNS``) -- never from raw caller input, since
+    they are interpolated into the SQL text, not bound as parameters.
+
+    Over-fetches by one row (pass ``limit + 1`` from the caller) to let the
+    caller detect truncation without a second query, matching this project's
+    existing ``_fetch_collection`` convention in server.py.
+    """
+    _require_user_id(whoop_user_id)
+    if table not in _METRIC_TIMESERIES_TABLES:
+        raise ValueError(f"unknown metric-timeseries table: {table!r}")
+    if value_column not in _METRIC_TIMESERIES_COLUMNS[table]:
+        raise ValueError(f"unknown metric-timeseries column {value_column!r} for table {table!r}")
+    if date_column not in (_METRIC_TIMESERIES_DATE_COLUMNS[table],):
+        raise ValueError(
+            f"unknown metric-timeseries date column {date_column!r} for table {table!r}"
+        )
+    if granularity not in _BUCKET_EXPR:
+        raise ValueError(f"unknown granularity: {granularity!r}")
+
+    bucket_expr = _BUCKET_EXPR[granularity].format(date_column=date_column)
+    sql = f"""
+        SELECT {bucket_expr} AS bucket, AVG({value_column}) AS value
+        FROM {table}
+        WHERE whoop_user_id = ?
+          AND deleted_at IS NULL
+          AND score_state = 'SCORED'
+          AND {value_column} IS NOT NULL
+          AND {date_column} IS NOT NULL
+          AND (? IS NULL OR {date_column} >= ?)
+          AND (? IS NULL OR {date_column} <= ?)
+        GROUP BY bucket
+        ORDER BY bucket
+        LIMIT ?
+    """  # noqa: S608 -- table/value_column/date_column come only from this
+    # module's own fixed allow-lists above, never from raw caller input.
+    rows = _execute_scoped(conn, sql, (whoop_user_id, start, start, end, end, limit)).fetchall()
+    return [(row[0], row[1]) for row in rows]
+
+
 # -- workouts ---------------------------------------------------------------
 
 

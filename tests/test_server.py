@@ -58,6 +58,7 @@ EXPECTED_TOOLS = {
     "metric_trend",
     "correlate_metrics",
     "compare_periods",
+    "whoop_timeseries",
 }
 
 #: The only tools allowed to change anything. Everything else is a read.
@@ -1920,7 +1921,7 @@ async def test_summarize_period_zero_records_all_metrics_insufficient(
 
 # -- identity tests (issue #8) ----------------------------------------------
 
-#: The 13 tools _ensure_matches_live_grant must gate -- every data and
+#: The 14 tools _ensure_matches_live_grant must gate -- every data and
 #: analysis tool (including #15's whoop_sync, which writes to the local
 #: store but still resolves identity through the same gate before touching
 #: WHOOP), and none of the 4 auth tools (those are how a principal gets
@@ -1945,6 +1946,7 @@ _PRINCIPAL_GATED_TOOLS = {
     "metric_trend",
     "correlate_metrics",
     "compare_periods",
+    "whoop_timeseries",
 }
 
 

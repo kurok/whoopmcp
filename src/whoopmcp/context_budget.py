@@ -101,4 +101,11 @@ TOOL_CEILINGS: dict[str, int] = {
     # #16: 6 small per-entity coverage dicts, never echoed records -- same
     # "does not grow with history size" shape as whoop_sync above.
     "whoop_data_coverage": 340,
+    # #20: a 365-point daily series (one full year, granularity="day") is
+    # this tool's own worst case -- capped by _TIMESERIES_MAX_POINTS, and
+    # deliberately carrying no "coverage"/"range_coverage" envelope (see the
+    # tool's own docstring for why). Measured at 3582 against
+    # tests/test_whoop_timeseries.py's own 365-day fixture; rounded up to
+    # roughly 1.25x.
+    "whoop_timeseries": 4500,
 }
