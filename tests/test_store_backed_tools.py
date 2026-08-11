@@ -263,7 +263,14 @@ _LIVE_API_TOOLS = frozenset({"whoop_sync"})
 #: alongside its own payload, so it is deliberately exercised by its own
 #: dedicated tests below (test_whoop_data_coverage_*) instead of through the
 #: generic TOOL_ARGS loop -- excluded here for that reason, not overlooked.
-_SEPARATELY_TESTED_TOOLS = frozenset({"whoop_data_coverage"})
+#: whoop_timeseries (#20) is excluded for a related reason: it carries a
+#: lightweight, single flat "range_coverage" entry (see its own docstring
+#: in server.py) but deliberately NOT the fuller "coverage" envelope every
+#: other range tool carries -- that envelope's fixed per-call cost is
+#: exactly what this tool exists to avoid -- so it would fail
+#: test_response_includes_coverage below by design, not by omission. It has
+#: its own complete test file, tests/test_whoop_timeseries.py.
+_SEPARATELY_TESTED_TOOLS = frozenset({"whoop_data_coverage", "whoop_timeseries"})
 
 #: Every data/analysis tool this issue repoints, with a happy-path argument
 #: set against `_seed_full_dataset`'s data. A tool added later without an

@@ -34,6 +34,7 @@ from starlette.responses import JSONResponse, Response
 
 from whoopmcp import store
 from whoopmcp.analysis import (
+    _METRIC_PATHS,  # reused for whoop_timeseries (#20), not duplicated
     DEFAULT_LAG_SWEEP,
     InsufficientDataError,
     correlate_lag_sweep,
@@ -1531,6 +1532,64 @@ def _resolve_collection(metric: str) -> str:
         raise ValueError(f"unknown metric: {metric!r}") from None
 
 
+#: whoop_timeseries's (#20) own unit per metric, keyed by the same 6 names
+#: as _METRIC_COLLECTION. Declared once here and echoed in the response
+#: envelope's "unit" field, per the issue's own Scope ("the unit declared
+#: once in the envelope rather than repeated per point"). Direction (e.g.
+#: "lower is generally better" for resting_heart_rate) is NOT repeated in
+#: the envelope -- the issue's own Notes ask for it in "the tool
+#: description", which is this tool's docstring (see its Args section
+#: below), not a runtime payload field; keeping it out of every response
+#: matters here specifically because this tool's whole point is costing
+#: an order of magnitude fewer tokens than the equivalent list_* call
+#: (measured in tests/test_whoop_timeseries.py's own
+#: test_whoop_timeseries_is_cheaper_than_list_sleeps), and a repeated
+#: direction sentence is pure per-call overhead the model already has from
+#: the tool schema.
+_METRIC_UNIT: dict[str, str] = {
+    "recovery_score": "%",
+    "hrv": "ms",
+    "resting_heart_rate": "bpm",
+    "sleep_performance": "%",
+    "sleep_efficiency": "%",
+    "strain": "0-21 exertion scale",
+}
+
+
+def _resolve_metric_timeseries_source(metric: str) -> tuple[str, str, str]:
+    """Resolve a friendly metric name to whoop_timeseries's own
+    ``(entity, value_column, date_column)`` -- the store table (keyed by
+    the store's own table name, matching every other coverage/range_coverage
+    envelope in this module), its SQL value column, and its SQL date column.
+
+    Deliberately not a change to ``_resolve_collection`` above: that
+    function is used today by metric_trend/correlate_metrics/compare_periods
+    and its exact ``"unknown metric: {metric!r}"`` message is very likely
+    pinned by their own tests, so it stays as-is. This resolver instead
+    composes the already-existing mappings (#16's own
+    ``_METRIC_COLLECTION``/``_COLLECTION_TO_ENTITY``, analysis.py's own
+    ``_METRIC_PATHS``, store.py's own ``_METRIC_TIMESERIES_DATE_COLUMNS``)
+    without duplicating any of them, and raises its own helpful, name-listing
+    error rather than reusing (or widening) ``_resolve_collection``'s.
+    """
+    if metric not in _METRIC_COLLECTION:
+        raise ValueError(
+            f"unknown metric: {metric!r}; valid metrics are: "
+            f"{', '.join(sorted(_METRIC_COLLECTION))}"
+        )
+    collection = _METRIC_COLLECTION[metric]
+    entity = _COLLECTION_TO_ENTITY[collection]
+    value_column = _METRIC_PATHS[metric]
+    date_column = store._METRIC_TIMESERIES_DATE_COLUMNS[entity]
+    return entity, value_column, date_column
+
+
+#: Cap on the number of {date, value} points whoop_timeseries returns in one
+#: call -- mirrors _ANALYSIS_MAX_RECORDS's own role/magnitude below, applied
+#: to buckets rather than raw records.
+_TIMESERIES_MAX_POINTS = 1000
+
+
 #: Cap passed to every analysis-tool store read. Also the number quoted in
 #: the truncation "note" below, so the two stay in sync without threading
 #: the value through every call site.
@@ -1976,4 +2035,106 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             )
         response["coverage"] = coverage
         response["range_coverage"] = range_coverage
+        return response
+
+    @server.tool(name="whoop_timeseries", title="Metric time series", annotations=READ_ONLY)
+    async def whoop_timeseries(
+        metric: str,
+        start: str,
+        end: str,
+        ctx: Context[AppContext, Any],
+        granularity: Literal["day", "week", "month"] = "day",
+    ) -> dict[str, Any]:
+        """One metric's trend as a flat ``[{date, value}, ...]`` series --
+        the cheap alternative to a list_* call for "how has X trended"
+        questions: the model never needs to fetch whole records and average
+        them itself.
+
+        Aggregated in the database (SQL ``GROUP BY``, never pandas/numpy):
+        multiple records landing in the same bucket (e.g. two workouts'
+        strain the same day) are averaged (mean), not summed. A bucket with
+        no scored record for it is simply absent from "points" -- never a
+        zero-valued entry; a day you didn't wear the strap did not have a
+        resting heart rate of nought. Only records with ``score_state ==
+        "SCORED"`` are counted, the same rule ``metric_trend`` and every
+        other analysis tool in this module apply.
+
+        A "week" bucket's "date" is the Monday that starts it (not a week
+        number, and not the record's own date) -- unambiguous without a side
+        table, since this response is read by a model, not a spreadsheet. A
+        "month" bucket's "date" is the 1st of that month.
+
+        Args:
+            metric: One of:
+                - "recovery_score" (%, higher is generally better)
+                - "hrv" (ms, higher is generally better)
+                - "resting_heart_rate" (bpm, lower is generally better --
+                  a rising trend is not an improvement)
+                - "sleep_performance" (%, higher is generally better)
+                - "sleep_efficiency" (%, higher is generally better)
+                - "strain" (0-21 exertion scale, context-dependent -- not
+                  inherently better or worse)
+            start: ISO 8601 start of the range, e.g. "2026-07-01T00:00:00Z".
+            end: ISO 8601 end of the range.
+            granularity: "day" (default), "week", or "month".
+
+        Served from the local store, never a live call. Carries a single
+        flat "range_coverage" ({"status": ..., "message": ...}, see
+        whoop_data_coverage's own convention) rather than the full
+        "coverage" envelope (earliest/latest, backfill status, incremental
+        sync status) metric_trend and the list_* tools carry: that fuller
+        envelope costs several hundred tokens of fixed bookkeeping
+        regardless of range size, which would defeat this tool's whole
+        reason to exist (an order of magnitude cheaper than the equivalent
+        list_* call -- see this module's own token-ratio test). This
+        lighter signal is the one that actually matters here: an absent
+        bucket paired with a non-"within_coverage" status means the range
+        may simply not be synced yet, never confidently reported as "no
+        activity". Call whoop_data_coverage for the fuller backfill/sync
+        status picture. The point count is capped; "truncated" and a
+        "note" report it when the cap is hit, rather than silently dropping
+        the tail of the range.
+        """
+        if granularity not in ("day", "week", "month"):
+            raise ValueError(f"granularity must be 'day', 'week' or 'month', got {granularity!r}")
+        app = ctx.request_context.lifespan_context
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        entity, value_column, date_column = _resolve_metric_timeseries_source(metric)
+
+        rows = store.get_metric_series(
+            conn,
+            whoop_user_id,
+            table=entity,
+            value_column=value_column,
+            date_column=date_column,
+            granularity=granularity,
+            start=start,
+            end=end,
+            limit=_TIMESERIES_MAX_POINTS + 1,
+        )
+        truncated = len(rows) > _TIMESERIES_MAX_POINTS
+        page_rows = rows[:_TIMESERIES_MAX_POINTS]
+
+        # Cheap by construction: one indexed MIN/MAX query, never the
+        # backfill/incremental-sync sub-lookups _entity_coverage's own
+        # fuller envelope makes -- this tool intentionally reports only
+        # the range-comparison RESULT, not the full status picture.
+        earliest, latest = _COLLECTION_COVERAGE_FN[entity](conn, whoop_user_id)
+        range_coverage = _range_coverage_entry(earliest, latest, start, end)
+
+        response: dict[str, Any] = {
+            "metric": metric,
+            "unit": _METRIC_UNIT[metric],
+            "granularity": granularity,
+            "points": [{"date": bucket, "value": value} for bucket, value in page_rows],
+            "truncated": truncated,
+            "range_coverage": range_coverage,
+        }
+        if truncated:
+            response["note"] = (
+                f"Only the first {_TIMESERIES_MAX_POINTS} bucket(s) in this range were "
+                "returned; narrow the date range or use a coarser granularity for the "
+                "full series."
+            )
         return response

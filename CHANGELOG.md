@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #20: `whoop_timeseries(metric, start, end, granularity="day")` --
+  one tool replacing per-entity `list_*` calls for "how has X trended"
+  questions, returning a flat `[{date, value}, ...]` series with the unit
+  declared once in the envelope (direction, e.g. "lower is generally
+  better" for resting_heart_rate, lives in the tool's own description
+  instead, per the issue's own Notes). Aggregated in SQL (a new
+  `store.get_metric_series`, one generic function guarded by its own
+  table/column allow-lists, never pandas/numpy) at day/week/month
+  granularity; a week bucket's date is the Monday that starts it, a month
+  bucket's is the 1st, and multiple records in one bucket are averaged, not
+  summed. Missing buckets are absent, never zero; unscored records are
+  excluded via the same `score_state = 'SCORED'` rule `extract_metric`
+  already applies in Python. Reuses #16's `_METRIC_COLLECTION`/
+  `_COLLECTION_TO_ENTITY` and analysis.py's `_METRIC_PATHS` rather than a
+  second metric-to-column table; an unknown metric name raises listing all
+  6 valid names. Capped at 1000 points per call, reported via
+  `truncated`/`note` like the existing analysis tools. Carries a single
+  flat `range_coverage` entry (reusing #16's own `_range_coverage_entry`)
+  so an absent bucket can never be confused with "this range was never
+  synced" -- but deliberately not the fuller `coverage` envelope (earliest/
+  latest, backfill status, incremental-sync status) every other repointed
+  tool carries (#16): that envelope's fixed bookkeeping cost would defeat
+  this tool's own point. Measured, not assumed: `list_sleeps` costs ~4.2x
+  `whoop_timeseries`'s tokens over 30 days and ~5.1x over a full year (both
+  asserted as regression floors in `tests/test_whoop_timeseries.py`) --
+  short of the issue's "order of magnitude" framing, the honest number for
+  the design actually shipped. New
+  `context_budget.TOOL_CEILINGS["whoop_timeseries"]` entry, measured against
+  a 365-day daily fixture.
 - Issue #19: webhook registration, local replay and the reconciliation
   backstop. `docs/SETUP.md` gained a "Webhooks (optional)" section covering
   endpoint registration and the signing-secret rotation gotcha -- the

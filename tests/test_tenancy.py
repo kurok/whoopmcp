@@ -1011,6 +1011,7 @@ _TOOL_ARGUMENTS: dict[str, dict[str, Any]] = {
         "comparison_start": "2026-01-08T00:00:00Z",
         "comparison_end": "2026-01-15T00:00:00Z",
     },
+    "whoop_timeseries": {"metric": "recovery_score", **_RANGE_ARGS},
 }
 
 
