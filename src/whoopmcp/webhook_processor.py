@@ -31,12 +31,12 @@ from typing import Any
 
 from whoopmcp.client import WhoopAPIError, WhoopClient
 from whoopmcp.store import (
-    get_profile,
     get_webhook_event,
     insert_webhook_event,
     mark_webhook_event_dead_letter,
     mark_webhook_event_retry,
     mark_webhook_event_success,
+    principal_is_linked_to_member,
     upsert_recovery,
     upsert_sleep,
     upsert_workout,
@@ -84,6 +84,28 @@ class UnresolvableEventError(ValueError):
     calls the receiving endpoint (#17) with its own well-formed, signed
     bodies, so this is a defensive backstop, not a path expected to see any
     real traffic.
+    """
+
+
+class MemberNotLinkedError(Exception):
+    """`_apply_event`'s signal that `event.whoop_user_id` has no live
+    `principal_members` link yet (#66).
+
+    Deliberately not the same thing as a transient failure (a WHOOP API
+    error, a network blip) and not the same thing as "unparseable" --
+    it means this event isn't actionable *by this server* yet, not that
+    anything went wrong. `process_webhook_event` catches this one
+    distinctly from the generic retry/dead-letter `except Exception` below
+    it: no `mark_webhook_event_*` call is made at all, so the row is left
+    exactly as `insert_webhook_event` (or the previous attempt) left it --
+    `status='pending'`, `attempt_count` unchanged. That does two things at
+    once: it never burns a retry attempt for something retrying wouldn't
+    fix (the member has to log in; no amount of waiting changes that), and
+    it keeps `status` out of the `('success', 'dead_letter')` set that
+    `process_webhook_event`'s own idempotency check short-circuits on --
+    so a later redelivery of the same `trace_id`, or a future #19
+    reconciliation pass, still reaches `_apply_event` again. Actually
+    reprocessing rows left in this state is #19's job, not this module's.
     """
 
 
@@ -251,12 +273,17 @@ async def _apply_event(conn: sqlite3.Connection, client: WhoopClient, event: Web
     acquires it internally on every call, same as every other client.py
     method) -- nothing in this module talks to `httpx` directly.
     """
-    if get_profile(conn, event.whoop_user_id) is None:
-        # An event for a user this server has no local principal for is
-        # dropped, not an error -- there's nothing to upsert against, and
-        # raising here would just get this event retried forever.
+    if not principal_is_linked_to_member(conn, event.whoop_user_id):
+        # An event for a whoop_user_id with no live principal_members link
+        # is dropped, not an error -- there's nothing to upsert against on
+        # behalf of. Unlike a real failure, this is not retryable-into-
+        # success (no amount of waiting links the member) and not
+        # dead-letter-worthy (it isn't broken, it's just not actionable
+        # *yet*): MemberNotLinkedError signals that distinction up to
+        # `process_webhook_event`, which leaves the row `pending` without
+        # spending a retry attempt on it (see that exception's docstring).
         logger.info("dropping webhook event for unknown user_id=%s", event.whoop_user_id)
-        return
+        raise MemberNotLinkedError(event.whoop_user_id)
 
     if event.action == "deleted":
         if event.resource == "recovery":
@@ -346,7 +373,11 @@ async def process_webhook_event(
     failure, or anything else (a malformed response shape, say) -- counts as
     a transient failure for this purpose: retried, then dead-lettered, never
     left to propagate and take down a caller that is processing more than
-    one event.
+    one event. The one exception to that: `MemberNotLinkedError` (#66) is
+    handled separately, before the generic case, and leaves the row
+    `pending` without spending a retry attempt -- see its own docstring for
+    why "not yet actionable" has to be distinct from both "failed" and
+    "succeeded".
     """
     clock = clock or time.time
     try:
@@ -373,6 +404,13 @@ async def process_webhook_event(
     while True:
         try:
             await _apply_event(conn, client, event)
+        except MemberNotLinkedError:
+            # Not yet actionable, not a failure -- see that exception's own
+            # docstring. No mark_webhook_event_* call: the row stays exactly
+            # as it was (status='pending', attempt_count untouched), so it
+            # neither reaches success/dead_letter nor burns an attempt, and
+            # a later redelivery of this trace_id still reaches _apply_event.
+            return
         except Exception:  # see docstring: any failure here is transient-until-proven-otherwise
             attempt += 1
             if attempt >= max_attempts:
