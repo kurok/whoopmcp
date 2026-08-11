@@ -32,7 +32,12 @@ from whoopmcp.auth import Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.store import open_store
-from whoopmcp.webhook_processor import _consume_webhooks, process_webhook_event
+from whoopmcp.webhook_processor import (
+    UnknownTraceIdError,
+    _consume_webhooks,
+    process_webhook_event,
+    replay_webhook_event,
+)
 
 # -- fixture setup ---------------------------------------------------------
 
@@ -1028,3 +1033,221 @@ class TestWebhookEventTable:
         assert row is not None
         assert row["status"] == "dead_letter"
         assert row["attempt_count"] == 5
+
+
+# =============================================================================
+# Issue #19: local replay -- re-run process_webhook_event against a stored
+# event's own event_body, never re-POSTing or re-signing anything.
+#
+# webhook_events.event_body (store.py) already holds the raw JSON payload,
+# and process_webhook_event is idempotent on trace_id (#18) -- reprocessing
+# an already-'success' (or 'dead_letter') row is a safe no-op, and that
+# idempotency is exactly what makes "replay reproduces the same store state"
+# assertable. replay_webhook_event re-encodes the stored event_body and calls
+# process_webhook_event directly: it must never issue an HTTP POST back to
+# this server's own /webhooks/whoop, and must never touch #17's signature
+# verification.
+# =============================================================================
+
+
+class TestWebhookReplay:
+    """Tests for #19's `webhook_processor.replay_webhook_event`."""
+
+    @respx.mock
+    async def test_replay_reposts_a_stored_event_and_reproduces_the_same_store_state(
+        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """Idempotency (#18) makes this assertable: replaying an
+        already-'success' event must reach exactly the same store state as
+        the original delivery produced -- no second fetch, no changed row.
+        """
+        sleep_id = "sleep-replay-1"
+        user_id = 123
+        insert_principal(db, user_id)
+
+        sleep_record = {
+            "id": sleep_id,
+            "start": "2026-08-10T08:00:00Z",
+            "end": "2026-08-10T16:00:00Z",
+        }
+        sleep_route = respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id}").mock(
+            return_value=httpx.Response(200, json=sleep_record)
+        )
+
+        event_payload = create_webhook_event_payload("sleep.updated", sleep_id, user_id)
+        raw_body = encode_webhook_body(event_payload)
+        trace_id = event_payload["trace_id"]
+
+        await process_webhook_event(db, client, raw_body)
+        assert sleep_route.call_count == 1
+
+        from whoopmcp.store import get_sleeps, get_webhook_event
+
+        before_sleeps = get_sleeps(db, user_id)
+        before_event = get_webhook_event(db, trace_id)
+        assert before_event is not None
+        assert before_event["status"] == "success"
+
+        await replay_webhook_event(db, client, trace_id)
+
+        # Idempotency's own no-op guarantee (#18): the row was already
+        # 'success', so replay never re-fetches and never changes the store.
+        assert sleep_route.call_count == 1, "replay of an already-success event must not re-fetch"
+        assert get_sleeps(db, user_id) == before_sleeps
+        assert get_webhook_event(db, trace_id) == before_event
+
+    @respx.mock
+    async def test_replay_of_a_pending_event_genuinely_reprocesses(
+        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """A row left 'pending' (mid-retry, or #66's not-yet-actionable
+        MemberNotLinkedError state) is not a terminal status -- replay must
+        genuinely re-run `_apply_event`, not silently no-op the way an
+        already-'success'/'dead_letter' row does. This is replay's real
+        operational value: development iteration on a code change, and
+        recovering an event that never got a chance to complete."""
+        sleep_id = "sleep-replay-2"
+        user_id = 123
+        insert_principal(db, user_id)
+
+        sleep_record = {
+            "id": sleep_id,
+            "start": "2026-08-10T08:00:00Z",
+            "end": "2026-08-10T16:00:00Z",
+        }
+        sleep_route = respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id}").mock(
+            return_value=httpx.Response(200, json=sleep_record)
+        )
+
+        event_payload = create_webhook_event_payload("sleep.updated", sleep_id, user_id)
+        raw_body = encode_webhook_body(event_payload)
+        trace_id = event_payload["trace_id"]
+
+        await process_webhook_event(db, client, raw_body)
+        assert sleep_route.call_count == 1
+
+        from whoopmcp.store import get_webhook_event, mark_webhook_event_retry
+
+        # Force the row back to a non-terminal state, the way a crash
+        # mid-retry (or the #66 not-yet-actionable path) would leave it.
+        mark_webhook_event_retry(db, trace_id, attempt_count=1)
+        pending_event = get_webhook_event(db, trace_id)
+        assert pending_event is not None
+        assert pending_event["status"] == "pending"
+
+        await replay_webhook_event(db, client, trace_id)
+
+        assert sleep_route.call_count == 2, (
+            "a pending row must be genuinely reprocessed, not no-op'd"
+        )
+        replayed_event = get_webhook_event(db, trace_id)
+        assert replayed_event is not None
+        assert replayed_event["status"] == "success"
+
+    @respx.mock
+    async def test_replay_of_an_unknown_trace_id_raises(
+        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """A trace_id this store has never seen has no `event_body` to
+        replay -- raises rather than silently doing nothing, and touches
+        neither the client nor the store. No route is mocked at all, so any
+        HTTP call would already fail this test via respx's own
+        AllMockedAssertionError before the explicit assertion below runs."""
+        with pytest.raises(UnknownTraceIdError):
+            await replay_webhook_event(db, client, "never-seen-trace-id")
+
+        assert len(respx.calls) == 0
+
+
+# =============================================================================
+# Issue #19: per-user last-delivery time, for #31 (not this issue) to later
+# alert on silence. Recorded on every successfully-processed delivery
+# (including the *.deleted-with-no-locally-resolvable-cycle and out-of-order
+# "vacuous success" skips -- both are still genuine, completed deliveries),
+# never on the #66 MemberNotLinkedError path (no delivery has reached an
+# actionable identity yet) and never on a retry/dead-letter path.
+# =============================================================================
+
+
+class TestLastDeliveryTracking:
+    """Tests for #19's `store.record_webhook_delivery`/`get_last_webhook_delivery`."""
+
+    @respx.mock
+    async def test_last_delivery_time_is_recorded_per_user_and_advances_on_delivery(
+        self,
+        config: Config,
+        auth: Authenticator,
+        db: sqlite3.Connection,
+        client: WhoopClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from whoopmcp.store import get_last_webhook_delivery
+
+        user_id = 123
+        insert_principal(db, user_id)
+
+        assert get_last_webhook_delivery(db, user_id) is None
+
+        sleep_id_1 = "sleep-delivery-1"
+        respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id_1}").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": sleep_id_1,
+                    "start": "2026-08-10T08:00:00Z",
+                    "end": "2026-08-10T16:00:00Z",
+                },
+            )
+        )
+        first_payload = create_webhook_event_payload("sleep.updated", sleep_id_1, user_id)
+        await process_webhook_event(db, client, encode_webhook_body(first_payload))
+
+        first_delivery = get_last_webhook_delivery(db, user_id)
+        assert first_delivery is not None
+
+        # Advance the store's own clock deterministically, then deliver a
+        # second, distinct event for the same user -- the recorded time must
+        # strictly advance, not merely "be set" a second time.
+        import whoopmcp.store as store_module
+
+        later = "2099-01-01T00:00:00+00:00"
+        monkeypatch.setattr(store_module, "_now", lambda: later)
+
+        sleep_id_2 = "sleep-delivery-2"
+        respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id_2}").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": sleep_id_2,
+                    "start": "2026-08-11T08:00:00Z",
+                    "end": "2026-08-11T16:00:00Z",
+                },
+            )
+        )
+        second_payload = create_webhook_event_payload("sleep.updated", sleep_id_2, user_id)
+        await process_webhook_event(db, client, encode_webhook_body(second_payload))
+
+        second_delivery = get_last_webhook_delivery(db, user_id)
+        assert second_delivery is not None
+        assert second_delivery > first_delivery
+        assert second_delivery == later
+
+    @respx.mock
+    async def test_last_delivery_is_not_touched_by_the_member_not_linked_path(
+        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """#66's MemberNotLinkedError path is not a completed delivery -- no
+        principal has resolved this event to an actionable identity yet, so
+        it must not be recorded as a liveness signal for #31."""
+        from whoopmcp.store import get_last_webhook_delivery
+
+        unknown_user_id = 999999
+        # Deliberately never insert_principal(db, unknown_user_id).
+
+        event_payload = create_webhook_event_payload(
+            "sleep.updated", "sleep-unknown-member", unknown_user_id
+        )
+        await process_webhook_event(db, client, encode_webhook_body(event_payload))
+
+        assert get_last_webhook_delivery(db, unknown_user_id) is None
+        assert len(respx.calls) == 0, "an unlinked member's event must never even reach a fetch"

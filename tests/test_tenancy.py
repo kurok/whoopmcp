@@ -218,10 +218,11 @@ def _result_text(result: Any) -> str:
 # =============================================================================
 
 
-def test_schema_version_bumped_to_three() -> None:
-    """#18's webhook_events was v2; #29's principal_members/tool_call_audit
-    is the next migration in the ladder."""
-    assert store.CURRENT_SCHEMA_VERSION == 3
+def test_schema_version_bumped_to_four() -> None:
+    """#18's webhook_events was v2, #29's principal_members/tool_call_audit
+    was v3; #19's per-user webhook_delivery_state (for #31's future
+    silence-alerting) is the next migration in the ladder."""
+    assert store.CURRENT_SCHEMA_VERSION == 4
 
 
 def test_principal_members_table_has_expected_columns() -> None:
@@ -598,6 +599,27 @@ def test_sync_state_never_cross_reads_between_members() -> None:
     conn.close()
 
 
+def test_webhook_delivery_state_never_cross_reads_between_members() -> None:
+    """#19's per-user last-delivery timestamp (one row per whoop_user_id,
+    for #31's future silence-alerting) doesn't fit the generic list/
+    singleton cases above either -- mirrors
+    ``test_sync_state_never_cross_reads_between_members``'s own shape."""
+    conn = store.open_store(":memory:")
+    store.record_webhook_delivery(conn, MEMBER_A)
+    store.record_webhook_delivery(conn, MEMBER_B)
+
+    a_delivery = store.get_last_webhook_delivery(conn, MEMBER_A)
+    b_delivery = store.get_last_webhook_delivery(conn, MEMBER_B)
+
+    assert a_delivery is not None
+    assert b_delivery is not None
+
+    # Advancing one member's delivery time must never move the other's.
+    store.record_webhook_delivery(conn, MEMBER_A)
+    assert store.get_last_webhook_delivery(conn, MEMBER_B) == b_delivery
+    conn.close()
+
+
 def test_tested_entity_tables_cover_every_tenant_scoped_table() -> None:
     """If a new tenant-scoped table is ever added to
     ``store._TENANT_SCOPED_TABLES`` without a corresponding cross-read case
@@ -606,7 +628,7 @@ def test_tested_entity_tables_cover_every_tenant_scoped_table() -> None:
     tested = (
         {name for name, *_ in _LIST_ENTITY_CASES}
         | {name for name, *_ in _SINGLETON_ENTITY_CASES}
-        | {"sync_state"}
+        | {"sync_state", "webhook_delivery_state"}
     )
     assert tested == store._TENANT_SCOPED_TABLES
 
