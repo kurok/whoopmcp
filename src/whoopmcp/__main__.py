@@ -8,9 +8,15 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from whoopmcp import __version__
 from whoopmcp.config import Config, ConfigError
+
+if TYPE_CHECKING:
+    import sqlite3
+
+    from whoopmcp.auth import Authenticator
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -218,6 +224,62 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _revoke_before_local_deletion(
+    auth: Authenticator, conn: sqlite3.Connection, whoop_user_id: int
+) -> int | None:
+    """Shared revoke-step for ``_delete_member``/``_erase_member`` (issue #65).
+
+    Returns ``None`` when the caller should proceed to local deletion, or a
+    nonzero exit code when it must abort instead. Two independent things can
+    make this a no-op-but-still-proceed rather than an abort:
+
+    1. Attribution: reuses ``_export_member``'s own
+       ``all_linked_whoop_user_ids(conn) == {whoop_user_id}`` predicate
+       verbatim (see that function for why guessing is unsafe). When it does
+       not hold, the single stored token cannot be attributed to
+       ``whoop_user_id`` -- skip the upstream revoke entirely rather than
+       revoking a different member's live grant, and point the operator at
+       WHOOP's own app settings instead.
+    2. "Nothing to revoke": ``revoke_and_forget`` raising
+       ``GrantAlreadyGoneError`` (no stored credentials, or WHOOP's
+       ``invalid_grant``) means the grant is already gone, not that
+       revocation failed -- treat it as revoke-step success and continue.
+
+    A plain ``AuthError`` (e.g. ``revoke_upstream``'s own non-2xx-response
+    path -- a genuine transport/network failure) is caught here and turned
+    into a nonzero exit code, which the caller returns BEFORE any local
+    deletion runs -- the same abort-with-data-intact outcome as before this
+    helper existed, just via a return code rather than an uncaught
+    exception. The ``except GrantAlreadyGoneError`` clause must stay ordered
+    before this one: the subclass is the only ignorable case.
+    """
+    from whoopmcp.auth import AuthError, GrantAlreadyGoneError
+    from whoopmcp.store import all_linked_whoop_user_ids
+
+    linked_ids = all_linked_whoop_user_ids(conn)
+    if linked_ids != {whoop_user_id}:
+        print(
+            f"whoopmcp: the single stored token cannot be attributed to whoop-user-id "
+            f"{whoop_user_id} (linked ids: {sorted(linked_ids)}); skipping the upstream "
+            "revoke -- if a grant for this member still exists, revoke it from WHOOP's "
+            "own app settings",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        asyncio.run(auth.revoke_and_forget())
+    except GrantAlreadyGoneError as exc:
+        print(
+            f"whoopmcp: nothing to revoke upstream ({exc}); continuing with local deletion",
+            file=sys.stderr,
+        )
+    except AuthError as exc:
+        print(f"whoopmcp: {exc}", file=sys.stderr)
+        return 1
+    return None
+
+
 def _delete_member(config: Config, whoop_user_id: int) -> int:
     """Handle ``whoopmcp delete-member --whoop-user-id N``.
 
@@ -229,8 +291,12 @@ def _delete_member(config: Config, whoop_user_id: int) -> int:
     merely forgotten, and removes the local principal link. Health data,
     webhook events, and audit rows are untouched -- that is #32's job, not
     this one's.
+
+    Local deletion is no longer conditioned on the upstream grant still
+    being alive, nor does it revoke a token it cannot attribute to this
+    member -- see ``_revoke_before_local_deletion`` (issue #65).
     """
-    from whoopmcp.auth import Authenticator, AuthError
+    from whoopmcp.auth import Authenticator
     from whoopmcp.store import (
         delete_principal_links_for_member,
         open_store,
@@ -250,11 +316,9 @@ def _delete_member(config: Config, whoop_user_id: int) -> int:
             return 2
 
         auth = Authenticator(config)
-        try:
-            asyncio.run(auth.revoke_and_forget())
-        except AuthError as exc:
-            print(f"whoopmcp: {exc}", file=sys.stderr)
-            return 1
+        abort_code = _revoke_before_local_deletion(auth, conn, whoop_user_id)
+        if abort_code is not None:
+            return abort_code
 
         delete_principal_links_for_member(conn, whoop_user_id)
     finally:
@@ -339,9 +403,13 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
     events, audit rows) plus the principal link
     (``delete_principal_links_for_member``, also reused from #30). Guards
     with the same mismatched-id refusal ``_delete_member`` uses, in the same
-    order -- no upstream revoke and no local deletion on a refusal.
+    order -- no local deletion on a refusal.
+
+    Local deletion is no longer conditioned on the upstream grant still
+    being alive, nor does it revoke a token it cannot attribute to this
+    member -- see ``_revoke_before_local_deletion`` (issue #65).
     """
-    from whoopmcp.auth import Authenticator, AuthError
+    from whoopmcp.auth import Authenticator
     from whoopmcp.store import (
         delete_principal_links_for_member,
         erase_member_data,
@@ -359,11 +427,9 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
             return 2
 
         auth = Authenticator(config)
-        try:
-            asyncio.run(auth.revoke_and_forget())
-        except AuthError as exc:
-            print(f"whoopmcp: {exc}", file=sys.stderr)
-            return 1
+        abort_code = _revoke_before_local_deletion(auth, conn, whoop_user_id)
+        if abort_code is not None:
+            return abort_code
 
         erase_member_data(conn, whoop_user_id)
         delete_principal_links_for_member(conn, whoop_user_id)

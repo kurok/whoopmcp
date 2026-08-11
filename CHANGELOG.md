@@ -371,6 +371,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #65: `delete-member`/`erase-member` gated all local deletion on
+  `Authenticator.revoke_and_forget()` succeeding, and revoked *the* stored
+  token unconditionally. Both were wrong. (1) Once the stored grant is
+  already gone -- the member revoked it in WHOOP's own app settings, or an
+  operator already ran `whoop_logout` -- `revoke_and_forget` raised
+  `AuthError` and both subcommands returned before deleting anything,
+  making erasure permanently impossible in exactly the scenario a data
+  subject is most likely to trigger it in. A new `GrantAlreadyGoneError`
+  (an `AuthError` subclass, raised at `access_token`'s "no stored
+  credentials" site and `_do_refresh`'s `invalid_grant` site) now lets both
+  call sites treat "nothing to revoke" as revoke-step success and continue
+  to local deletion, while a plain `AuthError` -- a genuine transport
+  failure calling WHOOP's revoke endpoint -- still aborts with nothing
+  deleted, unchanged. (2) Both subcommands guarded only with
+  `principal_is_linked_to_member`, then revoked the one stored token
+  regardless of which member it actually belonged to: with members A
+  (stale) and B (the token's real owner) both linked,
+  `erase-member --whoop-user-id A` revoked B's live grant while A's own
+  stayed standing. Both subcommands now reuse `_export_member`'s existing
+  `all_linked_whoop_user_ids(conn) == {whoop_user_id}` attribution guard
+  verbatim: when it doesn't hold, the upstream revoke is skipped entirely
+  (with a message pointing the operator at WHOOP's own app settings) and
+  local deletion still completes for the requested member.
 - Issue #66: `_apply_event`'s "known member" gate checked `get_profile()`
   against the `profiles` table, which nothing in `src/` writes (webhooks
   and #14's backfill both cover only the four entity collections) -- so a
