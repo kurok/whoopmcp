@@ -221,6 +221,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the server instance it returns (`_webhook_queue`) -- the only channel
   available to reach `build_server()`'s scope from inside `lifespan`, which
   the SDK calls back with just the server itself as its argument.
+- New `mcpauth.py`: whoopmcp as an OAuth 2.1 *resource server* for inbound MCP
+  requests (#28), separate from `auth.py`'s outbound WHOOP grant -- neither
+  module imports the other. Serves RFC 9728 protected-resource metadata at
+  `/.well-known/oauth-protected-resource` via `setup_mcp_auth()`, and
+  `MCPTokenVerifier` rejects any token whose resource claim doesn't name this
+  server (RFC 8707) or has none at all. Pins spec revision `2026-07-28`
+  (`mcp_types.version.LATEST_PROTOCOL_VERSION` in the installed SDK) as a
+  literal `SPEC_REVISION`, asserted by its own test so bumping it is a
+  deliberate edit. No Dynamic Client Registration or CIMD wiring: both are
+  authorization-server-side concerns, and whoopmcp supplies no
+  `auth_server_provider`, so neither is reachable here. `MCPTokenVerifier`
+  resolves no real tokens yet -- verifying an opaque bearer string against an
+  external, unspecified authorization server (JWKS or introspection) is a
+  decision this issue's text and the installed SDK both leave open, so every
+  token is rejected until a later issue wires in a real resolver; the RFC 8707
+  check itself is real, independently callable logic waiting for that. Not
+  wired into `server.py`: nothing here maps a validated token to a WHOOP
+  member (that's #29), so turning on enforcement for the real `/mcp` endpoint
+  today would only break existing clients, not protect anything yet.
 
 ### Changed
 
