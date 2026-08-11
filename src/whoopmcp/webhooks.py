@@ -53,14 +53,20 @@ _WEBHOOK_PATH = "/webhooks/whoop"
 
 
 def _timestamp_within_skew(timestamp_header: str, skew_seconds: float, *, now: float) -> bool:
-    """Whether ``timestamp_header`` (unix seconds, as text) is within the skew window of ``now``.
+    """Whether ``timestamp_header`` (unix milliseconds, as text) is within the skew window.
+
+    ``now`` is unix seconds, matching ``time.time()``.
+
+    WHOOP documents ``X-WHOOP-Signature-Timestamp`` as "the milliseconds
+    since epoch timestamp", so the header is converted to seconds before
+    comparison against ``now``, which is a ``time.time()``-shaped value.
 
     Checked in both directions -- WHOOP's clock and this process's clock are
     never perfectly synchronised -- but bounded, since an unbounded window
     would let a captured, correctly-signed request be replayed forever.
     """
     try:
-        timestamp = float(timestamp_header)
+        timestamp = float(timestamp_header) / 1000.0
     except ValueError:
         return False
     return abs(now - timestamp) <= skew_seconds

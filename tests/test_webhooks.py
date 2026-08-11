@@ -24,6 +24,7 @@ import pytest
 from mcp.server.transport_security import TransportSecuritySettings
 
 from whoopmcp.server import build_server
+from whoopmcp.webhooks import _timestamp_within_skew, verify_webhook_request
 
 
 @pytest.fixture
@@ -67,9 +68,15 @@ def valid_event_body() -> bytes:
 
 @pytest.fixture
 def valid_timestamp() -> str:
-    """A timestamp within the default skew window (5 minutes = 300s)."""
+    """A timestamp within the default skew window (5 minutes = 300s).
+
+    WHOOP's ``X-WHOOP-Signature-Timestamp`` is milliseconds since epoch, not
+    seconds -- built that way here so fixtures stay consistent with WHOOP's
+    real format rather than with the seconds-based bug this module used to
+    have.
+    """
     # Use current time (well within the window)
-    return str(int(time.time()))
+    return str(int(time.time() * 1000))
 
 
 class TestWebhookSignatureVerification:
@@ -164,7 +171,7 @@ class TestWebhookSignatureVerification:
         """A timestamp outside the 300s skew window is rejected even with valid signature."""
         client_secret = "test-secret-key"
         # Use a timestamp from 10 minutes ago (600s, well outside 300s window)
-        old_timestamp = str(int(time.time()) - 600)
+        old_timestamp = str(int((time.time() - 600) * 1000))
         signature = compute_webhook_signature(old_timestamp, valid_event_body, client_secret)
 
         app = build_server().streamable_http_app(
@@ -425,119 +432,86 @@ class TestWebhookSignatureVerification:
 
 
 class TestWebhookTimestampValidation:
-    """Tests specifically for timestamp skew window validation."""
+    """Tests specifically for timestamp skew window validation.
 
-    async def test_timestamp_at_future_limit_of_skew_window_is_accepted(
-        self, http_env: None, valid_event_body: bytes
-    ) -> None:
-        """A timestamp exactly at the future edge of the skew window is accepted."""
+    The boundary tests drive ``_timestamp_within_skew`` directly through its
+    injected ``now`` keyword rather than through live ``time.time()`` calls
+    at both fixture-build and handler-check time -- the latter shape is what
+    let ``test_timestamp_beyond_future_limit_of_skew_window_is_rejected``
+    flake once in CI history, since it assumed sub-second scheduling delay
+    between building the fixture and the handler's own clock read.
+    """
+
+    def test_timestamp_header_is_interpreted_as_milliseconds(self) -> None:
+        """A timestamp built as WHOOP's real milliseconds-since-epoch format is accepted.
+
+        The same value misinterpreted as seconds would place it roughly
+        55,000 years in the future, which the pre-fix implementation
+        rejected -- this test fails outright under that bug.
+        """
+        now = time.time()
+        timestamp_ms = str(int(now * 1000))
+        assert _timestamp_within_skew(timestamp_ms, 300.0, now=now) is True
+
+    def test_timestamp_valid_only_in_seconds_is_rejected(self) -> None:
+        """A timestamp that is only valid if misread as seconds is rejected.
+
+        Pins the millisecond interpretation going forward: this is exactly
+        the value the old, buggy fixtures produced (``str(int(time.time()))``),
+        and it must not pass now that the header is treated as milliseconds.
+        """
+        now = time.time()
+        timestamp_seconds_text = str(int(now))
+        assert _timestamp_within_skew(timestamp_seconds_text, 300.0, now=now) is False
+
+    def test_timestamp_at_future_limit_of_skew_window_is_accepted(self) -> None:
+        """A timestamp just inside the future edge of the skew window is accepted."""
+        fixed_now = 1_700_000_000.0
+        skew_seconds = 300.0
+        timestamp_ms = str(int((fixed_now + skew_seconds - 1) * 1000))
+        assert _timestamp_within_skew(timestamp_ms, skew_seconds, now=fixed_now) is True
+
+    def test_timestamp_beyond_future_limit_of_skew_window_is_rejected(self) -> None:
+        """A timestamp just beyond the future edge of the skew window is rejected."""
+        fixed_now = 1_700_000_000.0
+        skew_seconds = 300.0
+        timestamp_ms = str(int((fixed_now + skew_seconds + 1) * 1000))
+        assert _timestamp_within_skew(timestamp_ms, skew_seconds, now=fixed_now) is False
+
+    def test_timestamp_at_past_limit_of_skew_window_is_accepted(self) -> None:
+        """A timestamp just inside the past edge of the skew window is accepted."""
+        fixed_now = 1_700_000_000.0
+        skew_seconds = 300.0
+        timestamp_ms = str(int((fixed_now - skew_seconds + 1) * 1000))
+        assert _timestamp_within_skew(timestamp_ms, skew_seconds, now=fixed_now) is True
+
+    def test_timestamp_beyond_past_limit_of_skew_window_is_rejected(self) -> None:
+        """A timestamp just beyond the past edge of the skew window is rejected."""
+        fixed_now = 1_700_000_000.0
+        skew_seconds = 300.0
+        timestamp_ms = str(int((fixed_now - skew_seconds - 1) * 1000))
+        assert _timestamp_within_skew(timestamp_ms, skew_seconds, now=fixed_now) is False
+
+    def test_real_whoop_webhook_fixture_is_accepted(self, valid_event_body: bytes) -> None:
+        """An end-to-end ``verify_webhook_request`` call with a WHOOP-shaped
+        millisecond timestamp and a correctly computed signature passes,
+        proving the full verification path -- not just the unit helper --
+        works with WHOOP's real format.
+        """
         client_secret = "test-secret-key"
-        # Use a timestamp 299s in the future (just within the 300s window)
-        future_timestamp = str(int(time.time()) + 299)
-        signature = compute_webhook_signature(future_timestamp, valid_event_body, client_secret)
+        timestamp_ms = str(int(time.time() * 1000))
+        signature = compute_webhook_signature(timestamp_ms, valid_event_body, client_secret)
 
-        app = build_server().streamable_http_app(
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        )
-
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.post(
-                "/webhooks/whoop",
-                content=valid_event_body,
-                headers={
-                    "X-WHOOP-Signature": signature,
-                    "X-WHOOP-Signature-Timestamp": future_timestamp,
-                    "Content-Type": "application/json",
-                },
+        assert (
+            verify_webhook_request(
+                valid_event_body,
+                signature,
+                timestamp_ms,
+                client_secret,
+                300.0,
             )
-
-        assert response.status_code == 200
-
-    async def test_timestamp_beyond_future_limit_of_skew_window_is_rejected(
-        self, http_env: None, valid_event_body: bytes
-    ) -> None:
-        """A timestamp beyond the future edge of the skew window is rejected."""
-        client_secret = "test-secret-key"
-        # Use a timestamp 301s in the future (beyond the 300s window)
-        future_timestamp = str(int(time.time()) + 301)
-        signature = compute_webhook_signature(future_timestamp, valid_event_body, client_secret)
-
-        app = build_server().streamable_http_app(
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+            is True
         )
-
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.post(
-                "/webhooks/whoop",
-                content=valid_event_body,
-                headers={
-                    "X-WHOOP-Signature": signature,
-                    "X-WHOOP-Signature-Timestamp": future_timestamp,
-                    "Content-Type": "application/json",
-                },
-            )
-
-        assert response.status_code == 400
-
-    async def test_timestamp_at_past_limit_of_skew_window_is_accepted(
-        self, http_env: None, valid_event_body: bytes
-    ) -> None:
-        """A timestamp exactly at the past edge of the skew window is accepted."""
-        client_secret = "test-secret-key"
-        # Use a timestamp 299s in the past (just within the 300s window)
-        past_timestamp = str(int(time.time()) - 299)
-        signature = compute_webhook_signature(past_timestamp, valid_event_body, client_secret)
-
-        app = build_server().streamable_http_app(
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        )
-
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.post(
-                "/webhooks/whoop",
-                content=valid_event_body,
-                headers={
-                    "X-WHOOP-Signature": signature,
-                    "X-WHOOP-Signature-Timestamp": past_timestamp,
-                    "Content-Type": "application/json",
-                },
-            )
-
-        assert response.status_code == 200
-
-    async def test_timestamp_beyond_past_limit_of_skew_window_is_rejected(
-        self, http_env: None, valid_event_body: bytes
-    ) -> None:
-        """A timestamp beyond the past edge of the skew window is rejected."""
-        client_secret = "test-secret-key"
-        # Use a timestamp 301s in the past (beyond the 300s window)
-        past_timestamp = str(int(time.time()) - 301)
-        signature = compute_webhook_signature(past_timestamp, valid_event_body, client_secret)
-
-        app = build_server().streamable_http_app(
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        )
-
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.post(
-                "/webhooks/whoop",
-                content=valid_event_body,
-                headers={
-                    "X-WHOOP-Signature": signature,
-                    "X-WHOOP-Signature-Timestamp": past_timestamp,
-                    "Content-Type": "application/json",
-                },
-            )
-
-        assert response.status_code == 400
 
 
 class TestWebhookDisablement:
