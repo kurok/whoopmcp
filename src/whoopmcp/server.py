@@ -13,7 +13,9 @@ they state what the data is not (a diagnosis).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -38,6 +40,8 @@ from whoopmcp.auth import Authenticator, AuthError, build_store
 from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_params
 from whoopmcp.config import Config
 from whoopmcp.context_budget import strip_nulls
+from whoopmcp.store import open_store
+from whoopmcp.webhook_processor import _consume_webhooks
 from whoopmcp.webhooks import register_webhook_routes
 
 logger = logging.getLogger("whoopmcp")
@@ -132,13 +136,42 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
     workers from both completing a refresh with the same soon-to-rotate
     token. stdio keeps InProcessRefreshLock, unchanged, since it is always
     exactly one process and this doesn't apply to it.
+
+    Also starts the webhook consumer (#18), when there is one to start:
+    `build_server()` stashes the queue `register_webhook_routes` returns on
+    `_server._webhook_queue` (see that function's own call site for why) --
+    an ad hoc attribute rather than a new constructor parameter, since
+    `lifespan` is handed to `MCPServer(...)` and then called back by the SDK
+    itself with exactly one argument, the server it belongs to; `_server` is
+    the only channel available to get anything from `build_server()`'s scope
+    into this function without changing that call shape. Absent (a server
+    built by a test that never called `register_webhook_routes`, e.g.
+    `test_server.py`'s own direct `lifespan(build_server())` call) or
+    `webhooks_enabled` false: no store is opened and no consumer task runs,
+    matching `register_webhook_routes`'s own "off unless configured" default.
     """
     config = Config.from_env()
     auth = Authenticator(config)
     async with WhoopClient(config, auth) as client:
         principal = await _resolve_principal(client)
         logger.info("whoopmcp ready (state dir: %s)", config.state_dir)
-        yield AppContext(config=config, auth=auth, client=client, principal=principal)
+
+        queue: asyncio.Queue[bytes] | None = getattr(_server, "_webhook_queue", None)
+        store_conn: sqlite3.Connection | None = None
+        consumer_task: asyncio.Task[None] | None = None
+        if config.webhooks_enabled and queue is not None:
+            store_conn = open_store(config.cache_path)
+            consumer_task = asyncio.create_task(_consume_webhooks(queue, store_conn, client))
+
+        try:
+            yield AppContext(config=config, auth=auth, client=client, principal=principal)
+        finally:
+            if consumer_task is not None:
+                consumer_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consumer_task
+            if store_conn is not None:
+                store_conn.close()
 
 
 def _ensure_principal(app: AppContext) -> Principal:
@@ -253,7 +286,13 @@ def build_server() -> MCPServer[AppContext]:
     _register_data_tools(server)
     _register_analysis_tools(server)
     _register_health_routes(server)
-    register_webhook_routes(server)
+    # Stashed on the server instance, not returned or discarded: `lifespan`
+    # (already handed to MCPServer(...) above, and called back by the SDK
+    # with only the server itself as an argument) reads it back via
+    # `getattr(_server, "_webhook_queue", None)` to start #18's consumer
+    # task. See `lifespan`'s own docstring for why this attribute, rather
+    # than a constructor parameter, is the wiring point.
+    server._webhook_queue = register_webhook_routes(server)  # type: ignore[attr-defined]
     return server
 
 

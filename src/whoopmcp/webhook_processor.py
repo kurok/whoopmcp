@@ -1,0 +1,425 @@
+"""Webhook event consumer: idempotent processing keyed on trace_id (#18).
+
+#17 verifies a webhook request's signature and puts its raw, still-unparsed
+body on a queue. This module drains that queue: parse the body, resolve its
+``user_id`` to a locally-known user, fetch the one changed resource (through
+the same rate limiter every other outbound call goes through), and upsert it.
+
+Idempotency's actual mechanism is ``store.webhook_events``'s ``PRIMARY KEY``
+on ``trace_id``, written before processing starts -- a duplicate delivery of
+the same trace_id is recognised before this module issues a second fetch.
+
+The one WHOOP-specific trap this module exists to get right: ``recovery.updated``
+and ``recovery.deleted`` carry the UUID of the associated *sleep* in their
+``id`` field, not a recovery id (recoveries have none) and not a cycle id.
+Every other event's ``id`` is exactly what it looks like. See ``_apply_event``
+and ``_sleep_cycle_id`` below.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import random
+import sqlite3
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+from whoopmcp.client import WhoopAPIError, WhoopClient
+from whoopmcp.store import (
+    get_profile,
+    get_webhook_event,
+    insert_webhook_event,
+    mark_webhook_event_dead_letter,
+    mark_webhook_event_retry,
+    mark_webhook_event_success,
+    upsert_recovery,
+    upsert_sleep,
+    upsert_workout,
+)
+
+logger = logging.getLogger("whoopmcp")
+
+#: Resource half of an event_type ("recovery"/"sleep"/"workout") -> the
+#: table it is stored in. Recoveries key on cycle_id (store.py's own
+#: convention, unrelated to this module), sleeps and workouts on their own
+#: UUID -- see `_TABLE_BY_RESOURCE`'s docstring-adjacent callers below.
+_TABLE_BY_RESOURCE: dict[str, str] = {
+    "recovery": "recoveries",
+    "sleep": "sleeps",
+    "workout": "workouts",
+}
+
+#: How many times `process_webhook_event` retries a transient failure before
+#: giving up and dead-lettering the event. Matches client.py's own
+#: `_MAX_429_RETRIES` in spirit (a bounded number, not a policy this issue
+#: needs to make configurable) but is its own constant: that one governs a
+#: single HTTP call's 429 handling inside `WhoopClient._get`, this one
+#: governs a whole event's worth of attempts one layer up, and the two are
+#: free to diverge without either becoming wrong.
+DEFAULT_MAX_ATTEMPTS = 5
+
+#: Capped exponential backoff with full jitter between attempts, same shape
+#: as client.py's `_backoff_seconds` (independent constants, same reasoning:
+#: don't hammer a struggling dependency, but don't wait forever either).
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_MAX_SECONDS = 30.0
+
+#: How often a backoff wait rechecks its clock -- see client.py's own
+#: `_POLL_INTERVAL_SECONDS` for why this is small and bounded: it is what
+#: lets a test's fast-forwarding clock resolve a wait in one tick instead of
+#: the full logical duration.
+_POLL_INTERVAL_SECONDS = 0.02
+
+
+class UnresolvableEventError(ValueError):
+    """A webhook body couldn't be parsed into a usable event.
+
+    Never retried and never persisted to `webhook_events` -- without a
+    `trace_id` there is no key to record it under, and WHOOP already only
+    calls the receiving endpoint (#17) with its own well-formed, signed
+    bodies, so this is a defensive backstop, not a path expected to see any
+    real traffic.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookEvent:
+    """One parsed webhook body.
+
+    `resource_id` is copied verbatim from the payload's `id` field and named
+    deliberately not `sleep_id`/`recovery_id`/etc: for `recovery.updated` and
+    `recovery.deleted` it IS a sleep UUID (the v2 trap this module exists to
+    handle), for the other four event types it is the resource's own UUID.
+    Only `_apply_event` decides what that string actually identifies.
+    """
+
+    trace_id: str
+    event_type: str
+    resource: str
+    action: str
+    whoop_user_id: int
+    resource_id: str
+    raw_body: bytes
+
+
+def _parse_event(raw_body: bytes) -> WebhookEvent:
+    """Parse a verified webhook body into a `WebhookEvent`.
+
+    Raises `UnresolvableEventError` (never anything else) for any body that
+    doesn't carry the fields this module needs to act on -- malformed JSON,
+    a missing/malformed `event_type`, or a missing `trace_id`/`user_id`/`id`.
+    """
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise UnresolvableEventError(f"webhook body is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise UnresolvableEventError(f"webhook body is not a JSON object: {type(payload)}")
+
+    trace_id = payload.get("trace_id")
+    event_type = payload.get("event_type") or payload.get("type")
+    data = payload.get("data", payload)
+    if not isinstance(trace_id, str) or not trace_id:
+        raise UnresolvableEventError("webhook body has no usable trace_id")
+    if not isinstance(event_type, str) or "." not in event_type:
+        raise UnresolvableEventError(f"webhook body has no usable event_type: {event_type!r}")
+    resource, _, action = event_type.partition(".")
+    if resource not in _TABLE_BY_RESOURCE or action not in ("updated", "deleted"):
+        raise UnresolvableEventError(f"unrecognised webhook event_type: {event_type!r}")
+
+    try:
+        whoop_user_id = int(data["user_id"])
+        resource_id = str(data["id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise UnresolvableEventError(
+            f"webhook body missing/malformed user_id or id: {exc}"
+        ) from exc
+
+    return WebhookEvent(
+        trace_id=trace_id,
+        event_type=event_type,
+        resource=resource,
+        action=action,
+        whoop_user_id=whoop_user_id,
+        resource_id=resource_id,
+        raw_body=raw_body,
+    )
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _stored_updated_at(
+    conn: sqlite3.Connection, resource: str, whoop_user_id: int, resource_id: str
+) -> str | None:
+    """The stored record's own `updated_at` (from its `raw_json`), if any row
+    for `(whoop_user_id, resource_id)` exists in `resource`'s table.
+
+    This is WHOOP's own `updated_at` on the resource, not this store's
+    bookkeeping column of the same name (see store.py's module docstring) --
+    the two are unrelated, and only WHOOP's tells us whether an incoming
+    record is actually newer than what is already stored.
+    """
+    table = _TABLE_BY_RESOURCE[resource]
+    row = conn.execute(
+        f"SELECT raw_json FROM {table} WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- table is one of three fixed, internal literals, never user input
+        (whoop_user_id, resource_id),
+    ).fetchone()
+    if row is None:
+        return None
+    updated_at = json.loads(row[0]).get("updated_at")
+    return str(updated_at) if updated_at is not None else None
+
+
+def _sleep_cycle_id(conn: sqlite3.Connection, whoop_user_id: int, sleep_id: str) -> int | None:
+    """The `cycle_id` carried on a locally-stored sleep record, if any.
+
+    Used only to resolve `recovery.deleted` (see `_apply_event`): that event
+    must not fetch, so the only way to find out which cycle a sleep belongs
+    to is a sleep record already synced into this store by an earlier
+    `sleep.updated` event or a historical backfill (#15, not yet built).
+    """
+    row = conn.execute(
+        "SELECT raw_json FROM sleeps WHERE whoop_user_id = ? AND resource_id = ?",
+        (whoop_user_id, sleep_id),
+    ).fetchone()
+    if row is None:
+        return None
+    cycle_id = json.loads(row[0]).get("cycle_id")
+    return int(cycle_id) if cycle_id is not None else None
+
+
+def _upsert_if_not_older(
+    conn: sqlite3.Connection,
+    resource: str,
+    whoop_user_id: int,
+    resource_id: str,
+    record: dict[str, Any],
+) -> None:
+    """Upsert `record`, unless a newer record is already stored.
+
+    Events arrive out of order and can describe data older than the store's
+    cursor; comparing the fetched record's own `updated_at` against what is
+    already stored (not the webhook's delivery order, and not this store's
+    own write-time bookkeeping column) is what keeps a late, stale delivery
+    from clobbering a newer one. Missing on either side (not every WHOOP
+    resource necessarily carries `updated_at`) defaults to upserting, since
+    there is nothing to compare and last-write-wins is this store's existing
+    behaviour everywhere else.
+    """
+    stored = _stored_updated_at(conn, resource, whoop_user_id, resource_id)
+    incoming = record.get("updated_at")
+    if stored is not None and incoming is not None and str(incoming) < stored:
+        logger.info(
+            "skipping out-of-order webhook upsert: %s %s/%s incoming=%s stored=%s",
+            resource,
+            whoop_user_id,
+            resource_id,
+            incoming,
+            stored,
+        )
+        return
+    if resource == "sleep":
+        upsert_sleep(conn, whoop_user_id, record)
+    elif resource == "workout":
+        upsert_workout(conn, whoop_user_id, record)
+    elif resource == "recovery":
+        upsert_recovery(conn, whoop_user_id, record)
+
+
+def _set_deleted_at(
+    conn: sqlite3.Connection, resource: str, whoop_user_id: int, resource_id: str
+) -> None:
+    table = _TABLE_BY_RESOURCE[resource]
+    conn.execute(
+        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- see _stored_updated_at
+        (_now(), whoop_user_id, resource_id),
+    )
+    conn.commit()
+
+
+async def _apply_event(conn: sqlite3.Connection, client: WhoopClient, event: WebhookEvent) -> None:
+    """Do the one thing `event` describes: fetch-and-upsert, or mark deleted.
+
+    Every fetch here goes through `client`'s own rate limiter (`WhoopClient._get`
+    acquires it internally on every call, same as every other client.py
+    method) -- nothing in this module talks to `httpx` directly.
+    """
+    if get_profile(conn, event.whoop_user_id) is None:
+        # An event for a user this server has no local principal for is
+        # dropped, not an error -- there's nothing to upsert against, and
+        # raising here would just get this event retried forever.
+        logger.info("dropping webhook event for unknown user_id=%s", event.whoop_user_id)
+        return
+
+    if event.action == "deleted":
+        if event.resource == "recovery":
+            # THE V2 TRAP: event.resource_id is a sleep UUID, not a cycle id
+            # and not a recovery id -- recoveries have no id of their own.
+            # *.deleted must issue no fetch, so the cycle_id can only come
+            # from a sleep record already sitting in this store; if there
+            # isn't one, there is no fetch-free way to know which recovery
+            # row to mark, and this event is skipped (not retried -- a
+            # fetch wouldn't be new information the next attempt has that
+            # this one doesn't).
+            cycle_id = _sleep_cycle_id(conn, event.whoop_user_id, event.resource_id)
+            if cycle_id is None:
+                logger.warning(
+                    "recovery.deleted for user_id=%s sleep=%s: no locally-stored sleep to "
+                    "resolve its cycle; skipping (a fetch here would violate *.deleted's "
+                    "no-fetch rule)",
+                    event.whoop_user_id,
+                    event.resource_id,
+                )
+                return
+            _set_deleted_at(conn, "recovery", event.whoop_user_id, str(cycle_id))
+        else:
+            _set_deleted_at(conn, event.resource, event.whoop_user_id, event.resource_id)
+        return
+
+    if event.resource == "recovery":
+        # THE V2 TRAP, updated side: fetch the sleep the id actually names,
+        # read *its* cycle_id, and only then fetch the recovery for that
+        # cycle. Treating event.resource_id as a cycle id or a recovery id
+        # directly is exactly the bug this two-fetch shape exists to avoid.
+        sleep_record = await client.get_sleep(event.resource_id)
+        cycle_id = sleep_record.get("cycle_id")
+        if cycle_id is None:
+            raise WhoopAPIError(0, f"sleep {event.resource_id} carries no cycle_id")
+        recovery_record = await client.get_cycle_recovery(int(cycle_id))
+        _upsert_if_not_older(
+            conn, "recovery", event.whoop_user_id, str(recovery_record["cycle_id"]), recovery_record
+        )
+    elif event.resource == "sleep":
+        sleep_record = await client.get_sleep(event.resource_id)
+        _upsert_if_not_older(
+            conn, "sleep", event.whoop_user_id, str(sleep_record["id"]), sleep_record
+        )
+    elif event.resource == "workout":
+        workout_record = await client.get_workout(event.resource_id)
+        _upsert_if_not_older(
+            conn, "workout", event.whoop_user_id, str(workout_record["id"]), workout_record
+        )
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Capped exponential backoff with full jitter -- see module docstring."""
+    capped = min(_BACKOFF_MAX_SECONDS, _BACKOFF_BASE_SECONDS * (2**attempt))
+    return random.uniform(0, capped)  # noqa: S311 -- jitter, not a security use
+
+
+async def _wait_seconds(clock: Callable[[], float], seconds: float) -> None:
+    """Wait `seconds` of `clock`'s time, polling rather than one long sleep --
+    see client.py's own `_wait_seconds` for why: it lets a test's
+    fast-forwarding clock resolve this in one real tick.
+    """
+    deadline = clock() + seconds
+    while clock() < deadline:
+        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+
+
+async def process_webhook_event(
+    conn: sqlite3.Connection,
+    client: WhoopClient,
+    raw_body: bytes,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    clock: Callable[[], float] | None = None,
+) -> None:
+    """Process one webhook body to completion: idempotently, with retry.
+
+    Idempotent on `trace_id`: a body whose `trace_id` already has a
+    "success" or "dead_letter" row in `webhook_events` is recognised and
+    returned from immediately, before any fetch. Otherwise this retries
+    `_apply_event` up to `max_attempts` times, with capped exponential
+    backoff between attempts, before giving up and dead-lettering the event
+    so one permanently-failing event cannot wedge whatever is driving this
+    (see `_consume_webhooks`) forever.
+
+    Any exception `_apply_event` raises -- a WHOOP API error, a network
+    failure, or anything else (a malformed response shape, say) -- counts as
+    a transient failure for this purpose: retried, then dead-lettered, never
+    left to propagate and take down a caller that is processing more than
+    one event.
+    """
+    clock = clock or time.time
+    try:
+        event = _parse_event(raw_body)
+    except UnresolvableEventError:
+        logger.warning("dropping unparseable webhook event", exc_info=True)
+        return
+
+    existing = get_webhook_event(conn, event.trace_id)
+    if existing is not None:
+        if existing["status"] in ("success", "dead_letter"):
+            return
+        attempt = int(existing["attempt_count"])
+    else:
+        insert_webhook_event(
+            conn,
+            event.trace_id,
+            event.whoop_user_id,
+            event.event_type,
+            raw_body.decode("utf-8", errors="replace"),
+        )
+        attempt = 0
+
+    while True:
+        try:
+            await _apply_event(conn, client, event)
+        except Exception:  # see docstring: any failure here is transient-until-proven-otherwise
+            attempt += 1
+            if attempt >= max_attempts:
+                mark_webhook_event_dead_letter(conn, event.trace_id, attempt)
+                logger.warning(
+                    "webhook event dead-lettered after %d attempts: trace_id=%s type=%s",
+                    attempt,
+                    event.trace_id,
+                    event.event_type,
+                    exc_info=True,
+                )
+                return
+            mark_webhook_event_retry(conn, event.trace_id, attempt)
+            await _wait_seconds(clock, _backoff_seconds(attempt))
+            continue
+        else:
+            mark_webhook_event_success(conn, event.trace_id)
+            return
+
+
+async def _consume_webhooks(
+    queue: asyncio.Queue[bytes],
+    conn: sqlite3.Connection,
+    client: WhoopClient,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    clock: Callable[[], float] | None = None,
+) -> None:
+    """Drain `queue` forever, one event at a time.
+
+    Meant to run as a background task for the server's whole lifetime
+    (started and cancelled by `server.lifespan`). Processing is serial, not
+    concurrent: one event's retries (bounded by `max_attempts`, inside
+    `process_webhook_event`) delay the next event behind it, but never block
+    it indefinitely -- once an event dead-letters, the loop moves on. Any
+    exception that escapes `process_webhook_event` regardless (it is not
+    expected to raise, but this is the process's whole queue-draining loop)
+    is logged and swallowed here rather than left to kill the task outright,
+    which would stop every event queued after it from ever being processed.
+    """
+    while True:
+        raw_body = await queue.get()
+        try:
+            await process_webhook_event(
+                conn, client, raw_body, max_attempts=max_attempts, clock=clock
+            )
+        except Exception:
+            logger.exception("webhook consumer: event processing raised unexpectedly")
+        finally:
+            queue.task_done()
