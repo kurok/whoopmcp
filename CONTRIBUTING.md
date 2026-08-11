@@ -50,12 +50,17 @@ knows WHOOP's response *shapes* belongs in `analysis.extract_metric` or in
 `client`, not scattered across tools.
 
 **The user is an argument, never ambient.** A tool body gets its caller's
-identity from the `AppContext` it was handed (`_ensure_principal(app)`),
+identity from the `Context` it was handed, resolved once at the edge by
+`server.resolve_member_id` (via `_ensure_matches_live_grant`, which also
+refuses a resolved member that isn't this process's live WHOOP grant) --
 never by reaching into `Config.from_env()`, an environment variable, or any
-other process-global state. Today there is exactly one user, resolved once
-at startup and after login, so this looks like ceremony -- but it is what
-lets a second user (#29) become a change to one resolver instead of a
-rewrite of every tool.
+other process-global state. `resolve_member_id` itself reads only the
+`principal_members` table, written only by a completed WHOOP login
+(`whoop_complete_login`), never a caller-supplied parameter, header, or
+query string. #29 is exactly the resolver this paragraph used to promise:
+adding a second, genuinely concurrent live WHOOP grant is still future
+work, but the identity plumbing every tool goes through is already the one
+join point, not a per-tool rewrite.
 
 ## Working on a stub
 

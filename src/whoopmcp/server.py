@@ -16,18 +16,21 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import principal_components
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from whoopmcp import store
 from whoopmcp.analysis import (
     DEFAULT_LAG_SWEEP,
     InsufficientDataError,
@@ -91,6 +94,10 @@ class AppContext:
     auth: Authenticator
     client: WhoopClient
     principal: Principal | None = None
+    #: The persistent store (#13), opened by ``lifespan`` for the life of the
+    #: process. ``None`` only for a deployment/test that never opened one --
+    #: see ``resolve_member_id`` for what that means for identity resolution.
+    store_conn: sqlite3.Connection | None = None
 
 
 async def _resolve_principal(client: WhoopClient) -> Principal | None:
@@ -137,18 +144,21 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
     token. stdio keeps InProcessRefreshLock, unchanged, since it is always
     exactly one process and this doesn't apply to it.
 
-    Also starts the webhook consumer (#18), when there is one to start:
-    `build_server()` stashes the queue `register_webhook_routes` returns on
-    `_server._webhook_queue` (see that function's own call site for why) --
-    an ad hoc attribute rather than a new constructor parameter, since
-    `lifespan` is handed to `MCPServer(...)` and then called back by the SDK
-    itself with exactly one argument, the server it belongs to; `_server` is
-    the only channel available to get anything from `build_server()`'s scope
-    into this function without changing that call shape. Absent (a server
-    built by a test that never called `register_webhook_routes`, e.g.
-    `test_server.py`'s own direct `lifespan(build_server())` call) or
-    `webhooks_enabled` false: no store is opened and no consumer task runs,
-    matching `register_webhook_routes`'s own "off unless configured" default.
+    Always opens the persistent store (#13) -- issue #29's principal<->member
+    join and audit log need it on every request, not only when webhooks are
+    enabled, so this is no longer gated on `config.webhooks_enabled` the way
+    the webhook consumer task below still is. Also starts the webhook
+    consumer (#18), when there is one to start: `build_server()` stashes the
+    queue `register_webhook_routes` returns on `_server._webhook_queue` (see
+    that function's own call site for why) -- an ad hoc attribute rather than
+    a new constructor parameter, since `lifespan` is handed to `MCPServer(...)`
+    and then called back by the SDK itself with exactly one argument, the
+    server it belongs to; `_server` is the only channel available to get
+    anything from `build_server()`'s scope into this function without
+    changing that call shape. Absent (a server built by a test that never
+    called `register_webhook_routes`) or `webhooks_enabled` false: no
+    consumer task runs, matching `register_webhook_routes`'s own "off unless
+    configured" default -- the store itself is unaffected either way.
     """
     config = Config.from_env()
     auth = Authenticator(config)
@@ -156,22 +166,22 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
         principal = await _resolve_principal(client)
         logger.info("whoopmcp ready (state dir: %s)", config.state_dir)
 
+        store_conn = open_store(config.cache_path)
         queue: asyncio.Queue[bytes] | None = getattr(_server, "_webhook_queue", None)
-        store_conn: sqlite3.Connection | None = None
         consumer_task: asyncio.Task[None] | None = None
         if config.webhooks_enabled and queue is not None:
-            store_conn = open_store(config.cache_path)
             consumer_task = asyncio.create_task(_consume_webhooks(queue, store_conn, client))
 
         try:
-            yield AppContext(config=config, auth=auth, client=client, principal=principal)
+            yield AppContext(
+                config=config, auth=auth, client=client, principal=principal, store_conn=store_conn
+            )
         finally:
             if consumer_task is not None:
                 consumer_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await consumer_task
-            if store_conn is not None:
-                store_conn.close()
+            store_conn.close()
 
 
 def _ensure_principal(app: AppContext) -> Principal:
@@ -187,6 +197,135 @@ def _ensure_principal(app: AppContext) -> Principal:
     if app.principal is None:
         raise AuthError("no WHOOP identity resolved; run whoop_login to authenticate")
     return app.principal
+
+
+class UnresolvedPrincipalError(RuntimeError):
+    """The calling MCP principal has no WHOOP member linked to it.
+
+    Distinct from ``AuthError`` ("nobody is logged in to WHOOP at all"):
+    this means a principal is known -- a bearer token's identity, or the
+    local stdio sentinel -- but no completed WHOOP authorisation has ever
+    linked it to a member via ``store.link_principal_to_member``. Raised by
+    ``resolve_member_id`` (and by ``_ensure_matches_live_grant`` for the
+    "resolves to a real member, but not this process's live grant" case).
+    Never resolved by defaulting to some other member -- see both
+    functions' own docstrings.
+    """
+
+
+#: Fixed principal key for stdio / no-bearer-auth-wired deployments (today's
+#: only real deployment shape): one completed login links this one sentinel
+#: to a member, rather than inventing per-connection identity that #28's
+#: resource-server layer doesn't produce in that mode.
+_LOCAL_PRINCIPAL_CLIENT_ID = "__local__"
+
+
+def _principal_key(request: Any | None) -> tuple[str, str | None, str | None]:
+    """The (client_id, issuer, subject) triple identifying `request`'s caller.
+
+    Reads only `request.user` -- the `AuthenticatedUser` a verified bearer
+    token resolves to under streamable-http with #28's auth wired -- via the
+    SDK's own `principal_components()`, the single source `authorization
+    _context`/session-ownership binding already use for "who is this token's
+    principal". Never reads `request.query_params` or `request.headers`:
+    those are caller-supplied and are exactly the smuggling vector #28's own
+    `list_tools_protected` and this function both refuse to consult for
+    identity. `request` is `None` under stdio, or before #28's resource
+    server is wired into a deployment's transport -- both degrade to the
+    fixed local sentinel below, never to inventing a per-request identity
+    from anything the caller could control.
+    """
+    user = getattr(request, "user", None) if request is not None else None
+    if isinstance(user, AuthenticatedUser):
+        return principal_components(user.access_token)
+    return _LOCAL_PRINCIPAL_CLIENT_ID, None, None
+
+
+def _tool_name(ctx: Context[AppContext, Any]) -> str:
+    """The name of the tool this call is invoking, for the audit log.
+
+    ``ctx.request_context.params`` is a plain ``Mapping`` in production (the
+    raw ``tools/call`` JSON-RPC params, read before typed validation) but a
+    real ``CallToolRequestParams`` in tests that build one directly -- both
+    carry a ``name``, just via a different access pattern.
+    """
+    params = ctx.request_context.params
+    name = params.get("name") if isinstance(params, Mapping) else getattr(params, "name", None)
+    return str(name) if name is not None else "<unknown>"
+
+
+def resolve_member_id(ctx: Context[AppContext, Any]) -> int:
+    """Resolve the calling MCP principal to a WHOOP member id, once, at the edge.
+
+    The one join point between an MCP principal (#28's bearer token, or the
+    local stdio sentinel) and a WHOOP member (#8's ``Principal``): every
+    data/analysis tool calls this exactly once, as its first line via
+    ``_ensure_matches_live_grant``, and threads the returned id through
+    rather than re-resolving. Reads only the ``principal_members`` mapping
+    table (via ``_principal_key``, never a caller-supplied parameter, header,
+    or query string) and audits the call (``store.record_tool_call``) in the
+    same step resolution succeeds, so a tool that resolves but "forgets" to
+    audit is structurally impossible -- there is only one call site for
+    either.
+
+    Requires a persistent store (``AppContext.store_conn``). The store is
+    always opened by ``lifespan()``, so only deployments or tests that
+    construct ``AppContext`` outside ``lifespan()`` encounter an error here.
+
+    Raises:
+        RuntimeError: ``AppContext.store_conn`` is None. The persistent store
+            is required for principal-to-member resolution. This is always
+            opened by ``lifespan()``, so this error only occurs if ``AppContext``
+            is constructed outside that context.
+        UnresolvedPrincipalError: no ``principal_members`` row links the
+            calling principal to a member. Never a default, never a
+            fallback to some other member.
+    """
+    app = ctx.request_context.lifespan_context
+    if app.store_conn is None:
+        raise RuntimeError(
+            "resolve_member_id requires a persistent store (AppContext.store_conn must be set); "
+            "this is always opened by lifespan(), so this error only occurs if AppContext is "
+            "constructed outside lifespan(). Ensure lifespan() is called or open a store "
+            "before calling this function."
+        )
+
+    client_id, issuer, subject = _principal_key(ctx.request_context.request)
+    whoop_user_id = store.get_member_for_principal(
+        app.store_conn, client_id=client_id, issuer=issuer, subject=subject
+    )
+    if whoop_user_id is None:
+        raise UnresolvedPrincipalError(
+            f"no WHOOP member is linked to principal {client_id!r}; "
+            "run whoop_login and whoop_complete_login to authorise one"
+        )
+    store.record_tool_call(app.store_conn, whoop_user_id, _tool_name(ctx))
+    return whoop_user_id
+
+
+def _ensure_matches_live_grant(ctx: Context[AppContext, Any]) -> int:
+    """Gate a live-WHOOP-client tool on the resolved identity matching this
+    process's one live grant, and return the resolved member id.
+
+    Every data/analysis tool today calls the single process-wide live
+    ``WhoopClient`` -- #13's store isn't read by any tool yet, so there is
+    no per-member live client to route a resolved identity to.
+    ``resolve_member_id`` must still answer truthfully even when the
+    resolved member is not this grant (see its own tests, e.g. a spoofed
+    hint must never be adopted) -- the refusal for that mismatch belongs
+    one layer up, here, in the one place that actually knows "the live
+    client can only ever speak for one member".
+    """
+    app = ctx.request_context.lifespan_context
+    whoop_user_id = resolve_member_id(ctx)
+    principal = _ensure_principal(app)
+    if whoop_user_id != principal.user_id:
+        raise UnresolvedPrincipalError(
+            f"resolved WHOOP member {whoop_user_id} does not match this "
+            f"process's live WHOOP grant (member {principal.user_id}); "
+            "concurrent live access for more than one member is not supported yet"
+        )
+    return whoop_user_id
 
 
 async def _check_token_store_reachable() -> tuple[bool, str]:
@@ -409,6 +548,18 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
         app.auth.verify_state(state)
         token = await app.auth.exchange_code(code)
         app.principal = await _resolve_principal(app.client)
+        if app.principal is not None and app.store_conn is not None:
+            # The only writer of principal_members (#29): a completed WHOOP
+            # authorisation, and nothing else -- never a header, a hostname,
+            # or a caller-supplied member id.
+            client_id, issuer, subject = _principal_key(ctx.request_context.request)
+            store.link_principal_to_member(
+                app.store_conn,
+                client_id=client_id,
+                issuer=issuer,
+                subject=subject,
+                whoop_user_id=app.principal.user_id,
+            )
         granted = ", ".join(token.scopes) if token.scopes else "(none)"
         return f"Login complete. Granted scopes: {granted}"
 
@@ -577,7 +728,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def get_profile(ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Return the user's WHOOP profile: user id, email, first and last name."""
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
 
         async def _fetch() -> dict[str, Any]:
             return strip_nulls(await app.client.get_profile())
@@ -588,7 +739,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def get_body_measurement(ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Return height in metres, weight in kilograms and max heart rate in bpm."""
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
 
         async def _fetch() -> dict[str, Any]:
             return strip_nulls(await app.client.get_body_measurement())
@@ -614,7 +765,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 that page.
         """
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
         range_start, range_end = _default_range(start, end, next_token)
 
         async def _fetch() -> dict[str, Any]:
@@ -664,7 +815,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         if detail not in ("summary", "full"):
             raise ValueError(f"detail must be 'summary' or 'full', got {detail!r}")
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
         range_start, range_end = _default_range(start, end, next_token)
 
         async def _fetch() -> dict[str, Any]:
@@ -712,7 +863,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 that page.
         """
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
         range_start, range_end = _default_range(start, end, next_token)
 
         async def _fetch() -> dict[str, Any]:
@@ -762,7 +913,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         if detail not in ("summary", "full"):
             raise ValueError(f"detail must be 'summary' or 'full', got {detail!r}")
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
         range_start, range_end = _default_range(start, end, next_token)
 
         async def _fetch() -> dict[str, Any]:
@@ -792,7 +943,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def get_sleep(sleep_id: str, ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Return a single sleep by its v2 UUID."""
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
 
         async def _fetch() -> dict[str, Any]:
             record = await app.client.get_sleep(sleep_id)
@@ -806,7 +957,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def get_workout(workout_id: str, ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Return a single workout by its v2 UUID."""
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
 
         async def _fetch() -> dict[str, Any]:
             record = await app.client.get_workout(workout_id)
@@ -989,7 +1140,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             end: ISO 8601 end of the range.
         """
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
 
         async def _fetch() -> dict[str, Any]:
             (
@@ -1031,7 +1182,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         rolling means of the metric over calendar days.
         """
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
 
         async def _fetch() -> dict[str, Any]:
             collection = _resolve_collection(metric)
@@ -1105,7 +1256,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         lag_days = min(lag_days, _MAX_LAG_SWEEP_RADIUS)
 
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
 
         async def _fetch() -> dict[str, Any]:
             collection_a = _resolve_collection(metric_a)
@@ -1171,7 +1322,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             comparison_end: ISO 8601 end of the comparison period.
         """
         app = ctx.request_context.lifespan_context
-        _ensure_principal(app)
+        _ensure_matches_live_grant(ctx)
 
         async def _fetch() -> dict[str, Any]:
             # Sequential, not concurrent (no asyncio.gather): each window's fetch

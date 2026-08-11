@@ -27,6 +27,7 @@ from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.server import AppContext, Principal, build_server, lifespan
+from whoopmcp.store import link_principal_to_member, open_store
 
 #: Every tool the server promises. Adding one here without registering it, or
 #: registering one without listing it here, fails the suite.
@@ -122,7 +123,25 @@ def app_context(config: Config) -> AppContext:
     # user_id matches profile_fixture()'s "user_id": 12345, so a test that
     # mocks the profile endpoint and one that doesn't stay consistent with
     # each other about who "the" user is.
-    return AppContext(config=config, auth=auth, client=client, principal=Principal(user_id=12345))
+    #
+    # store_conn= plus the principal_members row (#29): every tool now
+    # resolves identity via resolve_member_id, which requires a store and
+    # errors without a mapping for the calling principal --
+    # ("__local__", None, None) is _principal_key's own sentinel for a
+    # request-less (stdio-shaped) Context, exactly what call_tool's
+    # ServerRequestContext(session=None, ...) builds.
+    conn = open_store(":memory:")
+    link_principal_to_member(
+        conn, client_id="__local__", issuer=None, subject=None, whoop_user_id=12345
+    )
+    yield AppContext(
+        config=config,
+        auth=auth,
+        client=client,
+        principal=Principal(user_id=12345),
+        store_conn=conn,
+    )
+    conn.close()
 
 
 @pytest.fixture
@@ -2353,9 +2372,14 @@ async def test_summarize_period_zero_records_all_metrics_insufficient(
 
 # -- identity tests (issue #8) ----------------------------------------------
 
-#: The 12 tools _ensure_principal must gate -- every data and analysis tool,
-#: and none of the 4 auth tools (those are how a principal gets created, or
-#: must keep working regardless of one).
+#: The 12 tools _ensure_matches_live_grant must gate -- every data and
+#: analysis tool, and none of the 4 auth tools (those are how a principal
+#: gets created, or must keep working regardless of one). Issue #29 renamed
+#: the gate from a bare `_ensure_principal(app)` to `_ensure_matches_live
+#: _grant(ctx)`, which still calls `_ensure_principal` internally (so an
+#: unauthenticated caller still fails exactly as before) and additionally
+#: refuses a resolved identity that doesn't match this process's one live
+#: WHOOP grant.
 _PRINCIPAL_GATED_TOOLS = {
     "get_profile",
     "get_body_measurement",
@@ -2513,20 +2537,28 @@ def test_every_principal_gated_tool_source_calls_ensure_principal(
     Registry lookup (server._tool_manager.get_tool(name).fn), not
     inspect.getsource on _register_data_tools/_register_analysis_tools
     directly: those two functions each define several tool closures back to
-    back, so scanning their combined source for "_ensure_principal(" would
-    pass even if only one of the 8 (or 4) tools nested inside actually called
-    it. Pulling each registered Tool's own `.fn` off the tool manager and
-    reading ITS source in isolation checks every one of the 12 tools
+    back, so scanning their combined source for "_ensure_matches_live_grant("
+    would pass even if only one of the 8 (or 4) tools nested inside actually
+    called it. Pulling each registered Tool's own `.fn` off the tool manager
+    and reading ITS source in isolation checks every one of the 12 tools
     individually, which is what actually catches a tool added later that
     skips the gate.
+
+    Checks for `_ensure_matches_live_grant(`, not the bare `_ensure_principal(`
+    this test's name still references: issue #29 moved every gated tool onto
+    that wrapper, which still calls `_ensure_principal` internally (so this
+    remains, transitively, a check that every tool calls it) and additionally
+    ties the gate to a resolved, per-request identity rather than only "is
+    anyone logged in".
     """
     for name in _PRINCIPAL_GATED_TOOLS:
         tool = server._tool_manager.get_tool(name)
         assert tool is not None, f"{name} is not registered"
         source = inspect.getsource(tool.fn)
-        assert "_ensure_principal(" in source, (
-            f"{name} never calls _ensure_principal -- an unauthenticated caller "
-            "would reach the network instead of getting a typed error"
+        assert "_ensure_matches_live_grant(" in source, (
+            f"{name} never calls _ensure_matches_live_grant -- an unauthenticated "
+            "or cross-tenant caller would reach the network instead of getting a "
+            "typed error"
         )
         # The absence check this acceptance criterion actually cares about:
         # a tool resolving its own config/identity from ambient state
