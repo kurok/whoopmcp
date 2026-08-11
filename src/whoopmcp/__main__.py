@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
 
 from whoopmcp import __version__
-from whoopmcp.config import ConfigError
+from whoopmcp.config import Config, ConfigError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,6 +43,30 @@ def main(argv: list[str] | None = None) -> int:
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
     )
+
+    # Not `required=True`: the default (no subcommand) is "run the server",
+    # the behaviour every test above this comment already exercises.
+    subparsers = parser.add_subparsers(dest="command")
+    delete_member_parser = subparsers.add_parser(
+        "delete-member",
+        help=(
+            "Revoke a member's WHOOP grant upstream (DELETE /v2/user/access) and forget "
+            "the local token and principal link (#30). Deliberately CLI-only: the "
+            "underlying primitive, Authenticator.revoke_and_forget, is never registered "
+            "as an MCP tool -- see its own docstring for why."
+        ),
+    )
+    delete_member_parser.add_argument(
+        "--whoop-user-id",
+        type=int,
+        required=True,
+        help=(
+            "Must match the WHOOP member id already linked in principal_members -- a "
+            "confirmation guard against operator error, not a selector among several "
+            "grants: there is exactly one live grant per process today."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     # stderr, never stdout: on stdio transport stdout carries the JSON-RPC
@@ -51,9 +76,6 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-
-    from whoopmcp.config import Config
-    from whoopmcp.server import build_server
 
     # Validate up front rather than leaving it to the lifespan. Once the
     # server is running the lifespan executes inside an anyio task group,
@@ -66,6 +88,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"whoopmcp: {exc}", file=sys.stderr)
         return 2
 
+    if args.command == "delete-member":
+        return _delete_member(config, args.whoop_user_id)
+
+    from whoopmcp.server import build_server
+
     transport = args.transport if args.transport is not None else config.transport
     host = args.host if args.host is not None else config.http_host
     port = args.port if args.port is not None else config.http_port
@@ -77,6 +104,50 @@ def main(argv: list[str] | None = None) -> int:
             build_server().run(transport="stdio")
     except KeyboardInterrupt:  # pragma: no cover
         return 130
+    return 0
+
+
+def _delete_member(config: Config, whoop_user_id: int) -> int:
+    """Handle ``whoopmcp delete-member --whoop-user-id N``.
+
+    The only caller of ``Authenticator.revoke_and_forget`` anywhere in this
+    codebase -- that primitive is not, and must never become, an MCP tool
+    (see its own docstring for why); this CLI subcommand is the operator's
+    one way to trigger it. Deletes the local token, calls WHOOP's
+    ``DELETE /v2/user/access`` so the grant is revoked upstream rather than
+    merely forgotten, and removes the local principal link. Health data,
+    webhook events, and audit rows are untouched -- that is #32's job, not
+    this one's.
+    """
+    from whoopmcp.auth import Authenticator, AuthError
+    from whoopmcp.store import (
+        delete_principal_links_for_member,
+        open_store,
+        principal_is_linked_to_member,
+    )
+
+    conn = open_store(config.cache_path)
+    try:
+        if not principal_is_linked_to_member(conn, whoop_user_id):
+            # Refuse rather than silently no-op-succeed: a mismatched id is
+            # far more likely to be operator error than an intentional
+            # deletion of a member with nothing linked to it.
+            print(
+                f"whoopmcp: no principal is linked to whoop-user-id {whoop_user_id}",
+                file=sys.stderr,
+            )
+            return 2
+
+        auth = Authenticator(config)
+        try:
+            asyncio.run(auth.revoke_and_forget())
+        except AuthError as exc:
+            print(f"whoopmcp: {exc}", file=sys.stderr)
+            return 1
+
+        delete_principal_links_for_member(conn, whoop_user_id)
+    finally:
+        conn.close()
     return 0
 
 

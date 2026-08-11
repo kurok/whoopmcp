@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import stat
@@ -15,8 +17,10 @@ import respx
 from whoopmcp.auth import (
     AUTHORIZE_URL,
     TOKEN_URL,
+    USER_ACCESS_URL,
     Authenticator,
     AuthError,
+    EncryptedFileTokenStore,
     FileTokenStore,
     Token,
     build_authorize_url,
@@ -589,3 +593,281 @@ async def test_refresh_lock_is_a_test_double_not_asyncio_lock(config: Config) ->
     assert result == "new-access"
     assert fake_lock.acquire_count == 1
     assert fake_lock.release_count == 1
+
+
+# -- envelope encryption at rest (issue #30) ---------------------------------
+#
+# EncryptedFileTokenStore does not exist yet. These tests specify: records
+# carry the key version they were sealed under; rotation re-seals lazily
+# (on the next load, not a forced bulk migration) with both the old and new
+# key coexisting in the environment for as long as that transition takes.
+
+
+def test_encrypted_file_store_round_trips(tmp_path: Path) -> None:
+    key = os.urandom(32)
+    store = EncryptedFileTokenStore(tmp_path / "token.json", keys={1: key}, current_version=1)
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    store.save(token)
+
+    assert store.load() == token
+
+
+def test_encrypted_file_store_never_writes_plaintext_token_to_disk(tmp_path: Path) -> None:
+    key = os.urandom(32)
+    path = tmp_path / "token.json"
+    store = EncryptedFileTokenStore(path, keys={1: key}, current_version=1)
+    token = Token("access-tok-marker", expires_at=1234.0, refresh_token="refresh-tok-marker")
+
+    store.save(token)
+
+    on_disk = path.read_text(encoding="utf-8")
+    assert "access-tok-marker" not in on_disk
+    assert "refresh-tok-marker" not in on_disk
+
+
+def test_encrypted_file_store_stamps_the_key_version_it_sealed_under(tmp_path: Path) -> None:
+    key = os.urandom(32)
+    path = tmp_path / "token.json"
+    store = EncryptedFileTokenStore(path, keys={1: key}, current_version=1)
+
+    store.save(Token("a", expires_at=1234.0, refresh_token="r"))
+
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["v"] == 1
+
+
+def test_encrypted_file_store_reseals_lazily_on_load_after_rotation(tmp_path: Path) -> None:
+    key_v1 = os.urandom(32)
+    key_v2 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+    assert json.loads(path.read_text(encoding="utf-8"))["v"] == 1
+
+    # v2 becomes current; both keys must be present in the environment for
+    # the duration of the transition -- no forced bulk re-encrypt pass.
+    rotated_store = EncryptedFileTokenStore(path, keys={1: key_v1, 2: key_v2}, current_version=2)
+    loaded = rotated_store.load()
+
+    assert loaded == token
+    # A read rewrites the record under the current version, lazily.
+    assert json.loads(path.read_text(encoding="utf-8"))["v"] == 2
+
+    # A second, still-v1 record elsewhere continues to load fine against the
+    # same two-key keyring -- both versions genuinely coexist.
+    other_path = tmp_path / "other-token.json"
+    EncryptedFileTokenStore(other_path, keys={1: key_v1}, current_version=1).save(token)
+    other_store = EncryptedFileTokenStore(
+        other_path, keys={1: key_v1, 2: key_v2}, current_version=2
+    )
+    assert other_store.load() == token
+
+
+def test_encrypted_file_store_is_empty_before_first_save(tmp_path: Path) -> None:
+    key = os.urandom(32)
+    store = EncryptedFileTokenStore(tmp_path / "token.json", keys={1: key}, current_version=1)
+
+    assert store.load() is None
+
+
+def test_encrypted_file_store_clear_removes_the_token(tmp_path: Path) -> None:
+    key = os.urandom(32)
+    store = EncryptedFileTokenStore(tmp_path / "token.json", keys={1: key}, current_version=1)
+    store.save(Token("a", expires_at=1234.0))
+
+    store.clear()
+
+    assert store.load() is None
+
+
+def test_encrypted_store_never_logs_key_or_plaintext_on_sealerror(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Encryption at rest is worthless if a decrypt failure logs the very
+    # material it was meant to protect. Corrupt the ciphertext on disk so
+    # load() must hit the auth-tag-failure path, and assert nothing sensitive
+    # reaches any log record produced along the way.
+    key = os.urandom(32)
+    path = tmp_path / "token.json"
+    refresh_marker = "super-secret-refresh-xyz-marker"
+    EncryptedFileTokenStore(path, keys={1: key}, current_version=1).save(
+        Token("a", expires_at=1234.0, refresh_token=refresh_marker)
+    )
+
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    ct = bytearray(base64.b64decode(on_disk["ct"]))
+    ct[0] ^= 0xFF
+    on_disk["ct"] = base64.b64encode(bytes(ct)).decode("ascii")
+    path.write_text(json.dumps(on_disk), encoding="utf-8")
+
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(AuthError):
+        EncryptedFileTokenStore(path, keys={1: key}, current_version=1).load()
+
+    assert refresh_marker not in caplog.text
+    assert base64.b64encode(key).decode("ascii") not in caplog.text
+    assert key.hex() not in caplog.text
+
+
+# -- no token material in logs, on every path (issue #30) --------------------
+#
+# Encryption at rest does not help if the process logs the plaintext on an
+# exception path -- this matters more than the cipher choice. Checked over
+# the full record text (message plus any exc_info-formatted traceback), not
+# just `record.message`, across the success, expiry-driven-refresh and
+# invalid_grant paths.
+
+
+async def test_no_token_material_in_logs_across_success_expiry_and_invalid_grant(
+    config: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    sentinel_access = "SENTINEL-ACCESS-TOKEN-abc123"
+    sentinel_refresh = "SENTINEL-REFRESH-TOKEN-xyz789"
+    sentinel_new_access = "SENTINEL-NEW-ACCESS-def456"
+    sentinel_new_refresh = "SENTINEL-NEW-REFRESH-ghi012"
+
+    caplog.set_level(logging.DEBUG)
+
+    auth = Authenticator(config)
+
+    # -- success: exchange_code ------------------------------------------
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": sentinel_access,
+                    "expires_in": 3600,
+                    "refresh_token": sentinel_refresh,
+                    "scope": "offline",
+                },
+            )
+        )
+        await auth.exchange_code("some-auth-code")
+
+    # -- expiry-driven refresh (renew) ------------------------------------
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": sentinel_new_access,
+                    "expires_in": 3600,
+                    "refresh_token": sentinel_new_refresh,
+                    "scope": "offline",
+                },
+            )
+        )
+        expiring = Token(
+            sentinel_access, expires_at=time.time() - 100, refresh_token=sentinel_refresh
+        )
+        await auth.refresh(expiring)
+
+    # -- invalid_grant -----------------------------------------------------
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "Refresh token is expired.",
+                },
+            )
+        )
+        dead = Token(
+            sentinel_new_access,
+            expires_at=time.time() - 100,
+            refresh_token=sentinel_new_refresh,
+        )
+        with pytest.raises(AuthError):
+            await auth.refresh(dead)
+
+    for sentinel in (
+        sentinel_access,
+        sentinel_refresh,
+        sentinel_new_access,
+        sentinel_new_refresh,
+    ):
+        # caplog.text is every captured record's message plus its formatted
+        # exc_info, concatenated -- the full record text, not only .message.
+        assert sentinel not in caplog.text
+        for record in caplog.records:
+            assert sentinel not in record.getMessage()
+            if record.exc_text:
+                assert sentinel not in record.exc_text
+
+
+# -- revoke-then-forget (issue #30) -------------------------------------------
+#
+# Deleting a member deletes the local token AND calls DELETE /v2/user/access
+# so the grant is revoked upstream rather than merely forgotten locally.
+# Deliberately NOT on client.py (whose own module docstring explains why the
+# MCP tool surface must never be able to reach this call) and NOT registered
+# as an MCP tool -- this lives only on the operator-initiated deletion path.
+
+
+@respx.mock
+async def test_revoke_and_forget_calls_delete_and_clears_local_token(config: Config) -> None:
+    store = FileTokenStore(config.token_path)
+    token = Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    store.save(token)
+
+    route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+
+    auth = Authenticator(config)
+    await auth.revoke_and_forget()
+
+    # Verified against the mock and the store, not merely "no exception was
+    # raised": the DELETE must have actually been made, and the local token
+    # must actually be gone afterward.
+    assert route.called
+    request = route.calls.last.request
+    assert request.headers["authorization"] == "Bearer access-tok"
+    assert FileTokenStore(config.token_path).load() is None
+
+
+@respx.mock
+async def test_revoke_and_forget_refreshes_an_expired_token_before_revoking(
+    config: Config,
+) -> None:
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": "renewed-access",
+                "expires_in": 3600,
+                "refresh_token": "renewed-refresh",
+                "scope": "offline",
+            },
+        )
+    )
+    delete_route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+
+    auth = Authenticator(config)
+    await auth.revoke_and_forget()
+
+    assert delete_route.called
+    assert delete_route.calls.last.request.headers["authorization"] == "Bearer renewed-access"
+    assert FileTokenStore(config.token_path).load() is None
+
+
+@respx.mock
+async def test_revoke_and_forget_raises_auth_error_without_leaking_the_token_on_failure(
+    config: Config,
+) -> None:
+    store = FileTokenStore(config.token_path)
+    store.save(Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok"))
+
+    respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(500))
+
+    auth = Authenticator(config)
+    with pytest.raises(AuthError) as exc_info:
+        await auth.revoke_and_forget()
+
+    assert "access-tok" not in str(exc_info.value)

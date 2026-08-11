@@ -55,7 +55,8 @@ def test_custom_scheme_redirect_uri_is_allowed() -> None:
 def test_unknown_token_backend_is_rejected() -> None:
     env = VALID_ENV | {"WHOOPMCP_TOKEN_BACKEND": "vault"}
 
-    with pytest.raises(ConfigError, match="file' or 'keyring"):
+    # 'encrypted-file' (#30) joined 'file'/'keyring' as a third valid value.
+    with pytest.raises(ConfigError, match="'file', 'keyring', or 'encrypted-file'"):
         Config.from_env(env)
 
 

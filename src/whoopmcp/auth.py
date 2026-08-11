@@ -17,6 +17,7 @@ import logging
 import os
 import secrets
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -25,9 +26,13 @@ from urllib.parse import urlencode
 import httpx
 
 from whoopmcp.config import Config
+from whoopmcp.crypto import SealError, seal, unseal
 
 AUTHORIZE_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
+#: The one non-GET endpoint WHOOP exposes to an OAuth client. Lives here,
+#: not in client.py -- see revoke_upstream's docstring for why.
+USER_ACCESS_URL = "https://api.prod.whoop.com/developer/v2/user/access"
 
 logger = logging.getLogger("whoopmcp.auth")
 
@@ -105,6 +110,23 @@ class TokenStore(Protocol):
     def clear(self) -> None: ...
 
 
+def _atomic_write_text(path: Path, contents: str) -> None:
+    """Write ``contents`` to ``path`` atomically, mode 0600.
+
+    Shared by ``FileTokenStore`` and ``EncryptedFileTokenStore`` so the
+    write-then-rename atomicity -- and the 0600 permissions that are the
+    whole point of both classes' promise -- exist in exactly one place.
+    Write-then-rename means a crash mid-write cannot truncate a good
+    record; creating the temp file 0600 means the secret is never
+    world-readable even for the instant before the rename.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_suffix(".tmp")
+    tmp.touch(mode=0o600, exist_ok=True)
+    tmp.write_text(contents, encoding="utf-8")
+    tmp.replace(path)
+
+
 class FileTokenStore:
     """Stores the token as JSON in the state directory, mode 0600.
 
@@ -146,14 +168,98 @@ class FileTokenStore:
                 self._path,
             )
 
-        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Write-then-rename so a crash mid-write cannot truncate a good token,
-        # and create the temp file 0600 so the secret is never world-readable
-        # even for the instant before the rename.
-        tmp = self._path.with_suffix(".tmp")
-        tmp.touch(mode=0o600, exist_ok=True)
-        tmp.write_text(token.to_json(), encoding="utf-8")
-        tmp.replace(self._path)
+        _atomic_write_text(self._path, token.to_json())
+
+    def clear(self) -> None:
+        self._path.unlink(missing_ok=True)
+
+
+class EncryptedFileTokenStore:
+    """Like ``FileTokenStore``, but the token is sealed (AES-256-GCM, via
+    ``crypto.seal``/``unseal``) before it touches disk, so what's actually
+    written is an envelope -- key version, nonce, ciphertext -- never the
+    plaintext ``Token`` JSON ``FileTokenStore`` writes.
+
+    Rotation is lazy, not big-bang: ``load`` re-seals a record under
+    ``current_version`` immediately after successfully reading one sealed
+    under an older version, so a record migrates to the new key the next
+    time it's read rather than needing a forced bulk pass. Both the old and
+    new key simply need to stay present in ``keys`` for as long as any
+    record sealed under the old one hasn't yet been read -- there is no
+    other downtime requirement.
+
+    This is a new, explicit ``token_backend`` value (``"encrypted-file"``)
+    rather than a change to plain ``"file"``, because it requires key
+    material ``"file"`` does not: an operator who wants it opts in by
+    setting the key env vars and flipping the backend.
+    """
+
+    _MODES_ENFORCED = os.name != "nt"
+
+    #: Bound into the AEAD tag so a sealed *token* envelope can never be
+    #: swapped for some other record type sealed with the same key and have
+    #: it still authenticate -- defense in depth beyond the key-version
+    #: binding crypto.seal already does on its own.
+    _ASSOCIATED_DATA = b"whoopmcp.token"
+
+    def __init__(self, path: Path, keys: Mapping[int, bytes], current_version: int) -> None:
+        self._path = path
+        self._keys = keys
+        self._current_version = current_version
+        self._warned = False
+
+    def load(self) -> Token | None:
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+
+        try:
+            envelope = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise AuthError(f"token file at {self._path} is unreadable: {exc}") from exc
+
+        try:
+            plaintext = unseal(envelope, self._keys, associated_data=self._ASSOCIATED_DATA)
+        except SealError as exc:
+            # SealError never carries the plaintext or the key (see
+            # crypto.unseal's own contract) -- neither does this message.
+            raise AuthError(f"token file at {self._path} failed to decrypt") from exc
+
+        try:
+            token = Token.from_json(plaintext.decode("utf-8"))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise AuthError(f"token file at {self._path} is unreadable: {exc}") from exc
+
+        if envelope.get("v") != self._current_version:
+            # Lazy rotation: this record was sealed under an older key
+            # version than the one now current. Re-seal it right away so
+            # every read after this one uses the new key -- no forced bulk
+            # re-encrypt pass, no downtime; the old key just needs to
+            # remain in `keys` until every such record has been touched
+            # once.
+            self.save(token)
+
+        return token
+
+    def save(self, token: Token) -> None:
+        if not self._MODES_ENFORCED and not self._warned:
+            self._warned = True
+            logger.warning(
+                "%s cannot be protected by file permissions on Windows; the sealed token "
+                "is readable by any process running as you, though its contents remain "
+                "encrypted. Set WHOOPMCP_TOKEN_BACKEND=keyring "
+                "(pip install 'whoopmcp[keyring]') to store it in the Windows Credential "
+                "Manager instead.",
+                self._path,
+            )
+        envelope = seal(
+            plaintext=token.to_json().encode("utf-8"),
+            keys=self._keys,
+            current_version=self._current_version,
+            associated_data=self._ASSOCIATED_DATA,
+        )
+        _atomic_write_text(self._path, json.dumps(envelope))
 
     def clear(self) -> None:
         self._path.unlink(missing_ok=True)
@@ -200,6 +306,20 @@ def build_store(config: Config) -> TokenStore:
     """Pick a token store based on configuration."""
     if config.token_backend == "keyring":
         return KeyringTokenStore()
+    if config.token_backend == "encrypted-file":
+        if config.token_encryption_key_version is None:
+            # Config.from_env() already refuses to produce a config with
+            # token_backend="encrypted-file" and no key version, so this
+            # only fires for a Config built by hand rather than from_env.
+            raise AuthError(
+                "token_backend='encrypted-file' requires token_encryption_key_version "
+                "and at least one entry in token_encryption_keys"
+            )
+        return EncryptedFileTokenStore(
+            config.token_path,
+            keys=config.token_encryption_keys,
+            current_version=config.token_encryption_key_version,
+        )
     return FileTokenStore(config.token_path)
 
 
@@ -250,6 +370,50 @@ def _is_invalid_grant(response: httpx.Response) -> bool:
     except ValueError:
         return False
     return isinstance(payload, dict) and payload.get("error") == "invalid_grant"
+
+
+def _supersedes(current: Token, token: Token) -> bool:
+    """Whether ``current`` (freshly read from the store) represents a
+    genuinely different grant than ``token`` (the caller's own copy) --
+    i.e. whether someone else has already won a refresh race `token`'s
+    caller is only now catching up to.
+
+    Compared by credential identity (access token + refresh token) rather
+    than full ``Token`` equality on purpose: ``expires_at`` is *expected*
+    to differ between a caller's about-to-expire copy and a genuinely
+    fresher store entry for the exact same grant, and a caller does not
+    always reconstruct ``scopes`` byte-for-byte. Comparing every field
+    would make this fire on a caller's own, not-yet-superseded token
+    purely because time has passed since they last read it; only the
+    credential itself changing means someone else has actually refreshed.
+    """
+    current_credential = (current.access_token, current.refresh_token)
+    token_credential = (token.access_token, token.refresh_token)
+    return current_credential != token_credential
+
+
+async def revoke_upstream(access_token: str, config: Config) -> None:
+    """``DELETE /v2/user/access``: revoke this grant on WHOOP's side.
+
+    client.py's own module docstring explains why ``WhoopClient`` deliberately
+    never calls this: revoking a grant is a decision a user makes for
+    themselves, through WHOOP's own settings, not something an LLM-driven
+    tool should be able to trigger. That reasoning holds for the MCP tool
+    surface -- it does NOT hold for an *operator*-initiated deletion, which
+    is the only caller of this function (via ``Authenticator
+    .revoke_and_forget``, itself only reachable from the ``delete-member``
+    CLI subcommand in ``__main__.py``, never a tool ``server.py`` registers).
+    Living here rather than on ``WhoopClient`` is what keeps this call out
+    of reach of the MCP tool surface, structurally -- not an oversight.
+    """
+    async with httpx.AsyncClient(timeout=config.request_timeout) as client:
+        response = await client.delete(
+            USER_ACCESS_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if not response.is_success:
+        # Never echo the request back -- that is where the bearer token lives.
+        raise AuthError(f"WHOOP user/access endpoint returned {response.status_code}")
 
 
 class RefreshLock(Protocol):
@@ -379,7 +543,7 @@ class Authenticator:
         await self._refresh_lock.acquire()
         try:
             current = self._store.load()
-            if current is not None and current != token and not current.expired:
+            if current is not None and not current.expired and _supersedes(current, token):
                 self._token = current
                 return current
             if self._inflight_refresh is None:
@@ -440,3 +604,23 @@ class Authenticator:
         self._store.clear()
         self._token = None
         self._pending_state = None
+
+    async def revoke_and_forget(self) -> None:
+        """Revoke this grant upstream, then forget the local token.
+
+        The operator-initiated counterpart to ``logout``: where ``logout``
+        only forgets, this also calls ``revoke_upstream`` first, so the
+        grant is actually revoked rather than merely no-longer-remembered
+        here. Deliberately unreachable from the MCP tool surface -- see
+        ``revoke_upstream``'s own docstring -- so its only caller is the
+        ``delete-member`` CLI subcommand (``__main__.py``), never a tool
+        ``server.py`` registers.
+
+        Refreshes first if the stored token is expired, since WHOOP's
+        revoke endpoint needs a live access token, not a dead one -- the
+        whole point of deleting a member is to kill the grant, not to fail
+        quietly because the access token had already expired.
+        """
+        access_token = await self.access_token()
+        await revoke_upstream(access_token, self._config)
+        self.logout()

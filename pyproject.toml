@@ -34,6 +34,12 @@ dependencies = [
     # on it) -- declared directly here too since server.py now imports it by
     # name for the /health and /ready routes (#27), not just through the SDK.
     "starlette>=1.0,<2",
+    # Already pulled in transitively by mcp -> pyjwt[crypto] -> cryptography
+    # (and by the keyring extra's own secretstorage on Linux) -- declared
+    # directly here too since crypto.py now imports it by name for AES-GCM
+    # envelope encryption of tokens at rest (#30). No new supply-chain
+    # surface: this makes an already-resolved indirect dependency explicit.
+    "cryptography>=42.0,<51",
 ]
 
 [project.optional-dependencies]

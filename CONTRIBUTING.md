@@ -36,6 +36,7 @@ mypy
 ```
 config.py            environment -> Config, validated once at startup
 auth.py              OAuth 2.0 flow + token storage
+crypto.py            envelope encryption primitive (AES-GCM, versioned keys); no auth/WHOOP knowledge
 client.py            one method per documented WHOOP endpoint, nothing more
 store.py             sqlite3 persistence: schema, migrations, per-user upserts and reads
 analysis.py          pure functions over already-fetched records
