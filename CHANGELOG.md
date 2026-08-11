@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #35: local mode stays a first-class, tested distribution. A new
+  `whoopmcp doctor` CLI subcommand (`__main__.py`, backed by a new
+  `doctor.py`) checks configuration, stored credentials, the local store,
+  and sync state in one pass, one sentence each, exiting non-zero if
+  anything needs attention and zero if it's all clean -- dispatched ahead
+  of `__main__.py`'s own up-front `Config.from_env()` call, since "missing
+  configuration" is one of doctor's own checks. The sync check reports
+  honestly that local mode has no scheduled incremental sync yet (#15 is
+  not merged) rather than judging staleness against a schedule that
+  doesn't exist. CI's `test` job matrix now documents -- with the empirical
+  verification behind it -- that every cell already covers both transport
+  modes in one run (`tests/test_http_transport.py` always exercises the real
+  streamable-http ASGI app; everything else always exercises the stdio
+  paths; a `WHOOPMCP_TRANSPORT` matrix axis was measured to produce
+  byte-identical per-test outcomes and deliberately NOT added, since it
+  would double the cell count while covering nothing). `docs/SETUP.md` now documents
+  the ten-authorised-member cap WHOOP places on every developer app
+  (confirmed with WHOOP), including your own, and the same live-fetch
+  freshness tradeoff `doctor`'s sync check reports.
 - `Authenticator.exchange_code`, `.refresh`, and `.access_token` now talk to WHOOP:
   form-encoded POSTs to the token endpoint wrapped into `Token` and persisted via
   the configured store, with `access_token()` refreshing an expired token automatically

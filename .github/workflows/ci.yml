@@ -37,6 +37,18 @@ jobs:
         # The two newest stable Python releases, matching requires-python.
         # Python has no LTS track; 3.13 and 3.14 are supported upstream until
         # 2029 and 2030 respectively.
+        #
+        # Both transport modes (#35) are covered by every cell of this matrix
+        # WITHOUT a transport axis, because the suite is mode-complete in one
+        # run: tests/test_http_transport.py always exercises the real
+        # streamable-http ASGI app (health/ready routes, a real MCP JSON-RPC
+        # exchange), and everything else always exercises the stdio-mode
+        # paths -- tests construct their own Config rather than reading an
+        # ambient WHOOPMCP_TRANSPORT, so an env-var axis was verified to
+        # produce byte-identical per-test outcomes in both settings (issue
+        # #35's review) and would only double this job's cell count while
+        # covering nothing. Local mode cannot silently rot mode-wise: its
+        # tests are unconditional, not gated behind a matrix value.
         python-version: ["3.13", "3.14"]
         os: [ubuntu-latest]
         # macOS and Windows are checked on the newest version only rather than

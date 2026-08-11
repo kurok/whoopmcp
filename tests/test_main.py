@@ -194,3 +194,47 @@ def test_delete_member_subcommand_refuses_a_mismatched_whoop_user_id(
     # still there -- a mismatched id must refuse, not silently no-op-succeed.
     assert not route.called
     assert FileTokenStore(config.token_path).load() is not None
+
+
+# -- doctor subcommand argparse wiring (issue #35) ---------------------------
+#
+# doctor takes no arguments (a zero-argument health check, unlike
+# delete-member/export-member/erase-member which all require
+# --whoop-user-id) and must run even when required config is missing --
+# see test_doctor.py for the diagnostic content itself; this only checks
+# that argparse recognises the subcommand and dispatches to it at all.
+
+
+def test_doctor_subcommand_is_recognised_by_argparse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    # Exit code is doctor's own business (see test_doctor.py); this test only
+    # asserts argparse dispatches "doctor" at all, rather than treating it as
+    # an unknown subcommand (argparse's own exit code for that is 2, the same
+    # code doctor itself never returns on a clean run -- so this alone would
+    # be an ambiguous assertion without test_doctor.py's own exit-code tests).
+    exit_code = main(["doctor"])
+
+    assert isinstance(exit_code, int)
+
+
+def test_doctor_subcommand_runs_before_config_validation_exits(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Missing configuration is itself one of doctor's own checks -- unlike
+    # every other subcommand, doctor must not be preempted by __main__.py's
+    # own up-front `Config.from_env()` call, which normally exits 2 before
+    # any subcommand dispatch runs at all.
+    for name in ("WHOOP_CLIENT_ID", "WHOOP_CLIENT_SECRET", "WHOOP_REDIRECT_URI"):
+        monkeypatch.delenv(name, raising=False)
+
+    main(["doctor"])
+
+    # Must reach doctor's own reporting rather than __main__.py's generic
+    # early exit: a bare "missing required environment variable" one-liner
+    # on stderr with no subcommand-specific framing would indicate the
+    # up-front Config.from_env() call intercepted it before doctor ran.
+    out = capsys.readouterr().out
+    assert "configuration" in out.lower()

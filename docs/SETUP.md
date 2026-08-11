@@ -32,8 +32,15 @@ through one registration.
    time. Consider *excluding* `read:profile`: it is the one scope carrying
    directly identifying information, and nothing here needs it.
 
-4. Register a **Redirect URL** (next section).
-5. Copy the **Client ID** and **Client Secret**.
+4. **Know the cap before you invite anyone else to use it.** Every WHOOP
+   developer app — including the one you just created — is limited to **ten
+   authorised members** (confirmed with WHOOP). That's a platform limit on
+   *your* app, not something this project imposes or can raise. It rarely
+   matters for a single-person local-mode install, but it surprises people
+   the moment they try to share one app registration across a household or a
+   small team.
+5. Register a **Redirect URL** (next section).
+6. Copy the **Client ID** and **Client Secret**.
 
 ## 2. Choose a redirect URI
 
@@ -121,6 +128,13 @@ Ask your client to run **`whoop_login`**. It returns a URL.
 `state` is verified against the pending login, so a code from a different
 flow is rejected. Confirm with **`whoop_auth_status`**.
 
+**On data freshness:** local mode has no scheduled incremental sync today —
+that's #15, and it hasn't merged yet. Every tool call fetches live from
+WHOOP rather than reading a background-refreshed cache, so there's no
+"stale cache" problem to worry about, at the cost of spending more of your
+app's shared rate-limit budget (see the `429` note below) on repeated
+fetches for the same data across a session.
+
 ## 5. Try it
 
 > "What was my average recovery over the last two weeks?"
@@ -161,3 +175,8 @@ requests per collection.
 **A tool raises `NotImplementedError`** — expected in 0.1.x. The scaffold is
 published; the internals are not implemented yet. The error names the issue
 tracking it, and the [roadmap](../README.md#roadmap) lists them.
+
+**Not sure what's actually wrong?** Run `whoopmcp doctor`. It checks your
+configuration, stored credentials, the local store, and sync state in one
+pass and reports each in a sentence, exiting non-zero if anything needs
+attention.
