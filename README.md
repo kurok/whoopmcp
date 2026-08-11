@@ -113,6 +113,7 @@ via `whoop_complete_login`.
 | `WHOOPMCP_TOKEN_BACKEND` | no | `file` | `file` or `keyring` |
 | `WHOOPMCP_STATE_DIR` | no | `~/.local/state/whoopmcp` | Token and cache location |
 | `WHOOPMCP_CACHE` | no | `false` | Cache responses on disk |
+| `WHOOPMCP_BACKFILL_FLOOR_DATE` | no | — | ISO 8601 lower bound for `whoopmcp backfill`; unset walks until history is exhausted |
 | `WHOOPMCP_TIMEOUT` | no | `30` | Per-request timeout, seconds |
 
 The `offline` scope is requested by default. Without it WHOOP issues no

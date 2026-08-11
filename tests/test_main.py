@@ -238,3 +238,91 @@ def test_doctor_subcommand_runs_before_config_validation_exits(
     # up-front Config.from_env() call intercepted it before doctor ran.
     out = capsys.readouterr().out
     assert "configuration" in out.lower()
+
+
+# -- backfill subcommand (issue #14) -----------------------------------------
+#
+# Like delete-member/export-member/erase-member/enforce-retention, backfill
+# is deliberately CLI-only (#30/#32's operator-only precedent) and gated on
+# the persistent store actually being enabled: PRIVACY.md promises the store
+# is "off by default; only written if you set WHOOPMCP_CACHE=true", and
+# backfill is the first bulk writer that would otherwise break that promise.
+
+
+def test_backfill_subcommand_refuses_when_cache_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    monkeypatch.delenv("WHOOPMCP_CACHE", raising=False)
+
+    with respx.mock:
+        exit_code = main(["backfill", "--whoop-user-id", "42"])
+        # Refused before any network traffic: no route was ever needed.
+        assert respx.calls.call_count == 0
+
+    assert exit_code == 2
+    err = capsys.readouterr().err
+    # The refusal must tell the operator exactly which knob to turn.
+    assert "WHOOPMCP_CACHE" in err
+    assert "Traceback" not in err
+
+
+def test_backfill_subcommand_refuses_an_unlinked_whoop_user_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Same confirmation guard as delete-member: --whoop-user-id must match
+    # the member already linked in principal_members ("the user is an
+    # argument, never ambient"), never name an arbitrary id.
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("WHOOPMCP_CACHE", "true")
+
+    with respx.mock:
+        exit_code = main(["backfill", "--whoop-user-id", "999"])
+        assert respx.calls.call_count == 0
+
+    assert exit_code == 2
+    assert "999" in capsys.readouterr().err
+
+
+def test_backfill_subcommand_runs_backfill_for_a_linked_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("WHOOPMCP_CACHE", "true")
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config
+
+    config = Config.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    conn.close()
+
+    recorded: dict[str, object] = {}
+
+    async def fake_run_backfill(
+        conn: object, client: object, config: object, whoop_user_id: int
+    ) -> dict[str, int]:
+        del conn, client, config
+        recorded["whoop_user_id"] = whoop_user_id
+        return {"recoveries": 0, "sleeps": 0, "cycles": 3, "workouts": 0}
+
+    monkeypatch.setattr("whoopmcp.backfill.run_backfill", fake_run_backfill)
+
+    exit_code = main(["backfill", "--whoop-user-id", "42"])
+
+    assert exit_code == 0
+    assert recorded["whoop_user_id"] == 42
+    captured = capsys.readouterr()
+    # The summary goes to stderr, never stdout: on stdio transport stdout
+    # carries JSON-RPC framing, and no sibling subcommand writes there either.
+    assert captured.out == ""
+    assert "cycles" in captured.err
+    # No token value on any output path.
+    assert "access-tok" not in captured.err
+    assert "refresh-tok" not in captured.err

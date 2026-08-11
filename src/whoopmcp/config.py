@@ -12,6 +12,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -92,6 +93,12 @@ class Config:
         token_encryption_key_version: Which version in
             `token_encryption_keys` new writes seal under. Only meaningful
             alongside `token_backend == "encrypted-file"`.
+        backfill_floor_date: Inclusive lower bound for `whoopmcp backfill`
+            (#14), an ISO 8601 date or datetime string passed straight
+            through as the WHOOP API's own `start` parameter. Unset (the
+            default) means no floor: walk until history is exhausted. Kept
+            as a string because `client.build_collection_params` and the
+            store's convention throughout is ISO strings, not datetimes.
     """
 
     client_id: str
@@ -111,6 +118,7 @@ class Config:
     webhook_timestamp_skew_seconds: float = 300.0
     token_encryption_keys: Mapping[int, bytes] = field(default_factory=dict)
     token_encryption_key_version: int | None = None
+    backfill_floor_date: str | None = None
 
     @property
     def token_path(self) -> Path:
@@ -176,6 +184,19 @@ class Config:
             else _default_state_dir()
         )
 
+        # Validated up front, like the redirect_uri and token-backend checks
+        # above: a malformed floor should fail at startup naming the
+        # variable, not partway through a multi-minute backfill.
+        backfill_floor_date = src.get("WHOOPMCP_BACKFILL_FLOOR_DATE") or None
+        if backfill_floor_date is not None:
+            try:
+                datetime.fromisoformat(backfill_floor_date)
+            except ValueError as exc:
+                raise ConfigError(
+                    "WHOOPMCP_BACKFILL_FLOOR_DATE must be an ISO 8601 date or "
+                    f"datetime, got {backfill_floor_date!r}"
+                ) from exc
+
         return cls(
             client_id=src["WHOOP_CLIENT_ID"],
             client_secret=src["WHOOP_CLIENT_SECRET"],
@@ -196,6 +217,7 @@ class Config:
             ),
             token_encryption_keys=token_encryption_keys,
             token_encryption_key_version=token_encryption_key_version,
+            backfill_floor_date=backfill_floor_date,
         )
 
 

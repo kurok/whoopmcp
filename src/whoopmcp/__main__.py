@@ -139,6 +139,30 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    backfill_parser = subparsers.add_parser(
+        "backfill",
+        help=(
+            "Resumable, throttled history import (#14): walks every collection "
+            "newest-first at BACKFILL priority into the persistent store, "
+            "checkpointing into sync_state after every committed page so an "
+            "interrupted run resumes exactly where it stopped. Honours "
+            "WHOOPMCP_BACKFILL_FLOOR_DATE and requires WHOOPMCP_CACHE=true. "
+            "Deliberately CLI-only, never an MCP tool -- a tool call that blocks "
+            "for a minute is a broken tool call, per #30/#32's operator-only "
+            "precedent."
+        ),
+    )
+    backfill_parser.add_argument(
+        "--whoop-user-id",
+        type=int,
+        required=True,
+        help=(
+            "Must match the WHOOP member id already linked in principal_members -- a "
+            "confirmation guard against operator error, not a selector among several "
+            "grants: there is exactly one live grant per process today."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     # stderr, never stdout: on stdio transport stdout carries the JSON-RPC
@@ -175,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         return _erase_member(config, args.whoop_user_id)
     if args.command == "enforce-retention":
         return _enforce_retention(config, args.max_age_days)
+    if args.command == "backfill":
+        return _backfill(config, args.whoop_user_id)
 
     from whoopmcp.server import build_server
 
@@ -387,6 +413,62 @@ def _doctor() -> int:
         if not check.ok:
             all_ok = False
     return 0 if all_ok else 1
+
+
+def _backfill(config: Config, whoop_user_id: int) -> int:
+    """Handle ``whoopmcp backfill --whoop-user-id N`` (#14).
+
+    Refuses -- before opening anything -- unless ``config.cache_enabled`` is
+    set: PRIVACY.md promises the persistent store is off by default, and
+    backfill is the first bulk writer that would otherwise break that
+    promise. Guards with the same ``principal_is_linked_to_member`` refusal
+    ``_delete_member`` uses ("the user is an argument, never ambient" -- the
+    id is explicit and verified against the login-written link, never
+    inferred), then runs ``backfill.run_backfill`` and prints a one-line
+    per-entity summary to stderr -- never stdout, never a token value.
+    """
+    from whoopmcp import backfill as backfill_module
+    from whoopmcp.auth import Authenticator, AuthError
+    from whoopmcp.client import WhoopAPIError, WhoopClient
+    from whoopmcp.store import open_store, principal_is_linked_to_member
+
+    if not config.cache_enabled:
+        print(
+            "whoopmcp: backfill requires the persistent store, which is off by "
+            "default; set WHOOPMCP_CACHE=true to enable it (see PRIVACY.md)",
+            file=sys.stderr,
+        )
+        return 2
+
+    conn = open_store(config.cache_path)
+    try:
+        if not principal_is_linked_to_member(conn, whoop_user_id):
+            print(
+                f"whoopmcp: no principal is linked to whoop-user-id {whoop_user_id}",
+                file=sys.stderr,
+            )
+            return 2
+
+        auth = Authenticator(config)
+
+        async def _run() -> dict[str, int]:
+            async with WhoopClient(config, auth) as client:
+                return await backfill_module.run_backfill(conn, client, config, whoop_user_id)
+
+        try:
+            imported = asyncio.run(_run())
+        except (AuthError, WhoopAPIError) as exc:
+            print(f"whoopmcp: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+    summary = ", ".join(f"{entity}={count}" for entity, count in sorted(imported.items()))
+    print(
+        f"whoopmcp: backfill finished for whoop-user-id {whoop_user_id}: {summary}",
+        file=sys.stderr,
+    )
+    return 0
 
 
 if __name__ == "__main__":
