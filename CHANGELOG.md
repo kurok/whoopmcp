@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #24: `whoop_outliers(metric, start, end, z=2.0)` and
+  `whoop_streaks(metric, start, end, threshold, direction)`. Two new pure
+  `analysis.py` functions back them: `rolling_z_scores` (a rolling, not
+  global, z-score per day -- a genuine sustained shift in the metric does
+  not read as a month of anomalies) and `find_streaks` (maximal
+  consecutive-day runs above/below a threshold). `rolling_z_scores` borrows
+  `_rolling_means`' own gap-aware "current run of coverage" rule (#22) but
+  never drops a day: every warm-up day is tagged `unscored_reason ==
+  "warm_up"` and reported under `whoop_outliers`' own `warmup_days`, rather
+  than silently absent -- a dropped day reads as a normal one. The tool's
+  own outlier *decision* for each warmed-up day scores it against a local
+  neighbourhood of up to 14 measured points on each side (`context_window`,
+  a new pure helper, at a bigger radius than its own display use below)
+  rather than that same trailing window: a strictly-causal window starves
+  on sparse coverage (two points 13 days apart, just inside a 14-day
+  window, can never produce |z| >= 2 by construction, regardless of how
+  extreme the value is), while a wider *trailing* window would instead
+  make the seasonal-drift acceptance test's own transition period
+  over-flag. Each outlier carries up to 3 nearest-measured-neighbour
+  context days either side (`context_window` again, truncated correctly at
+  the range's own edges) and, for that day only, whichever of the other 5
+  friendly metrics have a value that day -- 5 extra `store.get_metric_series`
+  calls total, never one per outlier. `find_streaks` enumerates every
+  calendar day in the requested range (not just measured ones), classifying
+  each `DayStatus` as `"missing"` (no scored record at all -- e.g. the
+  strap wasn't worn), `"failing"` (measured, does not meet the
+  threshold/direction), or `"passing"`; both `"missing"` and `"failing"`
+  end a streak with no bridging logic, and the full `days` list is
+  returned alongside `streaks` so a caller who disagrees with "missing
+  breaks a streak" can reconstruct the alternate interpretation itself --
+  the issue's own Notes leave that judgement call to the caller, not this
+  tool. `direction` is `"above"` (`value >= threshold`) or `"below"`
+  (`value <= threshold`), both inclusive of the threshold itself. Both
+  tools source their metric via #20's own `store.get_metric_series`/
+  `_resolve_metric_timeseries_source`, never a live fetch or a raw-record
+  refetch, and never raise `InsufficientDataError` -- an empty or
+  single-day range degrades to a coherent, empty-but-honest response
+  rather than refusing, a deliberate departure from `metric_trend`/
+  `correlate`'s "refuse below N" convention. Registered with the full
+  `coverage`/`range_coverage` envelope (#16's own convention), not #20's
+  token-cost exception. New `context_budget.TOOL_CEILINGS` entries for
+  both, measured against their own worst-case fixtures in
+  `tests/test_context_budget.py`.
 - Issue #20: `whoop_timeseries(metric, start, end, granularity="day")` --
   one tool replacing per-entity `list_*` calls for "how has X trended"
   questions, returning a flat `[{date, value}, ...]` series with the unit

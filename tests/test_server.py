@@ -59,6 +59,8 @@ EXPECTED_TOOLS = {
     "correlate_metrics",
     "compare_periods",
     "whoop_timeseries",
+    "whoop_outliers",
+    "whoop_streaks",
 }
 
 #: The only tools allowed to change anything. Everything else is a read.
@@ -1947,6 +1949,8 @@ _PRINCIPAL_GATED_TOOLS = {
     "correlate_metrics",
     "compare_periods",
     "whoop_timeseries",
+    "whoop_outliers",
+    "whoop_streaks",
 }
 
 

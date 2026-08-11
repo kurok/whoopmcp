@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -12,15 +12,19 @@ from whoopmcp.analysis import (
     Correlation,
     InsufficientDataError,
     LagResult,
+    RollingPoint,
     Summary,
     Trend,
+    context_window,
     correlate,
     correlate_lag_sweep,
     extract_metric,
+    find_streaks,
     linear_slope,
     mean,
     median,
     pearson,
+    rolling_z_scores,
     spearman,
     standardized_effect_size,
     stdev,
@@ -1132,3 +1136,363 @@ def test_trend_constant_value_series_raises_insufficient_data_error() -> None:
     ]
     with pytest.raises(InsufficientDataError, match=r"constant|insufficient"):
         trend(records, "recovery_score")
+
+
+# ===========================================================================
+# Issue #24: rolling_z_scores, context_window, find_streaks
+#
+# Written before the implementation exists -- every test below is expected
+# to fail (ImportError on the names this file's own import block above now
+# requests, or a plain assertion failure) until #24 lands. These are pure
+# functions over already day-deduplicated ``RollingPoint`` sequences, same
+# as ``_rolling_means`` -- no records, no store, no respx needed here (that
+# lives in tests/test_whoop_outliers.py and tests/test_whoop_streaks.py).
+# ===========================================================================
+
+
+def _daily_points(start: date, values: list[float]) -> list[RollingPoint]:
+    """A day-deduplicated RollingPoint series: one point per consecutive
+    calendar day starting at ``start``, values taken in order."""
+    return [
+        RollingPoint(date=(start + timedelta(days=i)).isoformat(), value=v)
+        for i, v in enumerate(values)
+    ]
+
+
+def _gapped_points(days: list[int], values: list[float], base: date) -> list[RollingPoint]:
+    """A RollingPoint series at explicit (possibly non-consecutive) day
+    offsets from ``base`` -- for building deliberate coverage gaps."""
+    return [
+        RollingPoint(date=(base + timedelta(days=d)).isoformat(), value=v)
+        for d, v in zip(days, values, strict=True)
+    ]
+
+
+# -- rolling_z_scores: known anomaly on an otherwise-flat series -----------
+
+
+def test_rolling_z_scores_flags_a_known_anomaly() -> None:
+    """One deliberate spike inserted into an otherwise-flat 30-day series.
+
+    The spike day itself must cross |z| >= 2; every other post-warm-up day
+    (including days immediately adjacent to the spike, whose own windows
+    are pulled slightly by it) must not.
+    """
+    values = [50.0] * 30
+    values[20] = 90.0
+    daily = _daily_points(date(2026, 1, 1), values)
+
+    result = rolling_z_scores(daily, window_days=7)
+    assert len(result) == 30
+
+    spike = result[20]
+    assert spike.unscored_reason is None
+    assert spike.z_score is not None
+    assert abs(spike.z_score) >= 2.0
+
+    # Neighbouring and distant normal days (all past the 6-day warm-up)
+    # must not be flagged, even the ones whose own trailing window still
+    # contains the spike value.
+    for i in (10, 18, 19, 21, 22, 29):
+        point = result[i]
+        assert point.unscored_reason is None, f"index {i} unexpectedly unscored"
+        assert point.z_score is not None
+        assert abs(point.z_score) < 2.0, f"index {i} was flagged but is not the anomaly"
+
+
+def test_rolling_z_scores_does_not_flag_a_slow_seasonal_drift() -> None:
+    """A genuine, sustained level shift ("a slow seasonal drift") over the
+    last 30 days of a 180-day series must not read as a month of outliers
+    under a ROLLING z-score, even though a naive GLOBAL mean/stdev
+    computed over the whole series -- calculated inline right here, not
+    just asserted about -- flags nearly every one of those 30 days.
+
+    This is the acceptance criterion's own discriminating test: it proves
+    the CONTRAST between a global and a rolling approach on one shared
+    fixture, not just that the rolling result looks quiet in isolation.
+    """
+    baseline = [50.0] * 150
+    shifted = [65.0] * 30
+    values = baseline + shifted
+    daily = _daily_points(date(2026, 1, 1), values)
+
+    # -- the naive, global comparison this test exists to discredit --
+    global_mean = mean(values)
+    global_stdev = stdev(values)
+    global_z = [(v - global_mean) / global_stdev for v in values]
+    shift_global_z = global_z[150:]
+    flagged_global = sum(1 for z in shift_global_z if abs(z) >= 2.0)
+    # The shifted month is a small, well-separated minority of the whole
+    # series, so its global z-score sits above 2 for essentially all of it --
+    # a global check would read the new, stable normal as a month-long
+    # anomaly.
+    assert flagged_global >= 25, (
+        f"fixture is not actually discriminating: only {flagged_global}/30 shifted days "
+        "would be flagged by a naive global z-score; the fixture needs a starker split"
+    )
+
+    # -- the rolling result this acceptance criterion is actually about --
+    result = rolling_z_scores(daily, window_days=7)
+    shift_rolling = result[150:]
+    flagged_rolling = [r for r in shift_rolling if r.z_score is not None and abs(r.z_score) >= 2.0]
+    # At most the single transition day (the window still mostly full of
+    # the old baseline) may legitimately read as a change point -- the
+    # other 29 days, once the window has re-adapted to the new normal,
+    # must not be flagged. "Does not flag every day" is the literal
+    # acceptance criterion; this asserts far fewer than "every day", and
+    # far fewer than the global comparison above.
+    assert len(flagged_rolling) <= 2
+    assert len(flagged_rolling) < flagged_global
+
+    # Deep into the shifted regime the rolling window has fully readjusted:
+    # z should sit near zero, not near the global comparison's ~2.2.
+    deep_shift = result[170]
+    assert deep_shift.z_score is not None
+    assert abs(deep_shift.z_score) < 1.0
+
+
+def test_rolling_z_scores_tags_warmup_days_as_unscored_not_dropped() -> None:
+    """The first (window_days - 1) days carry unscored_reason == "warm_up"
+    with mean/stdev/z_score all None -- reported, never absent from the
+    result at all."""
+    window_days = 5
+    values = [50.0 + i for i in range(10)]
+    daily = _daily_points(date(2026, 2, 1), values)
+
+    result = rolling_z_scores(daily, window_days=window_days)
+    assert len(result) == len(daily) == 10
+
+    for i in range(window_days - 1):
+        point = result[i]
+        assert point.unscored_reason == "warm_up", f"index {i} should be tagged warm_up"
+        assert point.rolling_mean is None
+        assert point.rolling_stdev is None
+        assert point.z_score is None
+
+    for i in range(window_days - 1, 10):
+        point = result[i]
+        assert point.unscored_reason is None
+        assert point.z_score is not None
+
+
+def test_rolling_z_scores_resets_warmup_after_a_long_gap() -> None:
+    """Mirrors _rolling_means' own gap-reset test (tests/test_analysis.py's
+    test_trend_rolling_windows_computed_by_date_not_row_count) but for this
+    new function: a gap >= window_days resets the warm-up clock, and every
+    day the old function would have silently DROPPED for still being
+    within a post-gap warm-up must instead appear here, tagged "warm_up".
+    """
+    base_date = date(2026, 8, 1)
+    days = list(range(5)) + list(range(24, 34))
+    values = [50.0 + i for i in range(5)] + [50.0 + (i - 24) for i in range(24, 34)]
+    daily = _gapped_points(days, values, base_date)
+
+    result = rolling_z_scores(daily, window_days=7)
+    assert len(result) == len(daily) == 15
+
+    # Pre-gap cluster (indices 0-4, days 0-4): only 5 days, never reaches a
+    # full 7-day window on its own.
+    for i in range(5):
+        assert result[i].unscored_reason == "warm_up", f"pre-gap index {i} should be warm_up"
+
+    # Post-gap indices 5-10 (days 24-29): the gap (19 days, >= window_days)
+    # resets the clock, so these must be tagged warm_up rather than either
+    # silently dropped (the old _rolling_means behaviour) or scored from
+    # pre-gap history that could never legitimately reach them.
+    for i in range(5, 11):
+        assert result[i].unscored_reason == "warm_up", (
+            f"post-gap index {i} (day {days[i]}) should be warm_up -- the gap must reset the clock"
+        )
+
+    # Index 11 (day 30) is the first point with a genuine 7-day post-gap
+    # window [24, 30], values 50..56 -- computed only from post-gap history.
+    first_scored = result[11]
+    assert first_scored.unscored_reason is None
+    assert first_scored.rolling_mean == pytest.approx(mean([50.0 + i for i in range(7)]), abs=0.01)
+    assert first_scored.z_score is not None
+
+
+def test_rolling_z_scores_zero_variance_window_is_not_an_outlier() -> None:
+    """A perfectly flat window (rolling_stdev == 0) defines z_score as 0.0
+    -- "no deviation to score against, not an outlier by construction" --
+    rather than raising or producing inf/NaN."""
+    daily = _daily_points(date(2026, 3, 1), [50.0] * 10)
+    result = rolling_z_scores(daily, window_days=5)
+    for point in result[4:]:
+        assert point.unscored_reason is None
+        assert point.rolling_stdev == 0.0
+        assert point.z_score == 0.0
+
+
+# -- context_window: nearest-measured-neighbours, truncated at the edges ---
+
+
+def test_context_window_truncates_at_sequence_edges() -> None:
+    """index=0 and index=len-1 on a short series: context comes back
+    shorter than the radius on the side that runs off the sequence,
+    rather than raising or padding."""
+    daily = _daily_points(date(2026, 3, 1), [10.0, 20.0, 30.0, 40.0, 50.0])
+
+    before, after = context_window(daily, index=0, radius=3)
+    assert before == []
+    assert [p.value for p in after] == [20.0, 30.0, 40.0]
+
+    before, after = context_window(daily, index=4, radius=3)
+    assert [p.value for p in before] == [20.0, 30.0, 40.0]
+    assert after == []
+
+
+def test_context_window_middle_of_range_returns_full_radius() -> None:
+    """Control case: radius genuinely available on both sides."""
+    daily = _daily_points(date(2026, 3, 1), [float(i) for i in range(10)])
+
+    before, after = context_window(daily, index=5, radius=3)
+    assert [p.value for p in before] == [2.0, 3.0, 4.0]
+    assert [p.value for p in after] == [6.0, 7.0, 8.0]
+
+
+# -- find_streaks: both directions, and missing vs. failing ----------------
+
+
+def test_find_streaks_above_and_below() -> None:
+    """A fixture with one clear high-run and one clear low-run of known
+    length/mean; direction="above" finds the high-run, direction="below"
+    finds the low-run."""
+    daily = (
+        _daily_points(date(2026, 1, 1), [80.0] * 5)
+        + _daily_points(date(2026, 1, 6), [50.0] * 5)
+        + _daily_points(date(2026, 1, 11), [20.0] * 5)
+        + _daily_points(date(2026, 1, 16), [50.0] * 5)
+    )
+
+    _, above_streaks = find_streaks(
+        daily,
+        threshold=70.0,
+        direction="above",
+        range_start="2026-01-01",
+        range_end="2026-01-20",
+    )
+    assert len(above_streaks) == 1
+    high = above_streaks[0]
+    assert high.direction == "above"
+    assert high.start == "2026-01-01"
+    assert high.end == "2026-01-05"
+    assert high.length == 5
+    assert high.mean == pytest.approx(80.0)
+
+    _, below_streaks = find_streaks(
+        daily,
+        threshold=30.0,
+        direction="below",
+        range_start="2026-01-01",
+        range_end="2026-01-20",
+    )
+    assert len(below_streaks) == 1
+    low = below_streaks[0]
+    assert low.direction == "below"
+    assert low.start == "2026-01-11"
+    assert low.end == "2026-01-15"
+    assert low.length == 5
+    assert low.mean == pytest.approx(20.0)
+
+
+def test_find_streaks_distinguishes_missing_from_failing() -> None:
+    """One calendar day genuinely absent from ``daily`` (missing) and one
+    present-but-failing day, both inside what would otherwise be one
+    8-day passing run. Asserts DayStatus.status differs ("missing" vs
+    "failing"), DayStatus.value differs (None vs not-None), and both
+    correctly terminate the streak -- the literal acceptance-criterion
+    test."""
+    daily = (
+        _daily_points(date(2026, 4, 1), [80.0] * 3)  # 04-01..04-03: passing
+        # 2026-04-04 deliberately absent: missing, not measured.
+        + _daily_points(date(2026, 4, 5), [50.0])  # 04-05: measured, failing
+        + _daily_points(date(2026, 4, 6), [80.0] * 3)  # 04-06..04-08: passing
+    )
+
+    days, streaks = find_streaks(
+        daily,
+        threshold=70.0,
+        direction="above",
+        range_start="2026-04-01",
+        range_end="2026-04-08",
+    )
+    assert len(days) == 8
+    by_date = {d.date: d for d in days}
+
+    missing_day = by_date["2026-04-04"]
+    failing_day = by_date["2026-04-05"]
+    assert missing_day.status == "missing"
+    assert missing_day.value is None
+    assert failing_day.status == "failing"
+    assert failing_day.value == pytest.approx(50.0)
+    assert missing_day.status != failing_day.status
+
+    assert len(streaks) == 2
+    first, second = streaks
+    assert (first.start, first.end, first.length) == ("2026-04-01", "2026-04-03", 3)
+    assert first.mean == pytest.approx(80.0)
+    assert (second.start, second.end, second.length) == ("2026-04-06", "2026-04-08", 3)
+    assert second.mean == pytest.approx(80.0)
+
+
+def test_find_streaks_empty_and_single_day_ranges_do_not_raise() -> None:
+    """range_start > range_end, and range_start == range_end, in both
+    directions -- no exception, coherent (possibly empty) days/streaks."""
+    # Inverted range, no data at all.
+    for direction in ("above", "below"):
+        days, streaks = find_streaks(
+            [],
+            threshold=50.0,
+            direction=direction,
+            range_start="2026-05-10",
+            range_end="2026-05-01",
+        )
+        assert days == []
+        assert streaks == []
+
+    # Single-day range, one passing measured point.
+    daily = _daily_points(date(2026, 6, 1), [80.0])
+    days, streaks = find_streaks(
+        daily,
+        threshold=70.0,
+        direction="above",
+        range_start="2026-06-01",
+        range_end="2026-06-01",
+    )
+    assert len(days) == 1
+    assert days[0].status == "passing"
+    assert days[0].value == pytest.approx(80.0)
+    assert len(streaks) == 1
+    assert (streaks[0].start, streaks[0].end, streaks[0].length) == (
+        "2026-06-01",
+        "2026-06-01",
+        1,
+    )
+
+    # Single-day range, nothing measured at all: missing, not a crash.
+    days, streaks = find_streaks(
+        [],
+        threshold=70.0,
+        direction="above",
+        range_start="2026-06-02",
+        range_end="2026-06-02",
+    )
+    assert len(days) == 1
+    assert days[0].status == "missing"
+    assert days[0].value is None
+    assert streaks == []
+
+
+def test_find_streaks_rejects_invalid_direction() -> None:
+    """direction accepts exactly "above"/"below" -- anything else is a
+    ValueError that names both valid options, not a silent misinterpretation."""
+    with pytest.raises(ValueError, match="above") as exc_info:
+        find_streaks(
+            [],
+            threshold=50.0,
+            direction="sideways",  # type: ignore[arg-type]
+            range_start="2026-01-01",
+            range_end="2026-01-02",
+        )
+    assert "below" in str(exc_info.value)
