@@ -41,6 +41,7 @@ from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from whoopmcp import metrics
 from whoopmcp.config import Config
 
 logger = logging.getLogger("whoopmcp")
@@ -118,6 +119,24 @@ def verify_webhook_request(
     return _signature_matches(raw_body, timestamp_header, signature_header, client_secret)
 
 
+def _rejection_reason(
+    signature_header: str | None, timestamp_header: str | None, skew_seconds: float, *, now: float
+) -> str:
+    """Re-derive, for #31's counter only, which of `verify_webhook_request`'s
+    three checks failed -- that function itself collapses all three into one
+    `False`, by design, so the caller learns nothing from the response.
+
+    Neither branch here touches the signing secret or the raw body: the
+    reason an operator sees is never an oracle a forger could use, only the
+    generic `invalid_signature` response is (see the route handler).
+    """
+    if signature_header is None or timestamp_header is None:
+        return "missing_header"
+    if not _timestamp_within_skew(timestamp_header, skew_seconds, now=now):
+        return "stale_timestamp"
+    return "bad_signature"
+
+
 def register_webhook_routes(server: MCPServer[Any]) -> asyncio.Queue[bytes]:
     """Register ``POST /webhooks/whoop`` on ``server``, returning the queue it feeds.
 
@@ -164,6 +183,7 @@ def register_webhook_routes(server: MCPServer[Any]) -> asyncio.Queue[bytes]:
         raw_body = await request.body()
         signature_header = request.headers.get(SIGNATURE_HEADER)
         timestamp_header = request.headers.get(TIMESTAMP_HEADER)
+        now = time.time()
 
         if not verify_webhook_request(
             raw_body,
@@ -171,10 +191,20 @@ def register_webhook_routes(server: MCPServer[Any]) -> asyncio.Queue[bytes]:
             timestamp_header,
             config.client_secret,
             config.webhook_timestamp_skew_seconds,
+            now=now,
         ):
-            # Deliberately generic: no body, signature, secret, or even
-            # which check failed -- an unauthenticated caller gets nothing
-            # to help it iterate toward a forgery.
+            # #31: the reason is re-derived for the operator-facing counter
+            # only -- the response below stays the same generic body for
+            # every cause, so an unauthenticated caller gets nothing to help
+            # it iterate toward a forgery.
+            metrics.record_webhook_signature_failure(
+                _rejection_reason(
+                    signature_header,
+                    timestamp_header,
+                    config.webhook_timestamp_skew_seconds,
+                    now=now,
+                )
+            )
             logger.warning("webhook rejected: signature verification failed")
             return JSONResponse({"error": "invalid_signature"}, status_code=400)
 
@@ -182,6 +212,7 @@ def register_webhook_routes(server: MCPServer[Any]) -> asyncio.Queue[bytes]:
         # decode and process. Returning 200 now, before any outbound WHOOP
         # call, matters: WHOOP retries a slow endpoint, and a retry of
         # in-flight work is how duplicate processing starts.
+        metrics.record_webhook_accepted()
         await queue.put(raw_body)
         logger.info("webhook accepted and queued")
         return JSONResponse({"status": "accepted"}, status_code=200)

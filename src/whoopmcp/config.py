@@ -99,6 +99,19 @@ class Config:
             default) means no floor: walk until history is exhausted. Kept
             as a string because `client.build_collection_params` and the
             store's convention throughout is ISO strings, not datetimes.
+        metrics_token: Bearer token required on `/metrics` (#31). Unset (the
+            default) means the route 404s and exports nothing -- off unless
+            explicitly configured, the same precedent `webhooks_enabled`
+            establishes, since `/metrics` would otherwise hand per-member
+            health telemetry to anyone who can reach the port.
+        metrics_member_salt: HMAC key for deriving `/metrics`' opaque
+            `member_ref` label from a WHOOP user id (#31). Deliberately not
+            `client_secret`: that value is also the webhook signing secret,
+            so rotating it would silently reset every metrics time series at
+            the same moment it broke webhooks. Unset means every per-member
+            series is withheld entirely -- an unkeyed hash of a WHOOP user id
+            (a modest integer) would be reversible by enumeration in
+            seconds, which is not opaque, so there is no weaker fallback.
     """
 
     client_id: str
@@ -119,6 +132,8 @@ class Config:
     token_encryption_keys: Mapping[int, bytes] = field(default_factory=dict)
     token_encryption_key_version: int | None = None
     backfill_floor_date: str | None = None
+    metrics_token: str | None = None
+    metrics_member_salt: str | None = None
 
     @property
     def token_path(self) -> Path:
@@ -218,6 +233,8 @@ class Config:
             token_encryption_keys=token_encryption_keys,
             token_encryption_key_version=token_encryption_key_version,
             backfill_floor_date=backfill_floor_date,
+            metrics_token=src.get("WHOOPMCP_METRICS_TOKEN") or None,
+            metrics_member_salt=src.get("WHOOPMCP_METRICS_SALT") or None,
         )
 
 

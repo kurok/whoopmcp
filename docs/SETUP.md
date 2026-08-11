@@ -219,13 +219,56 @@ new or updated records the way #15's sync does.
 
 ### Per-user last-delivery time
 
-Every successfully-processed webhook delivery now advances a per-member
-"last delivered at" timestamp, recorded so a future alert (#31, not
-implemented here) can notice a member who has gone quiet relative to their
-*own* baseline -- a dead integration and a user on holiday look identical
-otherwise. There is no dedicated tool or check surfacing this yet; today it
-is visible only inside the document `whoopmcp export-member` produces, under
-`webhook_delivery_state`.
+Every successfully-processed webhook delivery advances a per-member "last
+delivered at" timestamp. Besides being visible inside the document
+`whoopmcp export-member` produces (under `webhook_delivery_state`), it now
+also backs `whoopmcp_webhook_last_delivery_age_seconds` on `/metrics` --
+see [Metrics](#7-metrics) below -- so a member who has gone quiet relative
+to their *own* baseline (a dead integration and a user on holiday look
+identical otherwise) can be alerted on rather than discovered by a support
+ticket.
+
+---
+
+## 7. Metrics
+
+`/metrics` (#31) exposes Prometheus-format observability: sync lag per
+member, webhook delivery silence (per member and fleet-wide), webhook
+signature-verification failure rate, WHOOP API 429s and remaining rate
+budget, and token refresh failures by cause with `invalid_grant` broken
+out. `ops/alerts.yml` ships one Prometheus alerting rule per alert the
+issue names, including a baseline (not a fixed threshold) for webhook
+silence.
+
+Off by default, same precedent as `WHOOPMCP_WEBHOOKS_ENABLED`:
+
+- `WHOOPMCP_METRICS_TOKEN` unset -> the route 404s and exports nothing.
+  Set it, and every request needs `Authorization: Bearer <token>`; a
+  missing or wrong token gets `401`.
+- `WHOOPMCP_METRICS_SALT` unset -> the token-gated endpoint still serves,
+  but every series labelled by member is withheld entirely, and
+  `whoopmcp_member_metrics_enabled` reads `0` so a dashboard can tell "salt
+  not configured" apart from "no members linked". Set it to a value that
+  is **not** `WHOOP_CLIENT_SECRET` -- that value is also the webhook
+  signing secret, so rotating it would silently reset every metrics series
+  at the same moment it broke webhooks (see the rotation notes above).
+  The per-member label itself (`member_ref`) is a keyed HMAC-SHA256 of the
+  WHOOP user id, never the id, an email, or an unsalted hash -- WHOOP ids
+  are modest integers, and an unsalted digest is reversible by enumeration
+  in seconds.
+
+Both require `WHOOPMCP_CACHE=true`: the gauges are read from the same
+persistent store every other cache-backed tool uses.
+
+Every worker process under a multi-worker streamable-http deployment holds
+its own counters; a single scrape only ever sees whichever worker answered
+it. There is no cross-process aggregation here, deliberately -- see
+`whoopmcp/metrics.py`'s own module docstring.
+
+The backfill queue depth and oldest-queued-job age the issue's Scope also
+asks for are not implemented: there is no backfill queue anywhere in this
+codebase to measure (`whoopmcp backfill` is a synchronous, CLI-invoked run
+with no persistent job record).
 
 ---
 

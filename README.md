@@ -115,6 +115,8 @@ via `whoop_complete_login`.
 | `WHOOPMCP_CACHE` | no | `false` | Cache responses on disk |
 | `WHOOPMCP_BACKFILL_FLOOR_DATE` | no | — | ISO 8601 lower bound for `whoopmcp backfill`; unset walks until history is exhausted |
 | `WHOOPMCP_TIMEOUT` | no | `30` | Per-request timeout, seconds |
+| `WHOOPMCP_METRICS_TOKEN` | no | — | Bearer token required on `/metrics` (#31); unset means the route 404s and exports nothing |
+| `WHOOPMCP_METRICS_SALT` | no | — | HMAC key for `/metrics`' opaque per-member label; unset means every per-member series is withheld |
 
 The `offline` scope is requested by default. Without it WHOOP issues no
 refresh token and you would re-authorise through a browser every hour.

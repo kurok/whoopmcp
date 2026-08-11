@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #31: a `/metrics` endpoint exposing Prometheus-format observability
+  for sync lag per member, webhook delivery silence (per member and
+  fleet-wide), webhook signature-verification failure rate, WHOOP API 429s
+  and remaining rate budget, and token refresh failures by cause (with
+  `invalid_grant` broken out) -- plus a matching `ops/alerts.yml` rules
+  file, one rule per alert the issue names. Off by default
+  (`WHOOPMCP_METRICS_TOKEN` unset -> 404, same as `webhooks_enabled`'s
+  precedent) and fails closed twice over: the endpoint requires a bearer
+  token compared with `hmac.compare_digest`, and every per-member series is
+  additionally withheld unless `WHOOPMCP_METRICS_SALT` is set, since an
+  unsalted hash of a WHOOP user id is reversible by enumeration and would
+  defeat the whole point of the `member_ref` label. Backfill queue depth
+  was in the issue's own Scope but is intentionally not implemented: there
+  is no backfill queue anywhere in this codebase (`backfill.py`'s
+  `run_backfill` is a synchronous, CLI-invoked run with no persistent job
+  record), and building one would be a substantial feature outside this
+  issue's scope.
 - Issue #26: three MCP prompts chaining the *analysis* tools rather than
   the raw data tools, so the model sees a composition worth imitating
   instead of an invitation to dump records -- `morning_readiness_briefing`
