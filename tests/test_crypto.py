@@ -13,6 +13,7 @@ import contextlib
 import os
 
 import pytest
+
 from whoopmcp.crypto import SealError, seal, unseal
 
 
