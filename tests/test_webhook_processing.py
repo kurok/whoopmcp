@@ -17,6 +17,7 @@ import contextlib
 import json
 import logging
 import sqlite3
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -1207,8 +1208,12 @@ class TestLastDeliveryTracking:
 
         # Advance the store's own clock deterministically, then deliver a
         # second, distinct event for the same user -- the recorded time must
-        # strictly advance, not merely "be set" a second time.
-        import whoopmcp.store as store_module
+        # strictly advance, not merely "be set" a second time. The module is
+        # already imported (via `from whoopmcp.store import open_store`
+        # above); fetched from sys.modules rather than a second `import
+        # whoopmcp.store` statement so this file uses exactly one import
+        # style per module.
+        store_module = sys.modules["whoopmcp.store"]
 
         later = "2099-01-01T00:00:00+00:00"
         monkeypatch.setattr(store_module, "_now", lambda: later)
