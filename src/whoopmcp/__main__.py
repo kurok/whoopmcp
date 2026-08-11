@@ -130,6 +130,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Delete rows older than this many days. Defaults to 730 (2 years).",
     )
 
+    subparsers.add_parser(
+        "doctor",
+        help=(
+            "Health check (#35): configuration, credentials, store reachability, and "
+            "sync state, one sentence each. Exits non-zero if anything is wrong, zero "
+            "if everything checked out clean. Takes no arguments."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     # stderr, never stdout: on stdio transport stdout carries the JSON-RPC
@@ -139,6 +148,13 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+    # doctor is dispatched ahead of the up-front Config.from_env() below,
+    # deliberately: "missing configuration" is itself one of doctor's own
+    # checks, so it must reach doctor's own reporting rather than being
+    # preempted by the generic exit-2 path every other subcommand relies on.
+    if args.command == "doctor":
+        return _doctor()
 
     # Validate up front rather than leaving it to the lifespan. Once the
     # server is running the lifespan executes inside an anyio task group,
@@ -349,6 +365,28 @@ def _enforce_retention(config: Config, max_age_days: int) -> int:
     summary = ", ".join(f"{table}={count}" for table, count in sorted(counts.items()))
     print(f"whoopmcp: retention enforced (max_age_days={max_age_days}): {summary}", file=sys.stderr)
     return 0
+
+
+def _doctor() -> int:
+    """Handle ``whoopmcp doctor`` (#35).
+
+    Prints one line per check to stdout -- plain, human-readable text, not
+    JSON: this is a terminal diagnostic an operator reads themselves, the
+    same audience ``enforce-retention``'s own plain summary targets. Exits 0
+    only if every check came back clean; 1 if any did not. Never 2 -- that
+    code is reserved for the bad-argument class of error the other
+    subcommands use, and doctor takes no arguments to get wrong.
+    """
+    from whoopmcp.doctor import run_checks
+
+    checks = run_checks()
+    all_ok = True
+    for check in checks:
+        status = "OK" if check.ok else "FAIL"
+        print(f"{check.name}: {status} - {check.message}")
+        if not check.ok:
+            all_ok = False
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
