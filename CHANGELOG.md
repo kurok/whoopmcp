@@ -371,6 +371,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #64: the webhook replay-window check parsed `X-WHOOP-Signature-Timestamp`
+  as unix seconds instead of WHOOP's documented milliseconds, so every real
+  webhook missed the skew window by ~55,000 years and got rejected. The
+  timestamp is now converted to seconds before comparison; `_signature_matches`
+  and the 300s skew default are untouched.
 - `Authenticator.refresh` is now single-flighted. WHOOP invalidates the old
   refresh token the instant it issues a new one, so two callers racing the
   same refresh previously risked the loser overwriting a live token with a
