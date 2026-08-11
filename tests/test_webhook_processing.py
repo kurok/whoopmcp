@@ -752,7 +752,7 @@ class TestRetryAndDeadLetterLogic:
         finally:
             consumer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await consumer
+                _ = await consumer
 
         # Assert: event_1 is in dead_letter status after 5 attempts
         from whoopmcp.store import get_sleeps, get_webhook_event

@@ -9,16 +9,17 @@ here injects an ``AccessToken``-shaped principal directly (via
 HTTP round trip. See the task's own anchors for why that seam is sufficient
 and #28's stub has no bearing on this issue's testability.
 
-Symbols imported below that do not exist yet (``whoopmcp.server.resolve_member_id``,
-``.UnresolvedPrincipalError``, ``AppContext.store_conn``, ``whoopmcp.store
+#29 has since landed, so every symbol this file needs (``resolve_member_id``,
+``UnresolvedPrincipalError``, ``AppContext.store_conn``, ``whoopmcp.store
 .link_principal_to_member``, ``.get_member_for_principal``, ``.record_tool_call``,
-``.UnscopedQueryError``, ``._execute_scoped``, ``._TENANT_SCOPED_TABLES``) are
-referenced via ``whoopmcp.server``/``whoopmcp.store`` module attribute access
-rather than ``from ... import ...``, specifically so this file still *collects*
-today -- individual tests that touch a not-yet-existing attribute fail with a
-clear ``AttributeError``/``TypeError`` at call time instead of an ``ImportError``
-that would hide every other test in the file. That is the only reason for the
-mixed import style below; once #29 lands, both styles behave identically.
+``.UnscopedQueryError``, ``._execute_scoped``, ``._TENANT_SCOPED_TABLES``) now
+exists, and both import styles behave identically -- this file previously
+referenced the not-yet-existing ``whoopmcp.server`` symbols via module
+attribute access instead of ``from ... import ...``, specifically so it still
+*collected* while #29 was unimplemented, and has since been consolidated onto
+one style now that the workaround is no longer needed. ``whoopmcp.store`` is
+still accessed via module attribute access (``store.X``) throughout, by
+choice, not by that same necessity.
 
 Two design decisions worth calling out explicitly, since the issue asks that
 ambiguity be surfaced rather than silently resolved:
@@ -72,12 +73,18 @@ from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolRequestParams
 
-import whoopmcp.server as server_module
 from whoopmcp import store
 from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
-from whoopmcp.server import READ_ONLY, AppContext, Principal, build_server
+from whoopmcp.server import (
+    READ_ONLY,
+    AppContext,
+    Principal,
+    UnresolvedPrincipalError,
+    build_server,
+    resolve_member_id,
+)
 
 # Two WHOOP members. Large, distinctive integers so their decimal string forms
 # are vanishingly unlikely to appear by coincidence in a randomly generated
@@ -673,8 +680,8 @@ def test_unresolved_principal_raises_not_defaults(
     )
     ctx = _build_context(app_context, _principal_request("stranger"), tool_name="get_profile")
 
-    with pytest.raises(server_module.UnresolvedPrincipalError):
-        server_module.resolve_member_id(ctx)
+    with pytest.raises(UnresolvedPrincipalError):
+        resolve_member_id(ctx)
 
 
 def test_no_request_and_no_completed_login_raises_not_defaults(
@@ -690,8 +697,8 @@ def test_no_request_and_no_completed_login_raises_not_defaults(
     )
     ctx = _build_context(app_context, request=None, tool_name="get_profile")
 
-    with pytest.raises(server_module.UnresolvedPrincipalError):
-        server_module.resolve_member_id(ctx)
+    with pytest.raises(UnresolvedPrincipalError):
+        resolve_member_id(ctx)
 
 
 def test_resolve_member_id_ignores_caller_supplied_identity_hints(
@@ -716,7 +723,7 @@ def test_resolve_member_id_ignores_caller_supplied_identity_hints(
     spoofed_request = _principal_request("principal-b", spoofed_member_id=MEMBER_A)
     ctx = _build_context(app_context, spoofed_request, tool_name="get_profile")
 
-    result = server_module.resolve_member_id(ctx)
+    result = resolve_member_id(ctx)
 
     assert result == MEMBER_B  # the real mapping, never the spoofed hint or the live grant
 
@@ -734,8 +741,8 @@ def test_resolve_member_id_never_adopts_a_spoofed_hint_for_an_unmapped_principal
     spoofed_request = _principal_request("unmapped-principal", spoofed_member_id=MEMBER_A)
     ctx = _build_context(app_context, spoofed_request, tool_name="get_profile")
 
-    with pytest.raises(server_module.UnresolvedPrincipalError):
-        server_module.resolve_member_id(ctx)
+    with pytest.raises(UnresolvedPrincipalError):
+        resolve_member_id(ctx)
 
 
 async def test_resolve_member_id_audits_every_call(
@@ -760,7 +767,7 @@ async def test_resolve_member_id_audits_every_call(
         app_context, _principal_request("principal-a"), tool_name="list_recoveries"
     )
 
-    result = server_module.resolve_member_id(ctx)
+    result = resolve_member_id(ctx)
 
     assert result == MEMBER_A
     rows = store_conn.execute("SELECT whoop_user_id, tool_name FROM tool_call_audit").fetchall()

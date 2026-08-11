@@ -7,6 +7,7 @@ implementation of mcpauth.py and assert on its module invariants.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -357,7 +358,11 @@ def test_mcpauth_does_not_import_auth() -> None:
     with different tokens, threat models, and protocol versions. Importing one
     from the other would violate the design principle of keeping them isolated.
     """
-    import whoopmcp.mcpauth as mcpauth_module
+    # The module is already imported (via the `from whoopmcp.mcpauth import
+    # ...` above); fetched from sys.modules rather than a second `import
+    # whoopmcp.mcpauth` statement so this file uses exactly one import style
+    # per module.
+    mcpauth_module = sys.modules["whoopmcp.mcpauth"]
 
     # Check that auth.py is not imported in mcpauth
     assert "whoopmcp.auth" not in mcpauth_module.__dict__, (

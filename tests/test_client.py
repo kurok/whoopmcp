@@ -524,7 +524,7 @@ async def test_rate_limit_remaining_header_shrinks_the_bucket() -> None:
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        _ = await task
 
 
 async def test_rate_limit_reset_header_corrects_the_window_timer() -> None:
