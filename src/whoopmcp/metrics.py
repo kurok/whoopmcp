@@ -64,9 +64,6 @@ WEBHOOK_REJECTION_REASONS: tuple[str, ...] = (
     "bad_signature",
 )
 
-#: `whoopmcp_rate_limit_remaining`/`_limit`'s label vocabulary.
-_RATE_LIMIT_WINDOWS: tuple[str, ...] = ("minute", "day")
-
 #: Hex characters of the keyed HMAC kept in `member_ref`. Long enough that
 #: truncation doesn't meaningfully weaken the HMAC, short enough to keep
 #: exposition text readable.
