@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -71,7 +72,7 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.types import CallToolRequestParams
+from mcp.types import CallToolRequestParams, GetPromptResult
 
 from whoopmcp import store
 from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
@@ -211,6 +212,34 @@ async def _call_tool_as(
 def _result_text(result: Any) -> str:
     """Flatten a tool result to searchable text for a marker-substring check."""
     return str(result)
+
+
+async def _read_resource_as(
+    server: MCPServer[AppContext],
+    uri: str,
+    app_context: AppContext,
+    request: Any | None = None,
+) -> dict[str, Any]:
+    """Read a resource as `request`'s principal, and unwrap+parse its JSON
+    content -- the resource-read analogue of `_call_tool_as` above, at the
+    same dispatch depth, for sweeping #26's one whoop://user/{item}
+    template alongside the tool registry below."""
+    request_context = ServerRequestContext(
+        session=None,  # type: ignore[arg-type]
+        lifespan_context=app_context,
+        protocol_version="2025-06-18",
+        method="resources/read",
+        request=request,
+    )
+    context = Context(request_context=request_context, mcp_server=server)
+    result = await server.read_resource(uri, context=context)
+    contents = list(result)  # type: ignore[arg-type]
+    content = contents[0].content
+    if isinstance(content, bytes):
+        content = content.decode()
+    parsed = json.loads(content)
+    assert isinstance(parsed, dict)
+    return parsed
 
 
 # =============================================================================
@@ -1022,14 +1051,37 @@ _TOOL_ARGUMENTS: dict[str, dict[str, Any]] = {
 }
 
 
-async def test_no_resources_or_prompts_exist_yet_canary() -> None:
+async def test_no_concrete_resources_exist_yet_canary() -> None:
     """Documents today's registry shape. The sweep below already enumerates
-    resources and prompts via list_resources()/list_prompts(), so the day
-    either gains an entry it is automatically walked there too -- this
-    canary just makes that assumption visible and independently checkable."""
+    resources, resource templates, and prompts via list_resources()/
+    list_resource_templates()/list_prompts(), so a future addition to any
+    of them is automatically walked there too -- this canary just makes
+    that assumption visible and independently checkable.
+
+    #26 has since added three prompts (argument-less compositions of the
+    analysis tools, never touching the store or the live client) and the
+    four ``whoop://user/...`` resources it also specifies -- but as one
+    ``whoop://user/{item}`` *template*, not four static resources: a static
+    resource's function in the installed SDK is structurally incapable of
+    receiving ``Context`` at all (see ``server.py``'s own
+    ``_register_resources`` docstring for the full verification), so the
+    per-user identity gate a per-user resource requires could never run
+    inside one. Templates are never concrete resources, so
+    ``list_resources()`` stays ``[]`` by design; the one
+    ``whoop://user/{item}`` template only shows up via
+    ``list_resource_templates()``. ``list_prompts()`` no longer stays empty
+    either.
+    """
     server = build_server()
     assert await server.list_resources() == []
-    assert await server.list_prompts() == []
+    assert {t.uri_template for t in await server.list_resource_templates()} == {
+        "whoop://user/{item}"
+    }
+    assert {p.name for p in await server.list_prompts()} == {
+        "morning_readiness_briefing",
+        "weekly_training_review",
+        "sleep_debt_investigation",
+    }
 
 
 @respx.mock
@@ -1072,7 +1124,51 @@ async def test_every_read_only_registered_tool_refuses_to_serve_a_mismatched_mem
         server = build_server()
         tools = await server.list_tools()
         assert await server.list_resources() == []
-        assert await server.list_prompts() == []
+
+        # #26's one whoop://user/{item} template shares the same identity
+        # gate every tool above does (_ensure_matches_live_grant) -- swept
+        # here too, off list_resource_templates() rather than a
+        # hand-maintained URI list, so a future item added to the template
+        # is automatically in scope.
+        templates = await server.list_resource_templates()
+        assert {t.uri_template for t in templates} == {"whoop://user/{item}"}
+
+        store.upsert_profile(
+            store_conn, MEMBER_A, {"user_id": MEMBER_A, "email": f"member-{MEMBER_A}@example.com"}
+        )
+        store.upsert_recovery(store_conn, MEMBER_A, _member_recoveries(MEMBER_A, count=1)[0])
+        store.upsert_sleep(store_conn, MEMBER_A, _member_sleeps(MEMBER_A, count=1)[0])
+        store.upsert_cycle(store_conn, MEMBER_A, _member_cycles(MEMBER_A, count=1)[0])
+
+        for item in ("profile", "latest-recovery", "latest-sleep", "latest-cycle"):
+            uri = f"whoop://user/{item}"
+            # A (matches the live grant) is the sanity path: it must work.
+            await _read_resource_as(server, uri, app_context, request_a)
+
+            try:
+                result_b = await _read_resource_as(server, uri, app_context, request_b)
+            except Exception:  # noqa: S112 -- refusing outright *is* the correct, safe outcome here
+                continue
+
+            assert str(MEMBER_A) not in _result_text(result_b), (
+                f"{uri} leaked member {MEMBER_A}'s data into member {MEMBER_B}'s session"
+            )
+
+        # #26's prompts take no `ctx`, never touch the store or the live
+        # client, and are plain static instructional text -- there is no
+        # member-specific data for one to leak, but the sweep asserts that
+        # rather than assuming it: same registry-driven, no-hand-maintained-
+        # name-list principle as the tool sweep below, walking whichever
+        # member's request happens to reach `get_prompt` at all.
+        prompts = await server.list_prompts()
+        assert prompts, "expected at least one prompt to sweep now that #26 has landed"
+        for prompt in prompts:
+            result = await server.get_prompt(prompt.name, None)
+            assert isinstance(result, GetPromptResult)
+            text = "\n".join(getattr(m.content, "text", "") for m in result.messages)
+            assert str(MEMBER_A) not in text and str(MEMBER_B) not in text, (
+                f"prompt {prompt.name} leaked a member id into its own static instructional text"
+            )
 
         read_only_tools = [
             t for t in tools if t.annotations is not None and t.annotations.read_only_hint

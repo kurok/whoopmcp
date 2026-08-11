@@ -22,11 +22,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import principal_components
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ResourceNotFoundError
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -283,15 +284,22 @@ def _principal_key(request: Any | None) -> tuple[str, str | None, str | None]:
 
 
 def _tool_name(ctx: Context[AppContext, Any]) -> str:
-    """The name of the tool this call is invoking, for the audit log.
+    """The name of the tool or resource this call is invoking, for the audit log.
 
     ``ctx.request_context.params`` is a plain ``Mapping`` in production (the
-    raw ``tools/call`` JSON-RPC params, read before typed validation) but a
-    real ``CallToolRequestParams`` in tests that build one directly -- both
-    carry a ``name``, just via a different access pattern.
+    raw ``tools/call``/``resources/read`` JSON-RPC params, read before typed
+    validation) but a real ``CallToolRequestParams``/``ReadResourceRequestParams``
+    in tests that build one directly -- both carry a ``name`` (tools) or a
+    ``uri`` (resources), just via a different access pattern. A resource read
+    has no ``name`` at all, so falling back to ``name`` alone would silently
+    audit every resource read as ``"<unknown>"``; fall back to ``uri`` before
+    giving up.
     """
     params = ctx.request_context.params
-    name = params.get("name") if isinstance(params, Mapping) else getattr(params, "name", None)
+    if isinstance(params, Mapping):
+        name = params.get("name") or params.get("uri")
+    else:
+        name = getattr(params, "name", None) or getattr(params, "uri", None)
     return str(name) if name is not None else "<unknown>"
 
 
@@ -465,6 +473,8 @@ def build_server() -> MCPServer[AppContext]:
     _register_auth_tools(server)
     _register_data_tools(server)
     _register_analysis_tools(server)
+    _register_prompts(server)
+    _register_resources(server)
     _register_health_routes(server)
     # Stashed on the server instance, not returned or discarded: `lifespan`
     # (already handed to MCPServer(...) above, and called back by the SDK
@@ -2516,3 +2526,207 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             entity: _range_coverage_entry(ec["earliest"], ec["latest"], start, end)
         }
         return response
+
+
+def _register_prompts(server: MCPServer[AppContext]) -> None:
+    """Register the prompts (#26): compositions of the *analysis* tools, not
+    the raw data tools, so the model sees a habit worth imitating rather than
+    an invitation to dump records.
+
+    Every prompt here is a plain, argument-less function with no ``ctx``
+    parameter: a prompt states which tools to call and why, it does not call
+    them itself (see the issue's own Notes -- fetching or computing data
+    inside a prompt is exactly the "just dumps records" failure mode prompts
+    exist to avoid). Each returns ``list[str]``; the SDK turns each string
+    into its own user-role message.
+
+    Every prompt below stays consistent with ``INSTRUCTIONS``: no diagnosis,
+    and no correlation-over-a-few-weeks presented as causal.
+    """
+
+    @server.prompt(
+        name="morning_readiness_briefing",
+        title="Morning readiness briefing",
+        description=(
+            "Read today's recovery against the last fortnight, not in isolation, "
+            "using metric_trend and whoop_outliers."
+        ),
+    )
+    def morning_readiness_briefing() -> list[str]:
+        return [
+            "Compile a morning readiness briefing for the signed-in WHOOP user. "
+            "Today's recovery number means little read in isolation -- read it "
+            "against the recent trend, not on its own.\n\n"
+            "1. Call whoop_data_coverage to see what is actually held in the "
+            "local store before reasoning about it.\n"
+            '2. Call metric_trend for the "recovery_score" metric over the '
+            "last 14 days to place today's value in the context of the last "
+            "fortnight.\n"
+            '3. Call whoop_outliers for "recovery_score" over that same '
+            "14-day window to say whether today is a local outlier or an "
+            "ordinary day.\n\n"
+            "State the actual coverage window you reasoned over -- the "
+            "earliest and latest synced date and the record count, quoted "
+            'from the tools\' own "coverage"/"range_coverage" fields -- so '
+            "a briefing built on three days of data does not sound as "
+            "confident as one built on three months.\n\n"
+            "This is wellness data, not clinical data: report what the "
+            "numbers say and their sample size, and do not diagnose."
+        ]
+
+    @server.prompt(
+        name="weekly_training_review",
+        title="Weekly training review",
+        description=(
+            "Review strain distribution, workouts, and recovery response "
+            "using summarize_period and correlate_metrics."
+        ),
+    )
+    def weekly_training_review() -> list[str]:
+        return [
+            "Compile a weekly training review for the signed-in WHOOP user.\n\n"
+            "1. Call summarize_period for the last 7 days to get the strain "
+            "distribution and workout summary.\n"
+            '2. Call correlate_metrics for "strain" vs "recovery_score" '
+            "over the last 4 weeks to see how recovery has responded to "
+            "strain.\n\n"
+            "State the coverage window each tool actually covered -- earliest "
+            "and latest synced date, and sample count -- quoted from their "
+            'own "coverage" fields, before drawing any conclusion.\n\n'
+            "A several-week correlation between strain and recovery is not a "
+            "causal finding. Report the correlation and its sample size; do "
+            "not present it as strain causing a recovery outcome."
+        ]
+
+    @server.prompt(
+        name="sleep_debt_investigation",
+        title="Sleep debt investigation",
+        description=(
+            "Look at sleep consistency against recovery over a month using "
+            "metric_trend and correlate_metrics."
+        ),
+    )
+    def sleep_debt_investigation() -> list[str]:
+        return [
+            "Investigate sleep debt for the signed-in WHOOP user over the "
+            "last 30 days.\n\n"
+            "There is no direct sleep-duration metric registered for "
+            'metric_trend/correlate_metrics; use "sleep_performance" as the '
+            "nearest available proxy -- it measures actual sleep against "
+            "sleep need, which is what sleep debt means, unlike "
+            '"sleep_efficiency" (asleep-vs-in-bed, a quality measure, not a '
+            "duration one). Say explicitly that this is a proxy, not a raw "
+            "duration figure.\n\n"
+            '1. Call metric_trend for "sleep_performance" over the last 30 '
+            "days to see the trend and consistency of sleep.\n"
+            '2. Call correlate_metrics for "sleep_performance" vs '
+            '"recovery_score" over that same 30-day window to see how '
+            "recovery responds to a shortfall against sleep need.\n\n"
+            "State the coverage window you reasoned over -- earliest and "
+            "latest synced date, and sample count -- quoted from the tools' "
+            'own "coverage" fields.\n\n'
+            "Describe findings descriptively, not diagnostically: this is "
+            "wellness data, not a clinical assessment, and a month of data "
+            "does not establish causality."
+        ]
+
+
+def _register_resources(server: MCPServer[AppContext]) -> None:
+    """The four per-user resources (#26), as one ``whoop://user/{item}`` template.
+
+    One template rather than four static resources because a *static*
+    resource's read function in the installed SDK is structurally
+    incapable of receiving ``Context`` -- ``MCPServer.resource()`` rejects a
+    ``Context``-typed parameter on any URI with no ``{param}`` at
+    registration time -- so the ``_ensure_matches_live_grant`` identity gate
+    every one of these four requires would simply be unreachable behind a
+    static registration. A template *does* receive ``Context``,
+    and the four exact URIs the issue specifies --
+    ``whoop://user/profile``, ``whoop://user/latest-recovery``,
+    ``whoop://user/latest-sleep`` and ``whoop://user/latest-cycle`` -- still
+    resolve through it unchanged. The one visible consequence: they now
+    surface via ``resources/templates/list`` rather than ``resources/list``.
+
+    The template itself matches ANY single trailing segment -- both
+    ``whoop://user/`` (``item == ""``) and ``whoop://user/unknown-thing``
+    match just as readily as the four real items -- so the
+    ``ResourceNotFoundError`` at the end of the dispatch below is
+    load-bearing, not defensive: without it, every unrecognised item would
+    silently fall through instead of failing.
+    """
+
+    @server.resource(
+        "whoop://user/{item}",
+        name="whoop-user-item",
+        title="WHOOP user record",
+        description=(
+            "One of the signed-in user's WHOOP records, selected by `item`: "
+            '"profile", "latest-recovery", "latest-sleep", or "latest-cycle".'
+        ),
+        mime_type="application/json",
+    )
+    # ctx is deliberately typed as the bare `Context`, not the parametrized
+    # `Context[AppContext, Any]` every tool function above uses: a resource
+    # *template*'s function is wrapped whole in pydantic's `validate_call`
+    # (unlike a tool's, where the context parameter is stripped out before
+    # argument validation and injected directly) -- verified empirically,
+    # not assumed: a `Context[AppContext, Any]`-annotated parameter here
+    # forces pydantic to revalidate the incoming `Context` instance against
+    # that exact parametrized class, and since every caller in this
+    # codebase (including every test harness that reads a resource)
+    # constructs a plain, unparametrized `Context(...)`, that revalidation
+    # silently rebuilds a blank instance missing the private
+    # `_request_context`/`_mcp_server` attributes the object actually
+    # carried -- `ctx.request_context` then raises "Context is not
+    # available outside of a request" instead of ever reaching the
+    # identity gate. The bare annotation matches what every call site here
+    # actually constructs, so no such revalidation happens.
+    async def whoop_user_resource(item: str, ctx: Context) -> dict[str, Any]:
+        # A `cast`, not a real parametrized annotation on `ctx` itself (see
+        # above) -- has no runtime effect, so it doesn't reintroduce the
+        # pydantic revalidation this function's bare `Context` annotation
+        # exists to avoid, while still giving `_ensure_matches_live_grant`/
+        # `_require_store` below the `AppContext`-typed value they declare.
+        typed_ctx = cast("Context[AppContext, Any]", ctx)
+        app = typed_ctx.request_context.lifespan_context
+        # The identity gate runs before the item dispatch below, deliberately:
+        # an unauthenticated caller must not learn which items exist, and
+        # resolve_member_id's own audit write (store.record_tool_call) should
+        # record an attempted read of an unknown item rather than drop it.
+        whoop_user_id = _ensure_matches_live_grant(typed_ctx)
+        conn = _require_store(app)
+        if item == "profile":
+            record = store.get_profile(conn, whoop_user_id)
+            if record is None:
+                return {"error": "not_synced", "coverage": {"profile": _singleton_coverage(None)}}
+            updated_at = store.get_profile_updated_at(conn, whoop_user_id)
+            result = strip_nulls(record)
+            result["coverage"] = {"profile": _singleton_coverage(updated_at)}
+            return result
+        if item == "latest-recovery":
+            coverage = _entity_coverage(conn, whoop_user_id, "recoveries")
+            if coverage["earliest"] is None:
+                return {"error": "not_synced", "coverage": {"recoveries": coverage}}
+            record = store.get_latest_recovery(conn, whoop_user_id)
+            result = strip_nulls(_trim_recovery(record))  # type: ignore[arg-type]
+            result["coverage"] = {"recoveries": coverage}
+            return result
+        if item == "latest-sleep":
+            coverage = {"sleeps": _entity_coverage(conn, whoop_user_id, "sleeps")}
+            if coverage["sleeps"]["earliest"] is None:
+                return {"error": "not_synced", "coverage": coverage}
+            record = store.get_latest_sleep(conn, whoop_user_id)
+            # coverage["sleeps"]["earliest"] is non-None, so a row exists.
+            trimmed = strip_nulls(_trim_sleep(record, detail="full"))  # type: ignore[arg-type]
+            trimmed["units"] = {"stage_durations": "milliseconds"}
+            trimmed["coverage"] = coverage
+            return trimmed
+        if item == "latest-cycle":
+            coverage = _entity_coverage(conn, whoop_user_id, "cycles")
+            if coverage["earliest"] is None:
+                return {"error": "not_synced", "coverage": {"cycles": coverage}}
+            record = store.get_latest_cycle(conn, whoop_user_id)
+            result = strip_nulls(_trim_cycle(record))  # type: ignore[arg-type]
+            result["coverage"] = {"cycles": coverage}
+            return result
+        raise ResourceNotFoundError(f"Unknown resource: whoop://user/{item}")

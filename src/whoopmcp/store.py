@@ -558,6 +558,24 @@ def get_recovery_coverage(
     return (row[0], row[1]) if row is not None else (None, None)
 
 
+def get_latest_recovery(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str, Any] | None:
+    """The most recently created recovery held for ``whoop_user_id`` (by
+    ``created_at``), excluding soft-deleted rows -- ``None`` if none are
+    held. See ``get_recoveries`` for why ``created_at``, not ``updated_at``.
+    """
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        """
+        SELECT raw_json FROM recoveries
+        WHERE whoop_user_id = ? AND deleted_at IS NULL
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (whoop_user_id,),
+    ).fetchone()
+    return json.loads(row[0]) if row is not None else None
+
+
 # -- sleeps ---------------------------------------------------------------
 
 
@@ -672,6 +690,23 @@ def get_sleep_by_id(
     return json.loads(row[0]) if row is not None else None
 
 
+def get_latest_sleep(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str, Any] | None:
+    """The most recently started sleep held for ``whoop_user_id`` (by
+    ``start``), excluding soft-deleted rows -- ``None`` if none are held.
+    """
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        """
+        SELECT raw_json FROM sleeps
+        WHERE whoop_user_id = ? AND deleted_at IS NULL
+        ORDER BY start DESC LIMIT 1
+        """,
+        (whoop_user_id,),
+    ).fetchone()
+    return json.loads(row[0]) if row is not None else None
+
+
 # -- cycles ---------------------------------------------------------------
 
 
@@ -761,6 +796,23 @@ def get_cycle_coverage(
         (whoop_user_id,),
     ).fetchone()
     return (row[0], row[1]) if row is not None else (None, None)
+
+
+def get_latest_cycle(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str, Any] | None:
+    """The most recently started cycle held for ``whoop_user_id`` (by
+    ``start``), excluding soft-deleted rows -- ``None`` if none are held.
+    """
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        """
+        SELECT raw_json FROM cycles
+        WHERE whoop_user_id = ? AND deleted_at IS NULL
+        ORDER BY start DESC LIMIT 1
+        """,
+        (whoop_user_id,),
+    ).fetchone()
+    return json.loads(row[0]) if row is not None else None
 
 
 # -- metric time series (#20) -------------------------------------------------

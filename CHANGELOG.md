@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #26: three MCP prompts chaining the *analysis* tools rather than
+  the raw data tools, so the model sees a composition worth imitating
+  instead of an invitation to dump records -- `morning_readiness_briefing`
+  (`metric_trend` + `whoop_outliers` on `recovery_score` over the last 14
+  days), `weekly_training_review` (`summarize_period` over the last 7 days
+  + `correlate_metrics` on `strain` vs `recovery_score` over the last 4
+  weeks), and `sleep_debt_investigation` (`metric_trend` +
+  `correlate_metrics` on `sleep_performance` -- the nearest available
+  proxy, since no sleep-*duration* metric is registered -- vs
+  `recovery_score` over the last 30 days). Each instructs stating the
+  actual coverage window reasoned over, and stays consistent with
+  `INSTRUCTIONS`'s own no-diagnosis, no-causal-claim guidance. Also, the
+  issue's four `whoop://user/...` resources (`profile`, `latest-recovery`,
+  `latest-sleep`, `latest-cycle`), served as one `whoop://user/{item}`
+  template rather than four static resources: a static resource's function
+  in the installed SDK (`mcp==2.0.0`) is structurally incapable of
+  receiving `Context` at registration time, so the per-user identity gate
+  every one of these four requires could never run inside one -- see
+  `server.py`'s own `_register_resources` docstring for the full
+  verification. The four exact URIs still resolve unchanged; the one
+  visible consequence is that they surface via `resources/templates/list`
+  rather than `resources/list`. Also: `store.py` gained
+  `get_latest_recovery`/`get_latest_sleep`/`get_latest_cycle` (the "most
+  recent record" accessors the resources use), and `_tool_name` now falls
+  back to a resource's own `uri` when no tool `name` is present, so a
+  resource read audits correctly instead of logging as `"<unknown>"`.
+
 - Issue #24: `whoop_outliers(metric, start, end, z=2.0)` and
   `whoop_streaks(metric, start, end, threshold, direction)`. Two new pure
   `analysis.py` functions back them: `rolling_z_scores` (a rolling, not
