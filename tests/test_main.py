@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
+import httpx
 import pytest
+import respx
 
 from whoopmcp.__main__ import main
+from whoopmcp.auth import USER_ACCESS_URL, FileTokenStore, Token
 
 
 def test_version_exits_cleanly(capsys: pytest.CaptureFixture[str]) -> None:
@@ -102,3 +108,89 @@ def test_cli_host_and_port_override_config(monkeypatch: pytest.MonkeyPatch) -> N
     assert main(["--transport", "streamable-http", "--host", "127.0.0.2", "--port", "1234"]) == 0
 
     assert calls == [{"transport": "streamable-http", "host": "127.0.0.2", "port": 1234}]
+
+
+# -- delete-member subcommand (issue #30) ------------------------------------
+#
+# The revoke-then-forget primitive (Authenticator.revoke_and_forget) is
+# deliberately NOT an MCP tool -- server.py never registers it -- so an
+# operator's only way to trigger it is this CLI subcommand. --whoop-user-id
+# is a confirmation guard against operator error (there is exactly one live
+# grant per process today; see auth.py/store.py for why), not a selector
+# among several grants.
+
+
+def _set_required_env_and_state_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WHOOP_CLIENT_ID", "cid")
+    monkeypatch.setenv("WHOOP_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("WHOOP_REDIRECT_URI", "https://localhost:8443/callback")
+    monkeypatch.setenv("WHOOPMCP_STATE_DIR", str(tmp_path))
+
+
+def test_delete_member_subcommand_revokes_and_removes_principal_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config
+
+    config = Config.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    conn.close()
+
+    with respx.mock:
+        route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+        exit_code = main(["delete-member", "--whoop-user-id", "42"])
+
+    assert exit_code == 0
+    # Verified against the mock and the store/database, not merely that no
+    # error was raised.
+    assert route.called
+    assert FileTokenStore(config.token_path).load() is None
+
+    conn = store_module.open_store(config.cache_path)
+    assert (
+        store_module.get_member_for_principal(conn, client_id="local", issuer=None, subject=None)
+        is None
+    )
+    conn.close()
+
+
+def test_delete_member_subcommand_refuses_a_mismatched_whoop_user_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --whoop-user-id must match the id already linked in principal_members;
+    # it guards against operator error, it does not select among grants.
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config
+
+    config = Config.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    conn.close()
+
+    with respx.mock:
+        route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+        exit_code = main(["delete-member", "--whoop-user-id", "999"])
+
+    assert exit_code != 0
+    # Neither side effect happened: no upstream revoke, and the token is
+    # still there -- a mismatched id must refuse, not silently no-op-succeed.
+    assert not route.called
+    assert FileTokenStore(config.token_path).load() is not None

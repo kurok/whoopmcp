@@ -273,6 +273,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   executed by the time the violation is caught. `lifespan()` now opens the
   store unconditionally rather than only when webhooks are enabled, so this
   join has something to resolve against outside of tests.
+- Issue #30: tokens are now encrypted at rest. New `crypto.py` seals/unseals
+  bytes with AES-256-GCM (`cryptography`'s own AEAD, no custom framing),
+  binding the key version into the authentication tag so a relabeled
+  envelope fails closed instead of authenticating against the wrong key. A
+  new `EncryptedFileTokenStore` (`WHOOPMCP_TOKEN_BACKEND=encrypted-file`,
+  keyed by `WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N>` env vars plus a
+  `..._VERSION` pointer) re-seals a record under the current key version
+  lazily on its next read, so rotation needs no downtime and no forced
+  bulk re-encrypt -- both key versions just have to stay set for as long
+  as the transition takes. `Authenticator.revoke_and_forget` and a new
+  `auth.revoke_upstream` call WHOOP's `DELETE /v2/user/access` before
+  forgetting the local token, exposed only via a new `delete-member` CLI
+  subcommand (`__main__.py`) and `store.delete_principal_links_for_member`
+  -- deliberately not on `client.py` and never registered as an MCP tool,
+  so an LLM-driven tool call can never reach it.
 
 ### Changed
 

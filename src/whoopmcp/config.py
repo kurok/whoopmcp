@@ -9,12 +9,21 @@ everywhere -- there is nowhere to prompt.
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-TokenBackend = Literal["file", "keyring"]
+from whoopmcp.crypto import parse_key_env_value
+
+TokenBackend = Literal["file", "keyring", "encrypted-file"]
 Transport = Literal["stdio", "streamable-http"]
+
+#: Matches WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N>, capturing N. Only consulted
+#: when token_backend == "encrypted-file" -- the file/keyring backends have
+#: no key material and are unaffected by these variables being unset.
+_KEY_VERSION_VAR_RE = re.compile(r"^WHOOPMCP_TOKEN_ENCRYPTION_KEY_V(\d+)$")
 
 #: Scopes requested during authorisation. ``offline`` is what makes WHOOP
 #: return a refresh token; without it the grant dies after one hour and the
@@ -73,6 +82,16 @@ class Config:
             direction, before it's rejected even with a valid signature.
             Bounds the window a captured, correctly-signed request can be
             replayed in.
+        token_encryption_keys: Key-version -> 32-byte AES-256-GCM key,
+            parsed from `WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N>` variables.
+            Only populated (and only required) when `token_backend` is
+            `"encrypted-file"`. Every version named here must stay present
+            for as long as any on-disk record was sealed under it -- see
+            `auth.EncryptedFileTokenStore`, which re-seals a record under
+            the current version lazily, on its next read.
+        token_encryption_key_version: Which version in
+            `token_encryption_keys` new writes seal under. Only meaningful
+            alongside `token_backend == "encrypted-file"`.
     """
 
     client_id: str
@@ -90,6 +109,8 @@ class Config:
     http_port: int = 8000
     webhooks_enabled: bool = False
     webhook_timestamp_skew_seconds: float = 300.0
+    token_encryption_keys: Mapping[int, bytes] = field(default_factory=dict)
+    token_encryption_key_version: int | None = None
 
     @property
     def token_path(self) -> Path:
@@ -129,10 +150,15 @@ class Config:
             )
 
         backend = src.get("WHOOPMCP_TOKEN_BACKEND", "file")
-        if backend not in ("file", "keyring"):
+        if backend not in ("file", "keyring", "encrypted-file"):
             raise ConfigError(
-                f"WHOOPMCP_TOKEN_BACKEND must be 'file' or 'keyring', got {backend!r}"
+                "WHOOPMCP_TOKEN_BACKEND must be 'file', 'keyring', or 'encrypted-file', "
+                f"got {backend!r}"
             )
+
+        token_encryption_keys, token_encryption_key_version = _parse_token_encryption_keys(
+            src, required=backend == "encrypted-file"
+        )
 
         scopes = (
             tuple(src["WHOOPMCP_SCOPES"].split()) if src.get("WHOOPMCP_SCOPES") else DEFAULT_SCOPES
@@ -168,8 +194,70 @@ class Config:
             webhook_timestamp_skew_seconds=float(
                 src.get("WHOOPMCP_WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300")
             ),
+            token_encryption_keys=token_encryption_keys,
+            token_encryption_key_version=token_encryption_key_version,
         )
 
 
 def _as_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_token_encryption_keys(
+    src: Mapping[str, str], *, required: bool
+) -> tuple[dict[int, bytes], int | None]:
+    """Collect every `WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N>` present into a
+    version -> key mapping, plus the `WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION`
+    pointer naming which one is current.
+
+    This parsing only becomes mandatory when ``required`` is true (i.e.
+    ``token_backend == "encrypted-file"``) -- operators on the plain "file"
+    or "keyring" backends are unaffected by these variables being unset,
+    matching every other backend-specific setting in this module.
+    """
+    keys: dict[int, bytes] = {}
+    for name, raw in src.items():
+        match = _KEY_VERSION_VAR_RE.match(name)
+        if match is None or not raw:
+            continue
+        version = int(match.group(1))
+        try:
+            keys[version] = parse_key_env_value(raw, var_name=name)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+
+    if not required:
+        current_raw = src.get("WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION")
+        if not current_raw:
+            return keys, None
+        try:
+            return keys, int(current_raw)
+        except ValueError as exc:
+            raise ConfigError(
+                f"WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION must be an integer, got {current_raw!r}"
+            ) from exc
+
+    if not keys:
+        raise ConfigError(
+            "WHOOPMCP_TOKEN_BACKEND=encrypted-file requires at least one "
+            "WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N> variable (base64-encoded, 32 bytes)"
+        )
+
+    current_raw = src.get("WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION")
+    if not current_raw:
+        raise ConfigError(
+            "WHOOPMCP_TOKEN_BACKEND=encrypted-file requires "
+            "WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION to name which key version is current"
+        )
+    try:
+        current_version = int(current_raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION must be an integer, got {current_raw!r}"
+        ) from exc
+    if current_version not in keys:
+        raise ConfigError(
+            f"WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION={current_version} has no matching "
+            f"WHOOPMCP_TOKEN_ENCRYPTION_KEY_V{current_version} variable"
+        )
+    return keys, current_version

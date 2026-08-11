@@ -935,6 +935,48 @@ def get_member_for_principal(
     return row[0] if row is not None else None
 
 
+def principal_is_linked_to_member(conn: sqlite3.Connection, whoop_user_id: int) -> bool:
+    """Whether any MCP principal is currently linked to ``whoop_user_id``.
+
+    Used by the ``delete-member`` CLI subcommand (``__main__.py``) as a
+    confirmation guard against operator error, before it calls
+    ``delete_principal_links_for_member`` -- ``--whoop-user-id`` on that
+    subcommand must match a real, already-linked id, not name one out of
+    several live grants (there is exactly one per process today; see
+    ``CONTRIBUTING.md``).
+    """
+    cursor = _execute_scoped(
+        conn,
+        "SELECT 1 FROM principal_members WHERE whoop_user_id = ? LIMIT 1",
+        (whoop_user_id,),
+    )
+    return cursor.fetchone() is not None
+
+
+def delete_principal_links_for_member(conn: sqlite3.Connection, whoop_user_id: int) -> None:
+    """Remove every ``principal_members`` row linked to ``whoop_user_id``.
+
+    The local-identity-plumbing half of member deletion (#30): paired with
+    ``auth.Authenticator.revoke_and_forget`` (which handles the token and
+    the upstream revoke) by the ``delete-member`` CLI subcommand. Routed
+    through ``_execute_scoped`` like every other write in this module, even
+    though ``principal_members`` is not itself in ``_TENANT_SCOPED_TABLES``
+    -- see that table's own comment for why it is identity/audit plumbing,
+    not member data filtered by member; going through ``_execute_scoped``
+    here is just this module's one way of touching ``conn``, not a
+    tenancy-isolation claim about this particular table. Health data,
+    webhook events, and audit rows are deliberately untouched -- that is
+    #32's full erasure story, not this issue's narrower token-and-link
+    scope.
+    """
+    _execute_scoped(
+        conn,
+        "DELETE FROM principal_members WHERE whoop_user_id = ?",
+        (whoop_user_id,),
+    )
+    conn.commit()
+
+
 def record_tool_call(conn: sqlite3.Connection, whoop_user_id: int, tool_name: str) -> None:
     """Audit-log one tool call: identity and tool name only, never a payload.
 
