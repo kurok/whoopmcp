@@ -58,20 +58,28 @@ def strip_nulls(record: dict[str, Any]) -> dict[str, Any]:
 #: roughly 1.25x the measured worst case. tests/test_context_budget.py fails
 #: if any registered tool is missing an entry here, so a 17th tool with no
 #: ceiling breaks CI rather than shipping unmeasured.
+#:
+#: #16 repointed every data/analysis tool at the local store and gave each
+#: response a "coverage" (and, for the range-taking ones, "range_coverage")
+#: envelope -- every one of the 12 entries below was remeasured against this
+#: file's own store-seeded fixtures, not carried over from the pre-#16
+#: live-API measurement. ``whoop_data_coverage`` is new: 6 small per-entity
+#: dicts, never echoed records, so its worst case does not grow with history
+#: size the way the other 12 do.
 TOOL_CEILINGS: dict[str, int] = {
     "whoop_auth_status": 50,
     "whoop_login": 300,
     "whoop_complete_login": 50,
     "whoop_logout": 100,
-    "get_profile": 50,
-    "get_body_measurement": 50,
-    "list_recoveries": 1300,
-    "list_sleeps": 2600,
-    "list_cycles": 1500,
-    "list_workouts": 2800,
-    "get_sleep": 150,
-    "get_workout": 150,
-    "summarize_period": 300,
+    "get_profile": 60,
+    "get_body_measurement": 60,
+    "list_recoveries": 1500,
+    "list_sleeps": 2900,
+    "list_cycles": 1700,
+    "list_workouts": 3100,
+    "get_sleep": 250,
+    "get_workout": 250,
+    "summarize_period": 850,
     # 32000, not 100: metric_trend's rolling_7d/30d/90d (#22) return one point
     # per calendar day of coverage with no cap, so a multi-year range's worst
     # case is genuinely this large -- measured, not designed. Tracked as a
@@ -80,15 +88,17 @@ TOOL_CEILINGS: dict[str, int] = {
     # rolling-point cap with a truncation note) is a product decision this
     # rebase should not make unasked.
     "metric_trend": 32000,
-    "correlate_metrics": 300,
-    # 900, not 600: #21 added effect_size/coverage_asymmetric per metric plus
-    # a top-level period_length_note, measured at 675 against this file's own
-    # worst-case fixture (previously 600 was calibrated pre-#21).
-    "compare_periods": 900,
+    "correlate_metrics": 700,
+    # #21 added effect_size/coverage_asymmetric per metric plus a top-level
+    # period_length_note; #16 added coverage/range_coverage on top of that.
+    "compare_periods": 1300,
     # #15: four small per-entity {count, cursor} dicts, never echoed records --
     # response size does not grow with the number of records synced, only
     # with the (fixed, small) number of entities, so one record per entity is
     # already the worst case. Measured at 74 against
     # tests/test_context_budget.py's own fixture; rounded up to roughly 1.25x.
     "whoop_sync": 100,
+    # #16: 6 small per-entity coverage dicts, never echoed records -- same
+    # "does not grow with history size" shape as whoop_sync above.
+    "whoop_data_coverage": 340,
 }

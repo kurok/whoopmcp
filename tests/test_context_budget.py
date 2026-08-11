@@ -35,7 +35,16 @@ from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.context_budget import TOOL_CEILINGS, estimate_tokens
 from whoopmcp.server import AppContext, Principal, build_server
-from whoopmcp.store import link_principal_to_member, open_store
+from whoopmcp.store import (
+    link_principal_to_member,
+    open_store,
+    upsert_body_measurement,
+    upsert_cycle,
+    upsert_profile,
+    upsert_recovery,
+    upsert_sleep,
+    upsert_workout,
+)
 
 # -- fixture helpers, mirroring tests/test_server.py's own (kept separate so
 # this file's worst-case fixtures can evolve independently of the happy-path
@@ -312,6 +321,17 @@ def _mock_paginated_collection(
     respx.get(f"{BASE_URL}{path}").mock(side_effect=_respond)
 
 
+def _seed(conn: Any, whoop_user_id: int, upsert: Any, records: list[dict[str, Any]]) -> None:
+    """Bulk-seed the store for #16's own worst-case fixtures.
+
+    Every one of the 12 repointed tools (and whoop_data_coverage) reads
+    from the store, not the live API -- these fixtures no longer measure
+    anything by mocking WHOOP; they have to actually be written here.
+    """
+    for record in records:
+        upsert(conn, whoop_user_id, record)
+
+
 # -- registry enumeration: every tool must have a ceiling -------------------
 
 
@@ -373,39 +393,31 @@ async def test_whoop_complete_login_within_ceiling(
 # -- data tools: get_profile / get_body_measurement --------------------------
 
 
-@respx.mock
 async def test_get_profile_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
+    assert app_context.store_conn is not None
     fixture = {
         "user_id": 12345,
         "email": "user@example.com",
         "first_name": "John",
         "last_name": "Doe",
     }
-    respx.get(f"{BASE_URL}/v2/user/profile/basic").mock(
-        return_value=httpx.Response(200, json=fixture)
-    )
+    upsert_profile(app_context.store_conn, 12345, fixture)
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(server, "get_profile", {}, app_context)
+    result = await call_tool(server, "get_profile", {}, app_context)
 
     assert estimate_tokens(result) <= TOOL_CEILINGS["get_profile"]
 
 
-@respx.mock
 async def test_get_body_measurement_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
+    assert app_context.store_conn is not None
     fixture = {"height_meter": 1.75, "weight_kilogram": 75.5, "max_heart_rate": 190}
-    respx.get(f"{BASE_URL}/v2/user/measurement/body").mock(
-        return_value=httpx.Response(200, json=fixture)
-    )
+    upsert_body_measurement(app_context.store_conn, 12345, fixture)
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(server, "get_body_measurement", {}, app_context)
+    result = await call_tool(server, "get_body_measurement", {}, app_context)
 
     assert estimate_tokens(result) <= TOOL_CEILINGS["get_body_measurement"]
 
@@ -413,122 +425,139 @@ async def test_get_body_measurement_within_ceiling(
 # -- data tools: the 4 list tools, against one dense 25-record page ---------
 
 
-@respx.mock
 async def test_list_recoveries_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json=_dense_page(_dense_recovery))
+    assert app_context.store_conn is not None
+    _seed(
+        app_context.store_conn,
+        12345,
+        upsert_recovery,
+        [_dense_recovery(i) for i in range(1, _DENSE_PAGE_SIZE + 1)],
     )
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_recoveries",
-            {"start": "2024-01-01T00:00:00Z", "end": "2026-08-01T00:00:00Z"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "list_recoveries",
+        {"start": "2024-01-01T00:00:00Z", "end": "2026-08-30T00:00:00Z"},
+        app_context,
+    )
 
     assert result["count"] == _DENSE_PAGE_SIZE
     assert estimate_tokens(result) <= TOOL_CEILINGS["list_recoveries"]
 
 
-@respx.mock
 async def test_list_sleeps_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Worst case for list_sleeps is detail="full" -- that's the larger of its two shapes."""
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(200, json=_dense_page(_dense_sleep))
+    assert app_context.store_conn is not None
+    _seed(
+        app_context.store_conn,
+        12345,
+        upsert_sleep,
+        [_dense_sleep(i) for i in range(1, _DENSE_PAGE_SIZE + 1)],
     )
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_sleeps",
-            {"start": "2024-01-01T00:00:00Z", "end": "2026-08-01T00:00:00Z", "detail": "full"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "list_sleeps",
+        {"start": "2024-01-01T00:00:00Z", "end": "2026-08-30T00:00:00Z", "detail": "full"},
+        app_context,
+    )
 
     assert result["count"] == _DENSE_PAGE_SIZE
     assert estimate_tokens(result) <= TOOL_CEILINGS["list_sleeps"]
 
 
-@respx.mock
 async def test_list_cycles_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    respx.get(f"{BASE_URL}/v2/cycle").mock(
-        return_value=httpx.Response(200, json=_dense_page(_dense_cycle))
+    assert app_context.store_conn is not None
+    _seed(
+        app_context.store_conn,
+        12345,
+        upsert_cycle,
+        [_dense_cycle(i) for i in range(1, _DENSE_PAGE_SIZE + 1)],
     )
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_cycles",
-            {"start": "2024-01-01T00:00:00Z", "end": "2026-08-01T00:00:00Z"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "list_cycles",
+        {"start": "2024-01-01T00:00:00Z", "end": "2026-08-30T00:00:00Z"},
+        app_context,
+    )
 
     assert result["count"] == _DENSE_PAGE_SIZE
     assert estimate_tokens(result) <= TOOL_CEILINGS["list_cycles"]
 
 
-@respx.mock
 async def test_list_workouts_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
     """Worst case for list_workouts is detail="full" -- that's the larger of its two shapes."""
-    respx.get(f"{BASE_URL}/v2/activity/workout").mock(
-        return_value=httpx.Response(200, json=_dense_page(_dense_workout))
+    assert app_context.store_conn is not None
+    _seed(
+        app_context.store_conn,
+        12345,
+        upsert_workout,
+        [_dense_workout(i) for i in range(1, _DENSE_PAGE_SIZE + 1)],
     )
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_workouts",
-            {"start": "2024-01-01T00:00:00Z", "end": "2026-08-01T00:00:00Z", "detail": "full"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "list_workouts",
+        {"start": "2024-01-01T00:00:00Z", "end": "2026-08-30T00:00:00Z", "detail": "full"},
+        app_context,
+    )
 
     assert result["count"] == _DENSE_PAGE_SIZE
     assert estimate_tokens(result) <= TOOL_CEILINGS["list_workouts"]
 
 
-@respx.mock
 async def test_get_sleep_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    respx.get(f"{BASE_URL}/v2/activity/sleep/sleep-uuid-1").mock(
-        return_value=httpx.Response(200, json=_dense_sleep(1))
-    )
+    assert app_context.store_conn is not None
+    upsert_sleep(app_context.store_conn, 12345, _dense_sleep(1))
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(server, "get_sleep", {"sleep_id": "sleep-uuid-1"}, app_context)
+    result = await call_tool(server, "get_sleep", {"sleep_id": "sleep-uuid-1"}, app_context)
 
     assert estimate_tokens(result) <= TOOL_CEILINGS["get_sleep"]
 
 
-@respx.mock
 async def test_get_workout_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    respx.get(f"{BASE_URL}/v2/activity/workout/workout-uuid-1").mock(
-        return_value=httpx.Response(200, json=_dense_workout(1))
-    )
+    assert app_context.store_conn is not None
+    upsert_workout(app_context.store_conn, 12345, _dense_workout(1))
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server, "get_workout", {"workout_id": "workout-uuid-1"}, app_context
-        )
+    result = await call_tool(server, "get_workout", {"workout_id": "workout-uuid-1"}, app_context)
 
     assert estimate_tokens(result) <= TOOL_CEILINGS["get_workout"]
+
+
+async def test_whoop_data_coverage_within_ceiling(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """whoop_data_coverage's response is 6 small fixed-size entity dicts --
+    never echoed records -- so its worst case does not grow with history
+    size; seeding a dense page is enough to exercise a populated, non-empty
+    shape, not a true stress case."""
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    _seed(
+        conn, 12345, upsert_recovery, [_dense_recovery(i) for i in range(1, _DENSE_PAGE_SIZE + 1)]
+    )
+    _seed(conn, 12345, upsert_sleep, [_dense_sleep(i) for i in range(1, _DENSE_PAGE_SIZE + 1)])
+    _seed(conn, 12345, upsert_cycle, [_dense_cycle(i) for i in range(1, _DENSE_PAGE_SIZE + 1)])
+    _seed(conn, 12345, upsert_workout, [_dense_workout(i) for i in range(1, _DENSE_PAGE_SIZE + 1)])
+    upsert_profile(conn, 12345, {"user_id": 12345, "email": "user@example.com"})
+    upsert_body_measurement(conn, 12345, {"height_meter": 1.75})
+
+    result = await call_tool(server, "whoop_data_coverage", {}, app_context)
+
+    assert estimate_tokens(result) <= TOOL_CEILINGS["whoop_data_coverage"]
 
 
 # -- whoop_sync (#15): counts and a cursor per entity, never full records ---
@@ -598,93 +627,88 @@ async def test_whoop_sync_within_ceiling(tmp_path: Path, server: MCPServer[AppCo
 # -- analysis tools, against a >1000-record, >2-year collection -------------
 
 
-@respx.mock
 async def test_summarize_period_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    _mock_paginated_collection("/v2/recovery", _analysis_recovery_records())
-    _mock_paginated_collection("/v2/activity/sleep", _analysis_sleep_records())
-    _mock_paginated_collection("/v2/cycle", _analysis_cycle_records())
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    _seed(conn, 12345, upsert_recovery, _analysis_recovery_records())
+    _seed(conn, 12345, upsert_sleep, _analysis_sleep_records())
+    _seed(conn, 12345, upsert_cycle, _analysis_cycle_records())
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "summarize_period",
-            {"start": "2024-01-01T00:00:00Z", "end": "2026-08-01T00:00:00Z"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "summarize_period",
+        {"start": "2024-01-01T00:00:00Z", "end": "2026-08-01T00:00:00Z"},
+        app_context,
+    )
 
     assert estimate_tokens(result) <= TOOL_CEILINGS["summarize_period"]
 
 
-@respx.mock
 async def test_metric_trend_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    _mock_paginated_collection("/v2/recovery", _analysis_recovery_records())
+    assert app_context.store_conn is not None
+    _seed(app_context.store_conn, 12345, upsert_recovery, _analysis_recovery_records())
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "metric_trend",
-            {
-                "metric": "recovery_score",
-                "start": "2024-01-01T00:00:00Z",
-                "end": "2026-08-01T00:00:00Z",
-            },
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "metric_trend",
+        {
+            "metric": "recovery_score",
+            "start": "2024-01-01T00:00:00Z",
+            "end": "2026-08-01T00:00:00Z",
+        },
+        app_context,
+    )
 
     assert estimate_tokens(result) <= TOOL_CEILINGS["metric_trend"]
 
 
-@respx.mock
 async def test_correlate_metrics_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    _mock_paginated_collection("/v2/recovery", _analysis_recovery_records())
-    _mock_paginated_collection("/v2/cycle", _analysis_cycle_records())
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    _seed(conn, 12345, upsert_recovery, _analysis_recovery_records())
+    _seed(conn, 12345, upsert_cycle, _analysis_cycle_records())
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "correlate_metrics",
-            {
-                "metric_a": "strain",
-                "metric_b": "recovery_score",
-                "start": "2024-01-01T00:00:00Z",
-                "end": "2026-08-01T00:00:00Z",
-            },
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "correlate_metrics",
+        {
+            "metric_a": "strain",
+            "metric_b": "recovery_score",
+            "start": "2024-01-01T00:00:00Z",
+            "end": "2026-08-01T00:00:00Z",
+        },
+        app_context,
+    )
 
     assert estimate_tokens(result) <= TOOL_CEILINGS["correlate_metrics"]
 
 
-@respx.mock
 async def test_compare_periods_within_ceiling(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    _mock_paginated_collection("/v2/recovery", _analysis_recovery_records())
-    _mock_paginated_collection("/v2/activity/sleep", _analysis_sleep_records())
-    _mock_paginated_collection("/v2/cycle", _analysis_cycle_records())
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    _seed(conn, 12345, upsert_recovery, _analysis_recovery_records())
+    _seed(conn, 12345, upsert_sleep, _analysis_sleep_records())
+    _seed(conn, 12345, upsert_cycle, _analysis_cycle_records())
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "compare_periods",
-            {
-                "baseline_start": "2024-01-01T00:00:00Z",
-                "baseline_end": "2025-01-01T00:00:00Z",
-                "comparison_start": "2025-01-01T00:00:00Z",
-                "comparison_end": "2026-08-01T00:00:00Z",
-            },
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2024-01-01T00:00:00Z",
+            "baseline_end": "2025-01-01T00:00:00Z",
+            "comparison_start": "2025-01-01T00:00:00Z",
+            "comparison_end": "2026-08-01T00:00:00Z",
+        },
+        app_context,
+    )
 
     assert estimate_tokens(result) <= TOOL_CEILINGS["compare_periods"]
 
@@ -692,32 +716,31 @@ async def test_compare_periods_within_ceiling(
 # -- truncation surfaces on the tools that actually hit the cap -------------
 
 
-@respx.mock
 async def test_truncation_appears_on_summarize_period_and_metric_trend(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    _mock_paginated_collection("/v2/recovery", _analysis_recovery_records())
-    _mock_paginated_collection("/v2/activity/sleep", _analysis_sleep_records())
-    _mock_paginated_collection("/v2/cycle", _analysis_cycle_records())
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+    _seed(conn, 12345, upsert_recovery, _analysis_recovery_records())
+    _seed(conn, 12345, upsert_sleep, _analysis_sleep_records())
+    _seed(conn, 12345, upsert_cycle, _analysis_cycle_records())
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        summary = await call_tool(
-            server,
-            "summarize_period",
-            {"start": "2024-01-01T00:00:00Z", "end": "2026-08-01T00:00:00Z"},
-            app_context,
-        )
-        trend_result = await call_tool(
-            server,
-            "metric_trend",
-            {
-                "metric": "recovery_score",
-                "start": "2024-01-01T00:00:00Z",
-                "end": "2026-08-01T00:00:00Z",
-            },
-            app_context,
-        )
+    summary = await call_tool(
+        server,
+        "summarize_period",
+        {"start": "2024-01-01T00:00:00Z", "end": "2026-08-01T00:00:00Z"},
+        app_context,
+    )
+    trend_result = await call_tool(
+        server,
+        "metric_trend",
+        {
+            "metric": "recovery_score",
+            "start": "2024-01-01T00:00:00Z",
+            "end": "2026-08-01T00:00:00Z",
+        },
+        app_context,
+    )
 
     assert summary["truncated"] is True
     assert "note" in summary
@@ -728,28 +751,29 @@ async def test_truncation_appears_on_summarize_period_and_metric_trend(
 # -- detail="summary" (default) vs "full" --------------------------------
 
 
-@respx.mock
 async def test_list_sleeps_detail_summary_is_smaller_than_full(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
-        return_value=httpx.Response(200, json=_dense_page(_dense_sleep))
+    assert app_context.store_conn is not None
+    _seed(
+        app_context.store_conn,
+        12345,
+        upsert_sleep,
+        [_dense_sleep(i) for i in range(1, _DENSE_PAGE_SIZE + 1)],
     )
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        summary_result = await call_tool(
-            server,
-            "list_sleeps",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
-        full_result = await call_tool(
-            server,
-            "list_sleeps",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "detail": "full"},
-            app_context,
-        )
+    summary_result = await call_tool(
+        server,
+        "list_sleeps",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-30T00:00:00Z"},
+        app_context,
+    )
+    full_result = await call_tool(
+        server,
+        "list_sleeps",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-30T00:00:00Z", "detail": "full"},
+        app_context,
+    )
 
     assert estimate_tokens(summary_result) < estimate_tokens(full_result)
     assert "stage_durations" not in summary_result["records"][0]
@@ -758,28 +782,29 @@ async def test_list_sleeps_detail_summary_is_smaller_than_full(
     assert full_result["units"] == {"stage_durations": "milliseconds"}
 
 
-@respx.mock
 async def test_list_workouts_detail_summary_is_smaller_than_full(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    respx.get(f"{BASE_URL}/v2/activity/workout").mock(
-        return_value=httpx.Response(200, json=_dense_page(_dense_workout))
+    assert app_context.store_conn is not None
+    _seed(
+        app_context.store_conn,
+        12345,
+        upsert_workout,
+        [_dense_workout(i) for i in range(1, _DENSE_PAGE_SIZE + 1)],
     )
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        summary_result = await call_tool(
-            server,
-            "list_workouts",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
-        full_result = await call_tool(
-            server,
-            "list_workouts",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "detail": "full"},
-            app_context,
-        )
+    summary_result = await call_tool(
+        server,
+        "list_workouts",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-30T00:00:00Z"},
+        app_context,
+    )
+    full_result = await call_tool(
+        server,
+        "list_workouts",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-30T00:00:00Z", "detail": "full"},
+        app_context,
+    )
 
     assert estimate_tokens(summary_result) < estimate_tokens(full_result)
     assert "zone_durations" not in summary_result["records"][0]
@@ -791,10 +816,10 @@ async def test_list_workouts_detail_summary_is_smaller_than_full(
 # -- nulls are absent, not present-with-null --------------------------------
 
 
-@respx.mock
 async def test_list_recoveries_nulls_are_absent_not_present_with_null(
-    config: Config, app_context: AppContext, server: MCPServer[AppContext]
+    app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
+    assert app_context.store_conn is not None
     record = {
         "cycle_id": 1,
         "created_at": "2026-08-01T06:00:00Z",
@@ -805,18 +830,14 @@ async def test_list_recoveries_nulls_are_absent_not_present_with_null(
             "resting_heart_rate": None,  # forced null on an otherwise-normal field
         },
     }
-    respx.get(f"{BASE_URL}/v2/recovery").mock(
-        return_value=httpx.Response(200, json={"records": [record], "next_token": None})
-    )
+    upsert_recovery(app_context.store_conn, 12345, record)
 
-    async with WhoopClient(config, app_context.auth, clock=fast_forwarding_clock()) as client:
-        app_context.client = client
-        result = await call_tool(
-            server,
-            "list_recoveries",
-            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
-            app_context,
-        )
+    result = await call_tool(
+        server,
+        "list_recoveries",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"},
+        app_context,
+    )
 
     trimmed = result["records"][0]
     assert "resting_heart_rate" not in trimmed
