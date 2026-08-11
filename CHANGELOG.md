@@ -336,6 +336,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   controller, not a bystander) into their own sections, including an honest
   statement that this project takes no backups of its own in either mode --
   verified by grepping the repository for one, not assumed.
+- `whoopmcp backfill --whoop-user-id N` (#14): resumable, throttled history
+  import. Walks every collection (recoveries, sleeps, cycles, workouts)
+  newest-first at `RequestPriority.BACKFILL` -- the first consumer of #11's
+  low-priority class, so an import never starves an interactive question --
+  upserts through the persistent store, and checkpoints WHOOP's own
+  `nextToken` into `sync_state` after every committed page, so an interrupted
+  run resumes exactly where it stopped and never re-requests a committed
+  page. Honours a new optional `WHOOPMCP_BACKFILL_FLOOR_DATE` (ISO 8601,
+  passed as the API's own `start` lower bound; unset walks until history is
+  exhausted, malformed values fail at startup) and refuses to run unless
+  `WHOOPMCP_CACHE=true` -- the gate issue #13 anticipated, keeping
+  PRIVACY.md's "off by default" promise literally true. Deliberately
+  CLI-only, never an MCP tool, per #30/#32's operator-only precedent.
 
 ### Changed
 

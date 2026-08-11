@@ -45,8 +45,9 @@ _BACKOFF_MAX_SECONDS = 30.0
 
 
 class RequestPriority(enum.Enum):
-    """Two priority classes. Nothing in this codebase issues BACKFILL yet
-    (that's future work, #14) -- this just builds the mechanism ahead of it.
+    """Two priority classes. BACKFILL's first (and so far only) consumer is
+    the history import in ``backfill.py`` (#14); every other caller defaults
+    to INTERACTIVE.
     """
 
     INTERACTIVE = "interactive"
@@ -438,9 +439,13 @@ class WhoopClient:
         """GET /v2/cycle/{cycleId} -- one physiological cycle."""
         return await self._get(f"/v2/cycle/{cycle_id}")
 
-    async def list_cycles(self, **kwargs: Any) -> Page:
+    async def list_cycles(
+        self, *, priority: RequestPriority = RequestPriority.INTERACTIVE, **kwargs: Any
+    ) -> Page:
         """GET /v2/cycle -- cycles with strain and average heart rate."""
-        return await self._get_page("/v2/cycle", build_collection_params(**kwargs))
+        return await self._get_page(
+            "/v2/cycle", build_collection_params(**kwargs), priority=priority
+        )
 
     async def get_cycle_sleep(self, cycle_id: int) -> dict[str, Any]:
         """GET /v2/cycle/{cycleId}/sleep -- the sleep belonging to a cycle."""
@@ -452,9 +457,13 @@ class WhoopClient:
 
     # -- recovery ----------------------------------------------------------
 
-    async def list_recoveries(self, **kwargs: Any) -> Page:
+    async def list_recoveries(
+        self, *, priority: RequestPriority = RequestPriority.INTERACTIVE, **kwargs: Any
+    ) -> Page:
         """GET /v2/recovery -- recovery score, HRV and resting heart rate."""
-        return await self._get_page("/v2/recovery", build_collection_params(**kwargs))
+        return await self._get_page(
+            "/v2/recovery", build_collection_params(**kwargs), priority=priority
+        )
 
     # -- sleep -------------------------------------------------------------
 
@@ -462,9 +471,13 @@ class WhoopClient:
         """GET /v2/activity/sleep/{sleepId} -- one sleep, by v2 UUID."""
         return await self._get(f"/v2/activity/sleep/{sleep_id}")
 
-    async def list_sleeps(self, **kwargs: Any) -> Page:
+    async def list_sleeps(
+        self, *, priority: RequestPriority = RequestPriority.INTERACTIVE, **kwargs: Any
+    ) -> Page:
         """GET /v2/activity/sleep -- sleep performance and stage durations."""
-        return await self._get_page("/v2/activity/sleep", build_collection_params(**kwargs))
+        return await self._get_page(
+            "/v2/activity/sleep", build_collection_params(**kwargs), priority=priority
+        )
 
     # -- workouts ----------------------------------------------------------
 
@@ -472,6 +485,10 @@ class WhoopClient:
         """GET /v2/activity/workout/{workoutId} -- one workout, by v2 UUID."""
         return await self._get(f"/v2/activity/workout/{workout_id}")
 
-    async def list_workouts(self, **kwargs: Any) -> Page:
+    async def list_workouts(
+        self, *, priority: RequestPriority = RequestPriority.INTERACTIVE, **kwargs: Any
+    ) -> Page:
         """GET /v2/activity/workout -- workout strain and heart-rate metrics."""
-        return await self._get_page("/v2/activity/workout", build_collection_params(**kwargs))
+        return await self._get_page(
+            "/v2/activity/workout", build_collection_params(**kwargs), priority=priority
+        )

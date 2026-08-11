@@ -124,3 +124,33 @@ def test_unknown_transport_is_rejected() -> None:
 
     with pytest.raises(ConfigError, match="stdio' or 'streamable-http"):
         Config.from_env(env)
+
+
+# -- backfill floor date (issue #14) ------------------------------------------
+
+
+def test_backfill_floor_date_defaults_to_no_floor() -> None:
+    # Unset means "walk until history is exhausted".
+    assert Config.from_env(VALID_ENV).backfill_floor_date is None
+
+
+def test_backfill_floor_date_accepts_iso_and_stays_a_string() -> None:
+    # Kept as the string build_collection_params/the API convention expects,
+    # not parsed into a datetime.
+    env = VALID_ENV | {"WHOOPMCP_BACKFILL_FLOOR_DATE": "2024-01-01T00:00:00+00:00"}
+
+    assert Config.from_env(env).backfill_floor_date == "2024-01-01T00:00:00+00:00"
+
+
+def test_backfill_floor_date_accepts_a_bare_date() -> None:
+    env = VALID_ENV | {"WHOOPMCP_BACKFILL_FLOOR_DATE": "2024-01-01"}
+
+    assert Config.from_env(env).backfill_floor_date == "2024-01-01"
+
+
+def test_malformed_backfill_floor_date_is_rejected_at_startup() -> None:
+    # Fail at startup with the variable's name, not mid-backfill.
+    env = VALID_ENV | {"WHOOPMCP_BACKFILL_FLOOR_DATE": "not-a-date"}
+
+    with pytest.raises(ConfigError, match="WHOOPMCP_BACKFILL_FLOOR_DATE"):
+        Config.from_env(env)
