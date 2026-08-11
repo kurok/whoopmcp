@@ -371,6 +371,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #66: `_apply_event`'s "known member" gate checked `get_profile()`
+  against the `profiles` table, which nothing in `src/` writes (webhooks
+  and #14's backfill both cover only the four entity collections) -- so a
+  webhook event for a member who had completed `whoop_login` but had no
+  `profiles` row was dropped, and then *permanently* marked `success` (the
+  drop path returned normally, which `process_webhook_event` treats as
+  success), so no redelivery of that `trace_id` could ever reach
+  `_apply_event` again. The gate now checks
+  `principal_is_linked_to_member` against `principal_members` -- the
+  identity layer's own "is this a real, linked member" answer, already
+  written at login and already used by the `delete-member` CLI guard. A
+  drop for a genuinely unlinked member now raises a dedicated
+  `MemberNotLinkedError`, which `process_webhook_event` catches separately
+  from both the transient-failure retry path and the dead-letter path: the
+  row is left `pending` with `attempt_count` untouched, so it neither
+  counts toward `max_attempts` nor lands in `("success", "dead_letter")` --
+  a later redelivery of the same `trace_id` still reaches `_apply_event`.
+  Actually reprocessing rows left in this state is #19's job.
 - Issue #64: the webhook replay-window check parsed `X-WHOOP-Signature-Timestamp`
   as unix seconds instead of WHOOP's documented milliseconds, so every real
   webhook missed the skew window by ~55,000 years and got rejected. The

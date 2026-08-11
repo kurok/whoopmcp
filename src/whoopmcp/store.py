@@ -139,12 +139,21 @@ CREATE TABLE IF NOT EXISTS sync_state (
 #: could in principle be rebuilt from a full API backfill plus a replay of
 #: this table, after a bad migration or a bug in an upsert function.
 #:
-#: `status` is one of "pending" (queued or mid-retry), "success", or
-#: "dead_letter" (gave up after too many attempts). `attempt_count` and
+#: `status` is one of "pending", "success", or "dead_letter" (gave up after
+#: too many attempts). "pending" covers three distinct reasons a row hasn't
+#: reached a terminal state, none of which get their own status value:
+#: queued (never yet attempted), mid-retry (`attempt_count` > 0, transient
+#: failures so far, more attempts left), and -- since #66 -- not yet
+#: actionable (`_apply_event` raised `webhook_processor.MemberNotLinkedError`;
+#: `attempt_count` deliberately NOT incremented, since no amount of
+#: automatic retrying fixes a member who hasn't logged in yet). That third
+#: case is not swept by anything today -- reprocessing it is #19's
+#: reconciliation job, not this table's own bookkeeping. `attempt_count` and
 #: `whoop_user_id` are plain columns, not extracted into their own index,
 #: since the only query this table serves today is a point lookup by
 #: `trace_id`; `ix_webhook_events_status` exists for an operator inspecting
-#: what's stuck, not for anything this issue's own code queries by status.
+#: what's stuck (pending for any of the three reasons above, or dead_letter),
+#: not for anything this issue's own code queries by status.
 _SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS webhook_events (
     trace_id TEXT NOT NULL PRIMARY KEY,

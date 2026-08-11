@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -142,41 +143,24 @@ def encode_webhook_body(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
 
-# -- Helper: insert a principal (local user mapping) to the store
+# -- Helper: link a principal (local user mapping) to a WHOOP member, the
+# way `server.whoop_complete_login` really does via `link_principal_to_member`
+# -- NOT via a `profiles` row. #66: the membership gate `_apply_event` checks
+# is `principal_is_linked_to_member` against `principal_members`, and this
+# helper has to create the same row that check reads, or every test using it
+# would only be exercising a gate the fix already replaced.
 def insert_principal(
     conn: sqlite3.Connection,
     whoop_user_id: int,
-    email: str = "user@example.com",
+    client_id: str = "test-client",
 ) -> None:
-    """Insert a principal (local user mapping) for testing unknown user detection."""
-    # This assumes the profiles table can store the user mapping.
-    # For this test, we just check existence by trying to query recoveries
-    # for that user_id. In a real implementation, there'd be a principals
-    # or users table. For now, we'll mock the presence by upserting a
-    # profile or body measurement so the user exists in the store.
-    raw = json.dumps({"user_id": whoop_user_id, "email": email})
-    conn.execute(
-        """
-        INSERT INTO profiles (whoop_user_id, raw_json, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT (whoop_user_id) DO UPDATE SET
-            raw_json = excluded.raw_json,
-            updated_at = excluded.updated_at
-        """,
-        (whoop_user_id, raw, datetime.now(UTC).isoformat()),
+    """Link a principal to `whoop_user_id` in `principal_members`, the table
+    the membership gate actually reads (#66)."""
+    from whoopmcp.store import link_principal_to_member
+
+    link_principal_to_member(
+        conn, client_id=client_id, issuer="", subject="", whoop_user_id=whoop_user_id
     )
-    conn.commit()
-
-
-def get_principal(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str, Any] | None:
-    """Check if a principal exists in the store."""
-    row = conn.execute(
-        "SELECT raw_json FROM profiles WHERE whoop_user_id = ?",
-        (whoop_user_id,),
-    ).fetchone()
-    if row:
-        return json.loads(row[0])
-    return None
 
 
 # -- Tests: Idempotency, Recovery/Sleep Resolution, Resource Fetching
@@ -595,12 +579,23 @@ class TestUnknownUserHandling:
 
     @respx.mock
     async def test_event_for_unknown_user_is_dropped_without_error(
-        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+        self,
+        config: Config,
+        auth: Authenticator,
+        db: sqlite3.Connection,
+        client: WhoopClient,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Event for unknown user_id is silently skipped (status=success, no upsert).
+        """Event for a whoop_user_id with no `principal_members` link is
+        dropped without a fetch, and left `pending` -- NOT `success` and NOT
+        `dead_letter` (#66).
 
-        The event is marked as successfully processed (to avoid retry), but no
-        upsert occurs since there is no local principal for that user.
+        This is genuinely "not yet actionable", not a success (nothing was
+        upserted) and not a failure (nothing is broken; the member simply
+        hasn't logged in). Marking it `success` -- the pre-#66 behaviour --
+        would make a later redelivery of the same `trace_id` short-circuit
+        before ever reaching `_apply_event` again, permanently losing the
+        event even after the member does log in.
 
         `@respx.mock` with no routes registered, matching every other
         zero-fetch test in this file: if a regression ever reordered the
@@ -613,19 +608,31 @@ class TestUnknownUserHandling:
         unknown_user_id = 999999
         sleep_id = "sleep-uuid-unknown"
 
-        # Deliberately don't insert a principal for this user_id
-        # The store has no profiles row for this user
+        # Deliberately don't link a principal for this user_id -- no
+        # principal_members row, which is the gate _apply_event now checks.
 
         event_payload = create_webhook_event_payload("sleep.updated", sleep_id, unknown_user_id)
         raw_body = encode_webhook_body(event_payload)
 
-        await process_webhook_event(db, client, raw_body)
+        with caplog.at_level(logging.INFO):
+            await process_webhook_event(db, client, raw_body)
+
+        assert len(respx.calls) == 0, "an unlinked member's event must not fetch"
+
+        # The positive half of the log contract: the drop IS logged for a
+        # genuinely unlinked member. Its sibling test asserts the same
+        # message is ABSENT for a linked member -- a negative-only assertion
+        # that would pass vacuously if log capture ever broke, so this
+        # companion assertion is what keeps that one honest.
+        assert "dropping webhook event for unknown user_id" in caplog.text
 
         from whoopmcp.store import get_webhook_event
 
         event_row = get_webhook_event(db, event_payload["trace_id"])
         assert event_row is not None
-        assert event_row["status"] == "success"
+        assert event_row["status"] not in ("success", "dead_letter")
+        assert event_row["status"] == "pending"
+        assert event_row["attempt_count"] == 0, "the drop must not consume a retry attempt"
 
         # Assert: no sleep row exists for this user
         sleeps = db.execute(
@@ -633,6 +640,140 @@ class TestUnknownUserHandling:
             (unknown_user_id,),
         ).fetchone()
         assert sleeps[0] == 0
+
+
+class TestMembershipGate:
+    """Tests for #66: `_apply_event`'s membership gate must key on
+    `principal_members` (via `principal_is_linked_to_member`), not the
+    never-populated `profiles` table, and a drop for lacking a link must
+    never reach `mark_webhook_event_success`."""
+
+    @respx.mock
+    async def test_linked_member_with_no_profile_row_is_applied(
+        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """A whoop_user_id with a live `principal_members` row is applied
+        (fetch-and-upsert happens) even though no `profiles` row exists for
+        that user -- `upsert_profile` has zero callers in `src/`, so a gate
+        keyed on `profiles` would drop every event forever."""
+        user_id = 123
+        sleep_id = "sleep-uuid-linked-no-profile"
+
+        insert_principal(db, user_id)  # principal_members only -- no profiles row
+
+        sleep_record = {
+            "id": sleep_id,
+            "start": "2026-08-10T08:00:00Z",
+            "end": "2026-08-10T16:00:00Z",
+        }
+        sleep_route = respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id}").mock(
+            return_value=httpx.Response(200, json=sleep_record)
+        )
+
+        event_payload = create_webhook_event_payload("sleep.updated", sleep_id, user_id)
+        raw_body = encode_webhook_body(event_payload)
+
+        await process_webhook_event(db, client, raw_body)
+
+        assert sleep_route.called, "a linked member's event must fetch, not drop"
+
+        from whoopmcp.store import get_profile, get_sleeps, get_webhook_event
+
+        assert get_profile(db, user_id) is None, "profiles stays empty -- that's the whole bug"
+
+        sleeps = get_sleeps(db, user_id)
+        assert len(sleeps) == 1
+        assert sleeps[0]["id"] == sleep_id
+
+        event_row = get_webhook_event(db, event_payload["trace_id"])
+        assert event_row is not None
+        assert event_row["status"] == "success"
+
+    @respx.mock
+    async def test_linked_member_is_not_logged_as_unknown_user(
+        self,
+        config: Config,
+        auth: Authenticator,
+        db: sqlite3.Connection,
+        client: WhoopClient,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A linked member's event does not get logged as "dropping webhook
+        event for unknown user_id" -- that log line is reserved for a
+        genuinely unlinked whoop_user_id."""
+        user_id = 456
+        sleep_id = "sleep-uuid-no-drop-log"
+
+        insert_principal(db, user_id)
+
+        sleep_record = {
+            "id": sleep_id,
+            "start": "2026-08-10T08:00:00Z",
+            "end": "2026-08-10T16:00:00Z",
+        }
+        respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id}").mock(
+            return_value=httpx.Response(200, json=sleep_record)
+        )
+
+        event_payload = create_webhook_event_payload("sleep.updated", sleep_id, user_id)
+        raw_body = encode_webhook_body(event_payload)
+
+        with caplog.at_level(logging.INFO, logger="whoopmcp"):
+            await process_webhook_event(db, client, raw_body)
+
+        assert "dropping webhook event for unknown user_id" not in caplog.text
+
+    @respx.mock
+    async def test_redelivery_of_dropped_event_reaches_apply_event_again(
+        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """A second delivery of the same trace_id, after a first delivery was
+        dropped for lacking a principal link, is not short-circuited by the
+        `existing["status"] in ("success", "dead_letter")` check -- it
+        reaches `_apply_event` again, and (once the member has since linked)
+        actually applies."""
+        user_id = 789
+        sleep_id = "sleep-uuid-redelivery"
+
+        # Build the payload/body once, and redeliver the exact same bytes --
+        # a real WHOOP retry of its own webhook is byte-identical, and this
+        # is what keeps both deliveries keyed on the same trace_id.
+        event_payload = create_webhook_event_payload("sleep.updated", sleep_id, user_id)
+        raw_body = encode_webhook_body(event_payload)
+
+        # First delivery: user_id has no principal link yet -- dropped.
+        await process_webhook_event(db, client, raw_body)
+
+        assert len(respx.calls) == 0, "first delivery must not fetch: no link yet"
+
+        from whoopmcp.store import get_webhook_event
+
+        event_row = get_webhook_event(db, event_payload["trace_id"])
+        assert event_row is not None
+        assert event_row["status"] == "pending"
+
+        # The member logs in between deliveries.
+        insert_principal(db, user_id)
+
+        sleep_record = {
+            "id": sleep_id,
+            "start": "2026-08-10T08:00:00Z",
+            "end": "2026-08-10T16:00:00Z",
+        }
+        sleep_route = respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id}").mock(
+            return_value=httpx.Response(200, json=sleep_record)
+        )
+
+        # Second delivery of the exact same trace_id: must reach
+        # _apply_event again now that a link exists, not short-circuit on
+        # the still-pending row.
+        await process_webhook_event(db, client, raw_body)
+
+        assert sleep_route.called, "redelivery must reach _apply_event, not short-circuit"
+
+        event_row = get_webhook_event(db, event_payload["trace_id"])
+        assert event_row is not None
+        assert event_row["status"] == "success"
 
 
 class TestOutOfOrderEventHandling:
@@ -710,6 +851,14 @@ class TestRetryAndDeadLetterLogic:
         """Failing event is retried 5 times, then goes to dead_letter.
 
         The failing event does not block the next event in the queue.
+
+        Regression guard for #66: `user_id` here IS linked
+        (`insert_principal` below), so `_apply_event` never raises
+        `MemberNotLinkedError` -- every failure is a genuine transient
+        `WhoopAPIError` from the mocked 500. A real, exhausted-retries
+        failure must still land on `dead_letter`, not get swept into the
+        new "not yet actionable" `pending` state #66 adds for a different,
+        unrelated case.
         """
         user_id = 123
         sleep_id = "sleep-uuid-fail"
