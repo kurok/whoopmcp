@@ -10,7 +10,12 @@ Claude Desktop, Claude Code, Cursor, or anything else that speaks the
 protocol — read and analyse **your own** WHOOP data: recovery, sleep, strain,
 cycles and workouts.
 
-Runs locally. Your WHOOP credentials never leave your machine.
+Runs locally by default, and your WHOOP credentials never leave your machine
+in that mode. Run with `WHOOPMCP_TRANSPORT=streamable-http` (#27) instead and
+that stops being true: the operator of that server now holds other members'
+tokens and health data server-side, which makes them a data controller, not
+a bystander. See [PRIVACY.md](PRIVACY.md)'s local-mode/hosted-mode split
+before hosting this for anyone but yourself.
 
 > **Status: pre-alpha scaffold.** The structure, tool surface, configuration
 > and test harness are in place; the network and analysis internals are
@@ -129,8 +134,9 @@ warns when it first writes one.
 
 ## Privacy
 
-Read **[PRIVACY.md](PRIVACY.md)** before connecting real data. The essential
-points:
+Read **[PRIVACY.md](PRIVACY.md)** before connecting real data — it is split
+into local-mode and hosted-mode sections, since they are not the same
+document. The essential points:
 
 - **This server sends nothing to its maintainers.** No telemetry, no
   analytics, no phone-home. Traffic goes to `api.prod.whoop.com` and nowhere
@@ -142,8 +148,16 @@ points:
   going.
 - Tokens are stored locally at mode `0600`, or in your OS keychain. **On
   Windows file modes are not enforced** — use the keychain backend there.
-- Delete everything with `whoop_logout`, then remove `WHOOPMCP_STATE_DIR`,
-  then revoke the app in the WHOOP app under Settings.
+- **Local mode:** delete everything with `whoop_logout`, then remove
+  `WHOOPMCP_STATE_DIR`, then revoke the app in the WHOOP app under Settings.
+- **Hosted mode:** an operator holds other members' health data server-side
+  (#13) and is a data controller for it (GDPR Article 9). Per-member export
+  and erasure are operator-run CLI commands, deliberately not MCP tools —
+  `whoopmcp export-member --whoop-user-id N` and
+  `whoopmcp erase-member --whoop-user-id N` (the latter also revokes the
+  WHOOP grant upstream) — and `whoopmcp enforce-retention --max-age-days N`
+  deletes data past a configured age when an operator schedules it. This
+  project takes no backups of its own in either mode.
 
 ---
 

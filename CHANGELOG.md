@@ -289,6 +289,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -- deliberately not on `client.py` and never registered as an MCP tool,
   so an LLM-driven tool call can never reach it.
 
+- Issue #32: data subject rights -- export, erasure, and a real retention
+  job. Three new operator-only CLI subcommands (`__main__.py`), none
+  registered as an MCP tool and none touching `client.py`, per #30's own
+  precedent: `export-member` writes one JSON document covering every table
+  `store.py` defines for one member (health data, webhook events,
+  tool-call audit, principal links, plus the scopes actually granted --
+  never the token itself); `erase-member` reuses `Authenticator
+  .revoke_and_forget` (#30) for the upstream revoke, then permanently
+  `DELETE`s every row a new `store.erase_member_data` covers across a new
+  `store._ERASURE_TABLES` (`_TENANT_SCOPED_TABLES` plus `webhook_events` and
+  `tool_call_audit`) -- a real removal, verified at the database level, and
+  a structurally distinct code path from #18's `deleted_at` soft-delete
+  (`principal_members` is deliberately excluded, left to the existing
+  `delete_principal_links_for_member`); `enforce-retention` deletes rows
+  past a configured age (`--max-age-days`, default 730) via a new
+  `store.enforce_retention`, a deliberate cross-tenant sweep per table (keyed
+  per table by a new `store._RETENTION_TIMESTAMP_COLUMNS` map) rather than a
+  scheduler this project does not have -- an operator wires it into their
+  own cron or systemd timer. `store._ERASURE_TABLES` is asserted against the
+  live schema (`PRAGMA table_list`), not a second hand-maintained list, so a
+  future migration that adds a table without erasure coverage fails that
+  test rather than shipping silently unprotected. `PRIVACY.md` and
+  `README.md` now split every claim that differs between local mode (your
+  WHOOP credentials never leave your machine) and hosted mode (`WHOOPMCP_TRANSPORT=streamable-http`,
+  #27; an operator holding other members' health data server-side is a GDPR
+  controller, not a bystander) into their own sections, including an honest
+  statement that this project takes no backups of its own in either mode --
+  verified by grepping the repository for one, not assumed.
+
 ### Changed
 
 - WHOOP has confirmed the 100/minute and 10,000/day rate limits are **per

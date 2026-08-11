@@ -1,0 +1,773 @@
+"""Tests for issue #32: data subject rights -- export, erasure, retention.
+
+Written before any implementation exists, per the issue's own instruction.
+None of the following symbols exist yet: ``store.export_member_data``,
+``store.erase_member_data``, ``store.enforce_retention``,
+``store._ERASURE_TABLES``, ``store._RETENTION_TIMESTAMP_COLUMNS``, the four
+small ``get_*_for_member`` export helpers, or the ``export-member``/
+``erase-member``/``enforce-retention`` CLI subcommands in ``__main__.py``.
+``store`` and ``whoopmcp.__main__`` are referenced via module attribute access
+below rather than ``from ... import ...`` for exactly the reason
+``tests/test_tenancy.py``'s own docstring gives: this file must still
+*collect* today, so an individual test missing an attribute fails with a
+clear ``AttributeError``/``TypeError`` at call time rather than an
+``ImportError`` hiding every other test in the file. Once #32 lands both
+styles behave identically.
+
+Anchors this file leans on, already merged:
+
+- ``store._TENANT_SCOPED_TABLES`` / ``store._execute_scoped`` (#29) -- any new
+  erasure/export function must go through the same enforcement, not around it.
+- ``auth.Authenticator.revoke_and_forget`` / ``auth.revoke_upstream`` (#30) --
+  reused, not rebuilt, for erasure's "tokens ... plus upstream revocation"
+  scope. See ``tests/test_auth.py``'s own respx-mocked pattern, mirrored below.
+- ``__main__._delete_member`` / the ``delete-member`` subcommand (#30) --
+  ``erase-member`` is a new sibling subcommand, mirrored structurally
+  (including ``tests/test_main.py``'s own two delete-member tests).
+
+Erasure is a real ``DELETE``, never a ``deleted_at`` ``UPDATE`` -- that
+machinery is #18's, reserved for ``*.deleted`` webhook events, and is a
+deliberately distinct code path from a member exercising erasure (see the
+"soft-delete vs erasure are distinct paths" section at the bottom of this
+file). Every erasure assertion below reads the database directly with raw
+SQL on a plain ``sqlite3.Connection`` -- never through a store.py ``get_*``
+repository function that could itself filter member data and produce a false
+negative.
+"""
+
+from __future__ import annotations
+
+import inspect
+import sqlite3
+import time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+import respx
+
+from whoopmcp import store, webhook_processor
+from whoopmcp.__main__ import main
+from whoopmcp.auth import USER_ACCESS_URL, FileTokenStore, Token
+from whoopmcp.config import Config
+
+# Two WHOOP members. Large, distinctive integers so their decimal string
+# forms are vanishingly unlikely to collide with anything else in a fixture,
+# mirroring tests/test_tenancy.py's own MEMBER_A/MEMBER_B convention (kept in
+# a disjoint numeric range from that file's 900001/900002 purely so a
+# copy-paste mistake between the two files would be obvious, not because
+# anything here actually runs alongside test_tenancy.py's fixtures).
+MEMBER_A = 910001
+MEMBER_B = 910002
+
+
+@pytest.fixture
+def store_conn() -> sqlite3.Connection:
+    conn = store.open_store(":memory:")
+    yield conn
+    conn.close()
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> Config:
+    return Config.from_env(
+        {
+            "WHOOP_CLIENT_ID": "cid",
+            "WHOOP_CLIENT_SECRET": "csecret",
+            "WHOOP_REDIRECT_URI": "https://localhost:8443/callback",
+            "WHOOPMCP_STATE_DIR": str(tmp_path),
+        }
+    )
+
+
+def _set_required_env_and_state_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WHOOP_CLIENT_ID", "cid")
+    monkeypatch.setenv("WHOOP_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("WHOOP_REDIRECT_URI", "https://localhost:8443/callback")
+    monkeypatch.setenv("WHOOPMCP_STATE_DIR", str(tmp_path))
+
+
+# =============================================================================
+# seed helpers -- one per table in the anchor's enumeration, mirroring
+# tests/test_tenancy.py's own _seed_* helpers plus new ones for the three
+# tables that file doesn't need (webhook_events, tool_call_audit,
+# principal_members).
+# =============================================================================
+
+
+def _seed_recovery(conn: sqlite3.Connection, user_id: int, tag: str, cycle_id: int = 1) -> None:
+    store.upsert_recovery(
+        conn,
+        user_id,
+        {"cycle_id": cycle_id, "score_state": "SCORED", "score": {"recovery_score": tag}},
+    )
+
+
+def _seed_sleep(conn: sqlite3.Connection, user_id: int, tag: str, sleep_id: str = "s1") -> None:
+    store.upsert_sleep(
+        conn,
+        user_id,
+        {
+            "id": sleep_id,
+            "start": "2026-01-01T00:00:00Z",
+            "score_state": "SCORED",
+            "score": {"sleep_performance_percentage": tag},
+        },
+    )
+
+
+def _seed_cycle(conn: sqlite3.Connection, user_id: int, tag: str, cycle_id: int = 1) -> None:
+    store.upsert_cycle(
+        conn,
+        user_id,
+        {
+            "id": cycle_id,
+            "start": "2026-01-01T00:00:00Z",
+            "score_state": "SCORED",
+            "score": {"strain": tag},
+        },
+    )
+
+
+def _seed_workout(conn: sqlite3.Connection, user_id: int, tag: str, workout_id: str = "w1") -> None:
+    store.upsert_workout(
+        conn,
+        user_id,
+        {
+            "id": workout_id,
+            "start": "2026-01-01T00:00:00Z",
+            "score_state": "SCORED",
+            "sport_name": f"sport-{tag}",
+            "score": {"strain": tag},
+        },
+    )
+
+
+def _seed_body_measurement(conn: sqlite3.Connection, user_id: int, tag: str) -> None:
+    store.upsert_body_measurement(conn, user_id, {"weight_kilogram": tag})
+
+
+def _seed_profile(conn: sqlite3.Connection, user_id: int, tag: str) -> None:
+    store.upsert_profile(conn, user_id, {"user_id": user_id, "email": tag})
+
+
+def _seed_sync_state(conn: sqlite3.Connection, user_id: int, tag: str) -> None:
+    store.set_sync_state(
+        conn,
+        user_id,
+        "recoveries",
+        cursor=tag,
+        last_run_at="2026-01-01T00:00:00Z",
+        outcome="success",
+    )
+
+
+def _seed_webhook_event(conn: sqlite3.Connection, user_id: int, trace_id: str, tag: str) -> None:
+    store.insert_webhook_event(conn, trace_id, user_id, "sleep.updated", tag)
+
+
+def _seed_tool_call_audit(conn: sqlite3.Connection, user_id: int, tool_name: str) -> None:
+    store.record_tool_call(conn, user_id, tool_name)
+
+
+def _seed_principal_link(conn: sqlite3.Connection, user_id: int, client_id: str) -> None:
+    store.link_principal_to_member(
+        conn, client_id=client_id, issuer=None, subject=None, whoop_user_id=user_id
+    )
+
+
+def _seed_every_entity_table(conn: sqlite3.Connection, user_id: int, tag: str) -> None:
+    """Seed one row for ``user_id`` in every table the anchor names, tagged
+    distinctly so a cross-member leak or a survivor after erasure is
+    detectable by substring search."""
+    _seed_recovery(conn, user_id, tag)
+    _seed_sleep(conn, user_id, tag, sleep_id=f"sleep-{user_id}")
+    _seed_cycle(conn, user_id, tag, cycle_id=user_id)
+    _seed_workout(conn, user_id, tag, workout_id=f"workout-{user_id}")
+    _seed_body_measurement(conn, user_id, tag)
+    _seed_profile(conn, user_id, tag)
+    _seed_sync_state(conn, user_id, tag)
+    _seed_webhook_event(conn, user_id, f"trace-{user_id}", tag)
+    _seed_tool_call_audit(conn, user_id, f"tool-{tag}")
+    _seed_principal_link(conn, user_id, f"client-{user_id}")
+
+
+# =============================================================================
+# export: every entity held for a member, and never another member's data
+# =============================================================================
+
+
+def _walk_strings(value: Any) -> list[str]:
+    """Every string leaf reachable from ``value`` -- used to prove a marker
+    tag never appears anywhere in an exported document, not just at the
+    top level of whichever key happened to be checked."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str] = []
+        for k, v in value.items():
+            out.append(str(k))
+            out.extend(_walk_strings(v))
+        return out
+    if isinstance(value, list | tuple):
+        out = []
+        for item in value:
+            out.extend(_walk_strings(item))
+        return out
+    return [str(value)]
+
+
+def test_export_returns_every_entity_held_for_the_member(store_conn: sqlite3.Connection) -> None:
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+
+    export = store.export_member_data(store_conn, MEMBER_A)
+
+    assert export["whoop_user_id"] == MEMBER_A
+    assert "exported_at" in export
+    assert export["profile"]["email"] == "member-a-tag"
+    assert export["body_measurement"]["weight_kilogram"] == "member-a-tag"
+    assert len(export["recoveries"]) == 1
+    assert export["recoveries"][0]["score"]["recovery_score"] == "member-a-tag"
+    assert len(export["sleeps"]) == 1
+    assert len(export["cycles"]) == 1
+    assert len(export["workouts"]) == 1
+    assert len(export["sync_state"]) == 1
+    assert len(export["webhook_events"]) == 1
+    assert len(export["tool_call_audit"]) == 1
+    assert len(export["principal_links"]) == 1
+
+
+def test_export_never_leaks_a_second_members_data(store_conn: sqlite3.Connection) -> None:
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+    _seed_every_entity_table(store_conn, MEMBER_B, "member-b-tag")
+
+    export = store.export_member_data(store_conn, MEMBER_A)
+
+    dump = _walk_strings(export)
+    assert "member-b-tag" not in dump
+    assert str(MEMBER_B) not in dump
+    assert f"client-{MEMBER_B}" not in dump
+    assert f"trace-{MEMBER_B}" not in dump
+    # Positive control: member A's own tag really is present, so the
+    # negative assertions above aren't vacuously true against an empty export.
+    assert "member-a-tag" in dump
+
+
+def test_export_of_a_member_with_nothing_synced_yet_has_empty_collections_not_errors(
+    store_conn: sqlite3.Connection,
+) -> None:
+    export = store.export_member_data(store_conn, MEMBER_A)
+
+    assert export["whoop_user_id"] == MEMBER_A
+    assert export["profile"] is None
+    assert export["body_measurement"] is None
+    assert export["recoveries"] == []
+    assert export["sleeps"] == []
+    assert export["cycles"] == []
+    assert export["workouts"] == []
+    assert export["sync_state"] == []
+    assert export["webhook_events"] == []
+    assert export["tool_call_audit"] == []
+    assert export["principal_links"] == []
+
+
+# =============================================================================
+# erasure: real DELETEs, verified at the database level -- never through a
+# store.py get_* read, which could itself filter and produce a false negative
+# =============================================================================
+
+
+def test_erasure_registry_covers_every_schema_table() -> None:
+    """Enumerates the *live schema* (not a second hand-written list) via
+    ``PRAGMA table_list`` on a fresh store, so a future migration that adds a
+    table without adding it to ``store._ERASURE_TABLES`` (or the one
+    documented exception, ``principal_members``, erased separately by
+    ``delete_principal_links_for_member``) fails this test immediately --
+    one level stronger than #29's own hand-written-list-vs-test-cases parity
+    check, since this compares against the schema itself."""
+    conn = store.open_store(":memory:")
+    tables = {
+        row[1]
+        for row in conn.execute("PRAGMA table_list")
+        if row[0] == "main" and not row[1].startswith("sqlite_")
+    }
+    conn.close()
+
+    assert tables == store._ERASURE_TABLES | {"principal_members"}
+
+
+def test_erase_member_data_deletes_rows_from_every_erasure_table(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """Seeds one row per ``_ERASURE_TABLES`` table for MEMBER_A, erases, then
+    asserts directly against the database (raw ``conn.execute``, never a
+    store.py ``get_*`` read) that every one of those tables holds zero rows
+    for MEMBER_A afterward."""
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+
+    store.erase_member_data(store_conn, MEMBER_A)
+
+    for table in sorted(store._ERASURE_TABLES):
+        rows = store_conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608 -- table from a fixed internal frozenset, never user input
+            (MEMBER_A,),
+        ).fetchall()
+        assert rows == [], f"erase_member_data left rows behind in {table}"
+
+
+def test_erase_member_data_never_touches_another_members_rows(
+    store_conn: sqlite3.Connection,
+) -> None:
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+    _seed_every_entity_table(store_conn, MEMBER_B, "member-b-tag")
+
+    store.erase_member_data(store_conn, MEMBER_A)
+
+    for table in sorted(store._ERASURE_TABLES):
+        rows = store_conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (MEMBER_B,),
+        ).fetchall()
+        assert rows != [], (
+            f"erase_member_data for MEMBER_A wrongly removed MEMBER_B's rows in {table}"
+        )
+
+
+def test_erase_member_data_covers_webhook_events_and_tool_call_audit_specifically(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """Focused companion to the full-registry sweep above, exercising exactly
+    the two bookkeeping tables the issue calls out by name alongside health
+    data: webhook_events and tool_call_audit."""
+    _seed_webhook_event(store_conn, MEMBER_A, "trace-a", "member-a-tag")
+    _seed_webhook_event(store_conn, MEMBER_B, "trace-b", "member-b-tag")
+    _seed_tool_call_audit(store_conn, MEMBER_A, "tool-a")
+    _seed_tool_call_audit(store_conn, MEMBER_B, "tool-b")
+
+    store.erase_member_data(store_conn, MEMBER_A)
+
+    remaining_webhooks = store_conn.execute(
+        "SELECT trace_id FROM webhook_events WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    remaining_audit = store_conn.execute(
+        "SELECT tool_name FROM tool_call_audit WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    assert remaining_webhooks == []
+    assert remaining_audit == []
+
+    b_webhooks = store_conn.execute(
+        "SELECT trace_id FROM webhook_events WHERE whoop_user_id = ?", (MEMBER_B,)
+    ).fetchall()
+    b_audit = store_conn.execute(
+        "SELECT tool_name FROM tool_call_audit WHERE whoop_user_id = ?", (MEMBER_B,)
+    ).fetchall()
+    assert b_webhooks == [("trace-b",)]
+    assert b_audit == [("tool-b",)]
+
+
+def test_erase_member_data_does_not_touch_principal_members(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """``principal_members`` is deliberately erased by
+    ``delete_principal_links_for_member`` (#30), not duplicated inside
+    ``erase_member_data`` -- the two are composed by the CLI orchestration,
+    not by this one function alone."""
+    _seed_principal_link(store_conn, MEMBER_A, "client-a")
+
+    store.erase_member_data(store_conn, MEMBER_A)
+
+    rows = store_conn.execute(
+        "SELECT whoop_user_id FROM principal_members WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    assert rows == [(MEMBER_A,)], (
+        "erase_member_data must leave principal_members alone -- that table's own "
+        "erasure is delete_principal_links_for_member's job"
+    )
+
+
+# =============================================================================
+# erasure covers the upstream revoke too (reusing #30's own primitive) --
+# exercised at the CLI level (erase-member), mirroring
+# tests/test_main.py's delete-member tests and tests/test_auth.py's
+# revoke_and_forget respx pattern.
+# =============================================================================
+
+
+def test_erase_member_subcommand_revokes_upstream_and_deletes_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    _seed_every_entity_table(conn, 42, "erase-me-tag")
+    conn.close()
+
+    with respx.mock:
+        route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+        exit_code = main(["erase-member", "--whoop-user-id", "42"])
+
+    assert exit_code == 0
+    assert route.called
+    assert FileTokenStore(config.token_path).load() is None
+
+    conn = store_module.open_store(config.cache_path)
+    for table in sorted(store_module._ERASURE_TABLES):
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (42,),
+        ).fetchall()
+        assert rows == [], f"erase-member left rows behind in {table}"
+    assert (
+        store_module.get_member_for_principal(conn, client_id="local", issuer=None, subject=None)
+        is None
+    )
+    conn.close()
+
+
+def test_erase_member_subcommand_refuses_a_mismatched_whoop_user_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors test_main.py's own delete-member refusal test: a mismatched
+    id must refuse -- no upstream revoke, no local deletion -- not
+    silently no-op-succeed."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    _seed_every_entity_table(conn, 42, "erase-me-tag")
+    conn.close()
+
+    with respx.mock:
+        route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+        exit_code = main(["erase-member", "--whoop-user-id", "999"])
+
+    assert exit_code != 0
+    assert not route.called
+    assert FileTokenStore(config.token_path).load() is not None
+
+    conn = store_module.open_store(config.cache_path)
+    rows = conn.execute("SELECT * FROM recoveries WHERE whoop_user_id = ?", (42,)).fetchall()
+    assert rows != [], "a refused erase-member call must not delete anything"
+    conn.close()
+
+
+# =============================================================================
+# retention: a job that actually deletes rows past a configured age --
+# a record just inside the window survives, one just past it does not.
+# =============================================================================
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def test_enforce_retention_deletes_past_the_window_and_keeps_within_it(
+    store_conn: sqlite3.Connection,
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    max_age_days = 30
+
+    _seed_recovery(store_conn, MEMBER_A, "just-inside", cycle_id=1)
+    _seed_recovery(store_conn, MEMBER_A, "just-past", cycle_id=2)
+
+    just_inside_at = _iso(now - timedelta(days=max_age_days) + timedelta(seconds=1))
+    just_past_at = _iso(now - timedelta(days=max_age_days) - timedelta(seconds=1))
+    store_conn.execute(
+        "UPDATE recoveries SET updated_at = ? WHERE whoop_user_id = ? AND resource_id = ?",
+        (just_inside_at, MEMBER_A, "1"),
+    )
+    store_conn.execute(
+        "UPDATE recoveries SET updated_at = ? WHERE whoop_user_id = ? AND resource_id = ?",
+        (just_past_at, MEMBER_A, "2"),
+    )
+    store_conn.commit()
+
+    store.enforce_retention(store_conn, max_age_days=max_age_days, now=now)
+
+    remaining = {
+        row[0]
+        for row in store_conn.execute(
+            "SELECT resource_id FROM recoveries WHERE whoop_user_id = ?", (MEMBER_A,)
+        ).fetchall()
+    }
+    assert remaining == {"1"}, (
+        "the just-inside-window row must survive and the just-past one must not"
+    )
+
+
+def test_enforce_retention_honours_a_different_timestamp_column_per_table(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """webhook_events ages off ``created_at``, not ``updated_at`` -- proves
+    ``_RETENTION_TIMESTAMP_COLUMNS`` is actually consulted per table, not a
+    single hard-coded column name."""
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    max_age_days = 30
+
+    _seed_webhook_event(store_conn, MEMBER_A, "trace-inside", "member-a-tag")
+    _seed_webhook_event(store_conn, MEMBER_A, "trace-past", "member-a-tag")
+
+    just_inside_at = _iso(now - timedelta(days=max_age_days) + timedelta(seconds=1))
+    just_past_at = _iso(now - timedelta(days=max_age_days) - timedelta(seconds=1))
+    store_conn.execute(
+        "UPDATE webhook_events SET created_at = ? WHERE trace_id = ?",
+        (just_inside_at, "trace-inside"),
+    )
+    store_conn.execute(
+        "UPDATE webhook_events SET created_at = ? WHERE trace_id = ?",
+        (just_past_at, "trace-past"),
+    )
+    store_conn.commit()
+
+    store.enforce_retention(store_conn, max_age_days=max_age_days, now=now)
+
+    remaining = {
+        row[0]
+        for row in store_conn.execute(
+            "SELECT trace_id FROM webhook_events WHERE whoop_user_id = ?", (MEMBER_A,)
+        ).fetchall()
+    }
+    assert remaining == {"trace-inside"}
+
+
+def test_enforce_retention_only_touches_rows_past_the_window_for_their_own_member(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """A fresh row for one member must survive even while an old row for a
+    *different* member, in the same table, is aged out -- proves the sweep
+    doesn't over-delete across the whole table once it finds anything stale."""
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    max_age_days = 30
+
+    _seed_recovery(store_conn, MEMBER_A, "fresh", cycle_id=1)
+    _seed_recovery(store_conn, MEMBER_B, "old", cycle_id=1)
+
+    fresh_at = _iso(now - timedelta(days=1))
+    old_at = _iso(now - timedelta(days=max_age_days) - timedelta(seconds=1))
+    store_conn.execute(
+        "UPDATE recoveries SET updated_at = ? WHERE whoop_user_id = ?", (fresh_at, MEMBER_A)
+    )
+    store_conn.execute(
+        "UPDATE recoveries SET updated_at = ? WHERE whoop_user_id = ?", (old_at, MEMBER_B)
+    )
+    store_conn.commit()
+
+    store.enforce_retention(store_conn, max_age_days=max_age_days, now=now)
+
+    a_remaining = store_conn.execute(
+        "SELECT COUNT(*) FROM recoveries WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchone()[0]
+    b_remaining = store_conn.execute(
+        "SELECT COUNT(*) FROM recoveries WHERE whoop_user_id = ?", (MEMBER_B,)
+    ).fetchone()[0]
+    assert a_remaining == 1
+    assert b_remaining == 0
+
+
+def test_enforce_retention_returns_per_table_counts(store_conn: sqlite3.Connection) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    max_age_days = 30
+    _seed_recovery(store_conn, MEMBER_A, "old", cycle_id=1)
+    old_at = _iso(now - timedelta(days=max_age_days) - timedelta(seconds=1))
+    store_conn.execute(
+        "UPDATE recoveries SET updated_at = ? WHERE whoop_user_id = ?", (old_at, MEMBER_A)
+    )
+    store_conn.commit()
+
+    result = store.enforce_retention(store_conn, max_age_days=max_age_days, now=now)
+
+    assert isinstance(result, dict)
+    assert result.get("recoveries", 0) >= 1
+
+
+# =============================================================================
+# enforce-retention CLI wiring, mirroring delete-member's own subparser style
+# =============================================================================
+
+
+def test_enforce_retention_subcommand_runs_and_never_prints_a_token_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    sentinel_access = "SENTINEL-ACCESS-abc123"
+    sentinel_refresh = "SENTINEL-REFRESH-xyz789"
+    FileTokenStore(config.token_path).save(
+        Token(sentinel_access, expires_at=time.time() + 3600, refresh_token=sentinel_refresh)
+    )
+    conn = store_module.open_store(config.cache_path)
+    _seed_recovery(conn, 42, "old", cycle_id=1)
+    conn.execute(
+        "UPDATE recoveries SET updated_at = '2000-01-01T00:00:00+00:00' WHERE whoop_user_id = ?",
+        (42,),
+    )
+    conn.commit()
+    conn.close()
+
+    exit_code = main(["enforce-retention", "--max-age-days", "30"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert sentinel_access not in captured.out
+    assert sentinel_access not in captured.err
+    assert sentinel_refresh not in captured.out
+    assert sentinel_refresh not in captured.err
+
+    conn = store_module.open_store(config.cache_path)
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM recoveries WHERE whoop_user_id = ?", (42,)
+    ).fetchone()[0]
+    conn.close()
+    assert remaining == 0
+
+
+# =============================================================================
+# export-member CLI wiring
+# =============================================================================
+
+
+def test_export_member_subcommand_writes_json_scoped_to_the_target_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    _seed_every_entity_table(conn, 42, "export-me-tag")
+    _seed_every_entity_table(conn, 43, "other-member-tag")
+    conn.close()
+
+    out_path = tmp_path / "export.json"
+    exit_code = main(["export-member", "--whoop-user-id", "42", "--out", str(out_path)])
+
+    assert exit_code == 0
+    import json as _json
+
+    document = _json.loads(out_path.read_text(encoding="utf-8"))
+    dump = _walk_strings(document)
+    assert "export-me-tag" in dump
+    assert "other-member-tag" not in dump
+    assert "access-tok" not in dump
+    assert "refresh-tok" not in dump
+
+
+def test_export_member_subcommand_refuses_an_unlinked_whoop_user_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    exit_code = main(["export-member", "--whoop-user-id", "999999"])
+
+    assert exit_code == 2
+
+
+def test_export_member_subcommand_never_attributes_the_token_to_the_wrong_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """There is exactly one token file, but ``principal_members`` can still
+    hold links to more than one distinct WHOOP member (e.g. an operator
+    re-authorised against a different WHOOP account without ever running
+    erase-member for the old one). Nothing local records which member the
+    single stored token actually belongs to in that case -- the export must
+    say so honestly instead of silently attaching another member's scopes."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local-old", issuer=None, subject=None, whoop_user_id=MEMBER_A
+    )
+    store_module.link_principal_to_member(
+        conn, client_id="local-new", issuer=None, subject=None, whoop_user_id=MEMBER_B
+    )
+    conn.close()
+
+    out_path = tmp_path / "export.json"
+    exit_code = main(["export-member", "--whoop-user-id", str(MEMBER_A), "--out", str(out_path)])
+
+    assert exit_code == 0
+    import json as _json
+
+    document = _json.loads(out_path.read_text(encoding="utf-8"))
+    assert document["consent"]["scopes"] is None
+    assert document["consent"]["token_present"] is None
+    assert "access-tok" not in _walk_strings(document)
+    assert "refresh-tok" not in _walk_strings(document)
+
+
+# =============================================================================
+# soft-delete (#18) and erasure (#32) are distinct code paths -- confirmed
+# both statically (erasure never touches deleted_at; the *.deleted webhook
+# path never calls into erasure) and never merged into one "delete" function.
+# =============================================================================
+
+
+def test_erase_member_data_never_references_deleted_at() -> None:
+    """Reusing #18's soft-delete machinery is the obvious shortcut for
+    erasure, and it is wrong: it would leave the row (and its raw_json) in
+    the table. This asserts the real DELETE path never touches that column
+    at all, not merely that it deletes rows despite also setting it."""
+    source = inspect.getsource(store.erase_member_data)
+    assert "deleted_at" not in source
+
+
+def test_webhook_processor_never_calls_into_erasure_or_retention() -> None:
+    """The *.deleted webhook path (`_set_deleted_at`) and real member erasure
+    must never call into each other -- an AST-free, source-level check (the
+    module is small and stable enough that a substring check on function
+    names is sufficient and avoids over-engineering an AST walk that store.py
+    already needs for a much sharper property elsewhere)."""
+    source = inspect.getsource(webhook_processor)
+    assert "erase_member_data" not in source
+    assert "enforce_retention" not in source
+
+
+def test_set_deleted_at_and_erase_member_data_are_different_functions() -> None:
+    """The plainest possible version of "these are two paths, not one":
+    erasure's own function is not webhook_processor's soft-delete helper,
+    and neither calls the other by name in its source."""
+    assert store.erase_member_data is not webhook_processor._set_deleted_at
+    erase_source = inspect.getsource(store.erase_member_data)
+    assert "_set_deleted_at" not in erase_source
