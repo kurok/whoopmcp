@@ -10,6 +10,7 @@ import httpx
 import pytest
 import respx
 
+from whoopmcp import metrics
 from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
 from whoopmcp.client import (
     BASE_URL,
@@ -461,6 +462,7 @@ async def test_429_with_retry_after_waits_and_retries_once(
         httpx.Response(200, json={"user_id": 1}),
     ]
 
+    metrics.reset()
     async with WhoopClient(config, auth, clock=clock.now) as client:
         task = asyncio.create_task(client._get(path))
         await asyncio.sleep(0)
@@ -471,6 +473,12 @@ async def test_429_with_retry_after_waits_and_retries_once(
 
     assert result == {"user_id": 1}
     assert len(route.calls) == 2
+    # #31's counters, pinned here rather than in test_metrics.py because this
+    # is the only place a 429 is driven through the real retry loop. Asserting
+    # them only via direct metrics.record_* calls would leave the wiring
+    # unpinned, so deleting the increment from client.py would stay green.
+    assert metrics._counters.rate_limited == 1
+    assert metrics._counters.rate_limit_exhausted == 0
 
 
 @respx.mock
@@ -486,6 +494,7 @@ async def test_429_without_retry_after_backs_off_and_gives_up(
         return_value=httpx.Response(429, json={"error": "rate_limited"})
     )
 
+    metrics.reset()
     async with WhoopClient(config, auth, clock=clock.now) as client:
         task = asyncio.create_task(client._get(path))
 
@@ -503,6 +512,12 @@ async def test_429_without_retry_after_backs_off_and_gives_up(
         assert task.done()
         with pytest.raises(RateLimitedError):
             await asyncio.wait_for(task, timeout=1.0)
+
+    # #31: giving up is the incident counter, and every retry before it still
+    # counts as a 429 the operator should see. Pinned here for the same reason
+    # as the retried case above -- this is the only real exhaustion path.
+    assert metrics._counters.rate_limit_exhausted == 1
+    assert metrics._counters.rate_limited > 0
 
     assert 1 < len(route.calls) <= 10
 

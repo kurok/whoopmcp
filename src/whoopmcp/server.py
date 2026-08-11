@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hmac
 import json
 import logging
 import sqlite3
@@ -31,9 +32,9 @@ from mcp.server.mcpserver.exceptions import ResourceNotFoundError
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
-from whoopmcp import store
+from whoopmcp import metrics, store
 from whoopmcp.analysis import (
     _METRIC_PATHS,  # reused for whoop_timeseries (#20), not duplicated
     DEFAULT_LAG_SWEEP,
@@ -460,6 +461,64 @@ def _register_health_routes(server: MCPServer[AppContext]) -> None:
         )
 
 
+def _register_metrics_route(server: MCPServer[AppContext]) -> None:
+    """``GET /metrics``: Prometheus exposition for issue #31.
+
+    Same shape of problem ``_check_token_store_reachable`` and
+    ``register_webhook_routes`` already solve: a ``custom_route`` handler
+    gets a plain Starlette ``Request``, never the lifespan-resolved
+    ``AppContext``, so ``Config`` is read fresh per request rather than
+    captured once at server-build time, and the store connection is opened
+    and closed here rather than reused from ``AppContext.store_conn``.
+
+    Fails closed on both axes the issue's Notes and decision D2/D3 require:
+
+    - No ``WHOOPMCP_METRICS_TOKEN`` configured -> ``404``, byte-for-byte the
+      plain-text ``Not Found`` Starlette itself returns for an unregistered
+      path, so this route's existence isn't advertised either. Per the SDK's
+      own docstring, a ``@custom_route``
+      "will not require authorization" on its own -- unlike every MCP tool,
+      which goes through the SDK's auth middleware -- so this handler is
+      the only thing standing between the internet and per-member health
+      data once a token *is* configured.
+    - Token configured but the request's ``Authorization`` header is
+      missing or doesn't match -> ``401``. Compared with
+      ``hmac.compare_digest``, never ``==``, the same discipline
+      ``webhooks.py`` already applies to its own signature check.
+    - The token itself, the ``member_ref`` salt, and the WHOOP client
+      secret never appear in the response body -- ``metrics.render`` is
+      what actually enforces that; this handler adds nothing to the body
+      beyond what it returns.
+    """
+
+    @server.custom_route("/metrics", methods=["GET"])
+    async def metrics_endpoint(request: Request) -> Response:
+        config = Config.from_env()
+        if not config.metrics_token:
+            # Plain text, matching Starlette's own 404 body byte-for-byte: a
+            # JSON {"error": ...} body here would differ from what an
+            # unregistered path returns and so would confirm the route exists.
+            return PlainTextResponse("Not Found", status_code=404)
+
+        provided = request.headers.get("Authorization", "")
+        expected = f"Bearer {config.metrics_token}"
+        # The isascii() guard is not redundant: hmac.compare_digest raises
+        # TypeError on a str containing any non-ASCII character, and Starlette
+        # decodes raw header bytes as latin-1, so any caller can put one there
+        # -- turning what should be a 401 into an unhandled 500. A non-ASCII
+        # header cannot match a token this handler built itself, so failing it
+        # here is the same answer, arrived at without the exception.
+        if not (provided.isascii() and hmac.compare_digest(provided, expected)):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        conn = open_store(config.cache_path)
+        try:
+            text = metrics.render(conn, config)
+        finally:
+            conn.close()
+        return Response(text, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
 def build_server() -> MCPServer[AppContext]:
     """Construct the server and register every tool on it."""
     server: MCPServer[AppContext] = MCPServer(
@@ -476,6 +535,7 @@ def build_server() -> MCPServer[AppContext]:
     _register_prompts(server)
     _register_resources(server)
     _register_health_routes(server)
+    _register_metrics_route(server)
     # Stashed on the server instance, not returned or discarded: `lifespan`
     # (already handed to MCPServer(...) above, and called back by the SDK
     # with only the server itself as an argument) reads it back via

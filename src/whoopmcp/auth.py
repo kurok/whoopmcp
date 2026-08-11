@@ -25,6 +25,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from whoopmcp import metrics
 from whoopmcp.config import Config
 from whoopmcp.crypto import SealError, seal, unseal
 
@@ -587,29 +588,54 @@ class Authenticator:
 
     async def _do_refresh(self, token: Token) -> Token:
         async with httpx.AsyncClient(timeout=self._config.request_timeout) as client:
-            response = await client.post(
-                TOKEN_URL,
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": token.refresh_token,
-                    "client_id": self._config.client_id,
-                    "client_secret": self._config.client_secret,
-                    "scope": "offline",
-                },
-            )
+            try:
+                response = await client.post(
+                    TOKEN_URL,
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": token.refresh_token,
+                        "client_id": self._config.client_id,
+                        "client_secret": self._config.client_secret,
+                        "scope": "offline",
+                    },
+                )
+            except httpx.RequestError:
+                # #31: a refresh that never got a response at all -- never
+                # counted as invalid_grant/token_endpoint_error, both of
+                # which need an actual response to classify.
+                metrics.record_token_refresh_failure("network_error")
+                raise
         if response.status_code == 400 and _is_invalid_grant(response):
             self._store.clear()
             self._token = None
+            metrics.record_token_refresh_failure("invalid_grant")
             # GrantAlreadyGoneError, not plain AuthError: the grant is gone,
             # not merely unreachable -- see that class's own docstring.
             raise GrantAlreadyGoneError(
                 "WHOOP rejected the refresh token (invalid_grant); it will not become valid "
                 "on retry -- run whoop_login to re-authorise"
             )
-        _raise_for_token_error(response)
-        new_token = Token.from_response(response.json())
+        try:
+            _raise_for_token_error(response)
+        except AuthError:
+            # #31: any other non-2xx from the token endpoint. Not inside
+            # _raise_for_token_error itself -- exchange_code shares that
+            # helper, and a counter there would conflate first-login
+            # failures with refresh failures.
+            metrics.record_token_refresh_failure("token_endpoint_error")
+            raise
+        try:
+            new_token = Token.from_response(response.json())
+        except (AuthError, ValueError):
+            # #31: a 2xx response whose body isn't the token shape expected
+            # -- either response.json() itself failing (not JSON at all) or
+            # Token.from_response's own AuthError for a JSON body missing
+            # the fields it needs.
+            metrics.record_token_refresh_failure("malformed_response")
+            raise
         self._store.save(new_token)
         self._token = new_token
+        metrics.record_token_refresh_success()
         return new_token
 
     async def access_token(self) -> str:

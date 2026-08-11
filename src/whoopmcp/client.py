@@ -22,6 +22,7 @@ from typing import Any
 
 import httpx
 
+from whoopmcp import metrics
 from whoopmcp.auth import Authenticator, AuthError, build_store
 from whoopmcp.config import Config
 
@@ -60,6 +61,17 @@ class RequestPriority(enum.Enum):
 #: slightly-delayed, but still prompt, grant once a window rolls over, a
 #: header reveals more room, or a 429's wait elapses.
 _POLL_INTERVAL_SECONDS = 0.02
+
+
+@dataclass(frozen=True, slots=True)
+class RateLimitBudget:
+    """A point-in-time snapshot of `RateLimiter`'s budget, for `metrics.py`
+    (#31) -- see `RateLimiter.budget_snapshot`."""
+
+    minute_remaining: int
+    minute_limit: int
+    day_remaining: int
+    day_limit: int
 
 
 class RateLimiter:
@@ -120,6 +132,7 @@ class RateLimiter:
                     if may_take:
                         self._minute_remaining -= 1
                         self._day_remaining -= 1
+                        self._publish_budget()
                         return
                 await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         finally:
@@ -147,6 +160,29 @@ class RateLimiter:
             # drifted from WHOOP's own doesn't grant early, or make an
             # already-refilled bucket wait longer than it has to.
             self._minute_window_start = self._clock() + reset_seconds - 60.0
+        self._publish_budget()
+
+    def _publish_budget(self) -> None:
+        """Push the current budget into `metrics.py` (#31) -- see
+        `metrics.publish_rate_budget`'s own docstring for why this is a push
+        rather than the exporter reaching in here.
+        """
+        metrics.publish_rate_budget(
+            minute_remaining=self._minute_remaining,
+            minute_limit=self._per_minute_limit,
+            day_remaining=self._day_remaining,
+            day_limit=self._per_day_limit,
+        )
+
+    def budget_snapshot(self) -> RateLimitBudget:
+        """Public accessor for `metrics.py` (#31, item C) -- so it never
+        reaches into `_minute_remaining` and friends directly."""
+        return RateLimitBudget(
+            minute_remaining=self._minute_remaining,
+            minute_limit=self._per_minute_limit,
+            day_remaining=self._day_remaining,
+            day_limit=self._per_day_limit,
+        )
 
 
 async def _wait_seconds(clock: Callable[[], float], seconds: float) -> None:
@@ -367,6 +403,7 @@ class WhoopClient:
 
         attempt = 0
         while response.status_code == 429 and attempt < _MAX_429_RETRIES:
+            metrics.record_rate_limited()
             retry_after = _parse_retry_after_seconds(response)
             wait_seconds = retry_after if retry_after is not None else _backoff_seconds(attempt)
             await _wait_seconds(self._clock, wait_seconds)
@@ -376,6 +413,7 @@ class WhoopClient:
             self._rate_limiter.reconcile(response.headers)
 
         if response.status_code == 429:
+            metrics.record_rate_limit_exhausted()
             raise RateLimitedError(
                 _error_message(response), retry_after=_reset_seconds(response.headers)
             )

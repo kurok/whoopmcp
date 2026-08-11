@@ -1,0 +1,158 @@
+# Prometheus alerting rules for whoopmcp's /metrics endpoint (issue #31).
+#
+# Load this file the same way as any other Prometheus rules file, e.g. in
+# prometheus.yml:
+#
+#   rule_files:
+#     - /path/to/ops/alerts.yml
+#
+# Kept in ops/ (a new top-level directory: this repo previously had no
+# operator-facing config outside docs/) rather than docs/, because these are
+# rules a Prometheus server loads and evaluates -- not documentation prose --
+# and rather than under src/ because they ship as data, never imported by
+# any Python module. tests/test_metrics.py's own D4 tests read this file
+# directly (glob ops/*.y*ml), so it is also what keeps "every alert has a
+# metric that provably moves" auditable instead of asserted in prose: a
+# rename here that orphans a metric fails
+# test_every_metric_named_by_an_alert_rule_is_really_exported.
+#
+# None of these rules name a member: every whoopmcp_* metric with a
+# member_ref label is only ever selected by label matcher on the *name* of
+# the label, never a literal value, since that value is an opaque, salted
+# HMAC that rotates the moment WHOOPMCP_METRICS_SALT does.
+
+groups:
+  - name: whoopmcp
+    rules:
+      # "Sync lag per member" -- the issue's own "single most useful number
+      # in the system". Per-member and per-entity on purpose: an aggregate
+      # would hide the one member whose connection died three weeks ago
+      # behind everyone else's healthy median.
+      - alert: WhoopMemberSyncLagHigh
+        expr: whoopmcp_data_freshness_seconds > 86400
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Member {{ $labels.member_ref }}'s {{ $labels.entity }} data is over 24h stale"
+          description: >-
+            whoopmcp_data_freshness_seconds for this member/entity has been
+            above 86400s (24h) for 30m. Cross-check
+            whoopmcp_sync_last_run_age_seconds for the same member/entity to
+            tell "sync stopped running" apart from "sync keeps running but
+            WHOOP has nothing new to give it" -- both are real, and they call
+            for different responses.
+
+      # The companion half of the same failure mode: the sync itself may
+      # have stopped running (not merely stopped finding anything new).
+      - alert: WhoopMemberSyncStopped
+        expr: whoopmcp_sync_last_run_age_seconds > 86400
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Member {{ $labels.member_ref }}'s {{ $labels.entity }} sync hasn't run in over 24h"
+          description: >-
+            whoopmcp_sync_last_run_age_seconds (sync_state.last_run_at, the
+            raw entity key -- including the ':incremental' namespace) has
+            been above 86400s for 30m: whoop_sync is not running for this
+            member/entity at all, independent of whether the data itself
+            has gone stale.
+
+      # Webhook signature-verification failure rate. Rate, not a raw
+      # counter, and compared against the accepted rate so a busy endpoint
+      # with a trickle of forged requests doesn't page the same as a
+      # rotated secret rejecting every genuine delivery.
+      - alert: WhoopWebhookSignatureFailuresSustained
+        expr: >-
+          sum(rate(whoopmcp_webhook_signature_failures_total[5m]))
+            > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained webhook signature verification failures"
+          description: >-
+            whoopmcp_webhook_signature_failures_total has been climbing for
+            10m. A step change to "every delivery rejected" usually means
+            WHOOP_CLIENT_SECRET was rotated in the WHOOP dashboard without
+            updating every environment this server runs in -- see
+            docs/SETUP.md's rotation section. whoopmcp_webhooks_accepted_total
+            is the denominator for turning this into a true failure rate.
+
+      # invalid_grant "on any member" -- deliberately increase() > 0, not an
+      # aggregate rate: one revoked grant is one member who needs to
+      # whoop_logout/whoop_login again, and should page every time, not only
+      # once a rate crosses some threshold.
+      - alert: WhoopTokenRefreshInvalidGrant
+        expr: increase(whoopmcp_token_refresh_failures_total{cause="invalid_grant"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WHOOP rejected a refresh token as invalid_grant"
+          description: >-
+            whoopmcp_token_refresh_failures_total{cause="invalid_grant"}
+            increased in the last 15m: the member revoked the grant (or an
+            operator already ran whoop_logout) and the only fix is
+            whoop_login again. The other causes
+            (token_endpoint_error/malformed_response/network_error) are
+            typically transient and are not what this rule watches.
+
+      # 429 rate and remaining rate budget: "near exhaustion" has to be a
+      # ratio, since WHOOP's own X-RateLimit-Limit header can change the
+      # minute limit at runtime (RateLimiter.reconcile overwrites it).
+      - alert: WhoopRateLimitBudgetNearExhaustion
+        expr: >-
+          (whoopmcp_rate_limit_remaining / whoopmcp_rate_limit_limit) < 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WHOOP API rate limit budget for the {{ $labels.window }} window is nearly exhausted"
+          description: >-
+            remaining/limit for this window has stayed below 10% for 5m.
+            The 'day' window is this process's local accounting only --
+            never reconciled against a WHOOP header -- so treat it as an
+            estimate, not WHOOP's own truth. whoopmcp_rate_limited_total and
+            whoopmcp_rate_limit_exhausted_total show whether requests are
+            actually being retried or outright failing because of it.
+
+      # Webhook delivery silence, per member and overall. The issue is
+      # explicit that a dead integration and a member on holiday look
+      # identical against a fixed threshold, so this compares each member's
+      # current silence against *their own* recent history (a range-vector
+      # baseline), not an absolute cutoff.
+      - alert: WhoopMemberWebhookSilenceRelativeToBaseline
+        expr: >-
+          whoopmcp_webhook_last_delivery_age_seconds
+            > 3 * quantile_over_time(0.9, whoopmcp_webhook_last_delivery_age_seconds[14d])
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Member {{ $labels.member_ref }} has gone quiet relative to their own webhook baseline"
+          description: >-
+            whoopmcp_webhook_last_delivery_age_seconds for this member is
+            more than 3x their own 14-day p90 silence gap, sustained for 1h.
+            A fixed threshold can't tell a dead integration apart from a
+            member on holiday; their own history can.
+
+      # The fleet-wide backstop: fires even when per-member series are
+      # withheld entirely (WHOOPMCP_METRICS_SALT unset) or when the deploy
+      # has exactly one member, where "per-member baseline" has no history
+      # to compare against yet.
+      - alert: WhoopNoWebhookDeliveryFleetWide
+        expr: whoopmcp_webhook_seconds_since_any_delivery > 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No webhook delivery has completed for any member in over 24h"
+          description: >-
+            whoopmcp_webhook_seconds_since_any_delivery carries no
+            member_ref label, so it is exported even when
+            WHOOPMCP_METRICS_SALT is unset. Treat this as a backstop for
+            WhoopMemberWebhookSilenceRelativeToBaseline, not a replacement
+            for it -- a single healthy member keeps this one quiet while the
+            per-member rule still fires for everyone else.
