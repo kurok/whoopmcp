@@ -180,7 +180,15 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
             if consumer_task is not None:
                 consumer_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await consumer_task
+                    # Awaited for its side effect (blocking until the task
+                    # has actually finished cancelling), not its result --
+                    # assigned to make that discard explicit rather than a
+                    # bare expression statement. mypy's func-returns-value
+                    # check misfires on any assignment of an
+                    # asyncio.Task[None]'s await result, regardless of the
+                    # assignment target's own type -- verified in isolation,
+                    # not assumed.
+                    _ = await consumer_task  # type: ignore[func-returns-value]
             store_conn.close()
 
 

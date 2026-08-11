@@ -103,11 +103,14 @@ class Token:
 class TokenStore(Protocol):
     """Somewhere a token can be kept between server restarts."""
 
-    def load(self) -> Token | None: ...
+    def load(self) -> Token | None:
+        pass
 
-    def save(self, token: Token) -> None: ...
+    def save(self, token: Token) -> None:
+        pass
 
-    def clear(self) -> None: ...
+    def clear(self) -> None:
+        pass
 
 
 def _atomic_write_text(path: Path, contents: str) -> None:
@@ -443,9 +446,11 @@ class RefreshLock(Protocol):
     identity (needs #13). See #27 for the discovery and reasoning.
     """
 
-    async def acquire(self) -> None: ...
+    async def acquire(self) -> None:
+        pass
 
-    def release(self) -> None: ...
+    def release(self) -> None:
+        pass
 
 
 class InProcessRefreshLock:
