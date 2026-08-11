@@ -44,12 +44,25 @@ from whoopmcp.client import RateLimitedError, WhoopClient, build_collection_para
 from whoopmcp.config import Config
 from whoopmcp.context_budget import strip_nulls
 from whoopmcp.store import open_store
+from whoopmcp.sync import SyncDisabledError, run_sync
 from whoopmcp.webhook_processor import _consume_webhooks
 from whoopmcp.webhooks import register_webhook_routes
 
 logger = logging.getLogger("whoopmcp")
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True)
+
+#: For ``whoop_sync`` (#15) alone: WHOOP itself is only ever read (GET), but
+#: the tool's entire purpose is writing upserted records to the local store,
+#: so ``read_only_hint=True`` would be factually wrong per MCP's own
+#: semantics ("does not modify its environment") -- a client that trusts the
+#: hint could auto-approve it without the confirmation a writing tool
+#: otherwise warrants. ``destructive_hint=False`` and ``idempotent_hint=True``
+#: are both accurate: every write is an upsert, and running it twice with no
+#: new upstream data is a no-op.
+SYNCS_LOCAL_STORE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True
+)
 
 INSTRUCTIONS = """\
 Read-only access to the signed-in user's own WHOOP data: recovery, sleep,
@@ -974,6 +987,46 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             return trimmed
 
         return await _guard_rate_limit(_fetch)
+
+    @server.tool(name="whoop_sync", title="Sync recent WHOOP data", annotations=SYNCS_LOCAL_STORE)
+    async def whoop_sync(ctx: Context[AppContext, Any]) -> dict[str, Any]:
+        """Pull every recovery, sleep, cycle and workout changed since the last sync.
+
+        Walks each collection forward from its own high-water ``updated_at``
+        mark (never ``created_at``, so a rescored recovery or sleep is
+        picked up, not just a newly-created one) and upserts every record
+        into the local store. Once caught up, this costs one request per
+        collection.
+
+        Deletions are invisible to this walk: a record removed upstream
+        keeps whatever was last synced for it. Only a WHOOP webhook reports
+        a delete, and reconciling one this tool missed is a separate,
+        not-yet-built job -- do not rely on this tool to notice one.
+
+        Requires the persistent store (``WHOOPMCP_CACHE=true``, off by
+        default -- see PRIVACY.md). When it is disabled this returns
+        ``{"synced": False, ...}`` explaining why, rather than raising.
+        """
+        app = ctx.request_context.lifespan_context
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        if app.store_conn is None:
+            # _ensure_matches_live_grant (via resolve_member_id) already
+            # requires a store to have resolved this far; this is here only
+            # so mypy can narrow the type below, not a reachable branch.
+            raise RuntimeError("whoop_sync requires a persistent store")
+
+        try:
+            results = await run_sync(app.store_conn, app.client, app.config, whoop_user_id)
+        except SyncDisabledError as exc:
+            return {"synced": False, "message": str(exc)}
+
+        return {
+            "synced": True,
+            "entities": {
+                name: {"count": result.count, "cursor": result.high_water_mark}
+                for name, result in results.items()
+            },
+        }
 
 
 # -- analysis --------------------------------------------------------------

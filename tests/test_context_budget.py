@@ -531,6 +531,70 @@ async def test_get_workout_within_ceiling(
     assert estimate_tokens(result) <= TOOL_CEILINGS["get_workout"]
 
 
+# -- whoop_sync (#15): counts and a cursor per entity, never full records ---
+
+
+@respx.mock
+async def test_whoop_sync_within_ceiling(tmp_path: Path, server: MCPServer[AppContext]) -> None:
+    """whoop_sync's response is four small per-entity dicts (count + cursor),
+    never echoed records -- built on its own cache-enabled config/store
+    rather than this file's shared ``app_context`` fixture, since that
+    fixture's ``config`` leaves ``WHOOPMCP_CACHE`` unset and #15's tool
+    refuses to write to a disabled store (see tests/test_sync.py for that
+    contract in full)."""
+    config = Config.from_env(
+        {
+            "WHOOP_CLIENT_ID": "cid",
+            "WHOOP_CLIENT_SECRET": "csecret",
+            "WHOOP_REDIRECT_URI": "https://localhost:8443/callback",
+            "WHOOPMCP_STATE_DIR": str(tmp_path),
+            "WHOOPMCP_CACHE": "true",
+        }
+    )
+    FileTokenStore(config.token_path).save(
+        Token("fake-access-token", expires_at=time.time() + 3600, refresh_token="fake-refresh")
+    )
+    auth = Authenticator(config)
+    conn = open_store(":memory:")
+    link_principal_to_member(
+        conn, client_id="__local__", issuer=None, subject=None, whoop_user_id=12345
+    )
+
+    respx.get(f"{BASE_URL}/v2/recovery").mock(
+        return_value=httpx.Response(200, json=_dense_page(_dense_recovery, count=1))
+    )
+    respx.get(f"{BASE_URL}/v2/activity/sleep").mock(
+        return_value=httpx.Response(200, json=_dense_page(_dense_sleep, count=1))
+    )
+    respx.get(f"{BASE_URL}/v2/cycle").mock(
+        return_value=httpx.Response(200, json=_dense_page(_dense_cycle, count=1))
+    )
+    respx.get(f"{BASE_URL}/v2/activity/workout").mock(
+        return_value=httpx.Response(200, json=_dense_page(_dense_workout, count=1))
+    )
+
+    try:
+        async with WhoopClient(config, auth, clock=fast_forwarding_clock()) as client:
+            app_context = AppContext(
+                config=config,
+                auth=auth,
+                client=client,
+                principal=Principal(user_id=12345),
+                store_conn=conn,
+            )
+            result = await call_tool(server, "whoop_sync", {}, app_context)
+
+        assert set(result["entities"]) == {"recoveries", "sleeps", "cycles", "workouts"}
+        assert estimate_tokens(result) <= TOOL_CEILINGS["whoop_sync"]
+    finally:
+        # A try/finally here (unlike this file's other tests, which are
+        # already implemented and so never raise before their own
+        # conn.close()) so this not-yet-implemented tool's ToolError
+        # doesn't leak an unclosed sqlite connection into a later test's
+        # ResourceWarning-as-error under this project's filterwarnings=error.
+        conn.close()
+
+
 # -- analysis tools, against a >1000-record, >2-year collection -------------
 
 
