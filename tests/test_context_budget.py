@@ -332,6 +332,73 @@ def _seed(conn: Any, whoop_user_id: int, upsert: Any, records: list[dict[str, An
         upsert(conn, whoop_user_id, record)
 
 
+# -- regime 3: #24's own worst cases -- dense outliers/warm-up for
+# whoop_outliers, and a long alternating pass/fail/missing sweep for
+# whoop_streaks. Both walk a full calendar range (unlike regime 2's
+# record-count cap), so the fixture size below is driven by #24's own
+# day-count caps, not _ANALYSIS_RECORD_COUNT. ------------------------------
+
+_STREAK_SWEEP_DAYS = 1100
+
+
+def _outliers_worst_case_records() -> list[dict[str, Any]]:
+    """~1100 days with sparse isolated spikes -- worst case for
+    whoop_outliers: sparse high-value spikes (every 15th day) have z-scores
+    well above the default z=2.0 threshold when evaluated against the rolling
+    14-day window (which sees mostly lower baseline values), maximizing the
+    "outliers" list up to the internal _OUTLIERS_MAX_FLAGGED cap, each with
+    full context_before/context_after and other_metrics payload. Contrasts
+    with the alternating pattern (which produces zero outliers because
+    alternation IS the local norm under a rolling z-score), demonstrating
+    why a rolling rather than global baseline is needed."""
+    records = []
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    for i in range(_STREAK_SWEEP_DAYS):
+        created_at = (base + timedelta(days=i)).isoformat()
+        # Sparse isolated spikes: mostly 50.0 baseline, 90.0 spikes every 15th day.
+        value = 90.0 if i % 15 == 0 else 50.0
+        records.append(
+            {
+                "cycle_id": i,
+                "created_at": created_at,
+                "score_state": "SCORED",
+                "score": {
+                    "recovery_score": value,
+                    "hrv_rmssd_milli": 48.5,
+                    "resting_heart_rate": 55,
+                },
+            }
+        )
+    return records
+
+
+def _streaks_worst_case_records() -> list[dict[str, Any]]:
+    """~1100 days, one in three deliberately missing entirely and the rest
+    alternating pass/fail against a mid threshold -- worst case for
+    whoop_streaks: the "days" list enumerates every calendar day up to its
+    own internal cap, never collapsing missing/failing/passing runs."""
+    records = []
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    for i in range(_STREAK_SWEEP_DAYS):
+        if i % 3 == 0:
+            continue  # deliberately missing: no record at all for this day.
+        created_at = (base + timedelta(days=i)).isoformat()
+        value = 80.0 if i % 2 == 0 else 20.0
+        records.append(
+            {
+                "cycle_id": i,
+                "created_at": created_at,
+                "score_state": "SCORED",
+                "score": {
+                    "recovery_score": value,
+                    "hrv_rmssd_milli": 48.5,
+                    "resting_heart_rate": 55,
+                },
+            }
+        )
+    return records
+
+
 # -- registry enumeration: every tool must have a ceiling -------------------
 
 
@@ -711,6 +778,59 @@ async def test_compare_periods_within_ceiling(
     )
 
     assert estimate_tokens(result) <= TOOL_CEILINGS["compare_periods"]
+
+
+# -- #24: whoop_outliers/whoop_streaks worst cases --------------------------
+
+
+async def test_whoop_outliers_within_ceiling(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    assert app_context.store_conn is not None
+    _seed(app_context.store_conn, 12345, upsert_recovery, _outliers_worst_case_records())
+
+    result = await call_tool(
+        server,
+        "whoop_outliers",
+        {
+            "metric": "recovery_score",
+            "start": "2024-01-01T00:00:00Z",
+            "end": "2027-02-05T00:00:00Z",
+        },
+        app_context,
+    )
+
+    assert "whoop_outliers" in TOOL_CEILINGS, (
+        "context_budget.TOOL_CEILINGS needs a measured entry for whoop_outliers "
+        "(test_every_registered_tool_has_a_ceiling otherwise fails CI)"
+    )
+    assert estimate_tokens(result) <= TOOL_CEILINGS["whoop_outliers"]
+
+
+async def test_whoop_streaks_within_ceiling(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    assert app_context.store_conn is not None
+    _seed(app_context.store_conn, 12345, upsert_recovery, _streaks_worst_case_records())
+
+    result = await call_tool(
+        server,
+        "whoop_streaks",
+        {
+            "metric": "recovery_score",
+            "start": "2024-01-01T00:00:00Z",
+            "end": "2027-02-05T00:00:00Z",
+            "threshold": 50.0,
+            "direction": "above",
+        },
+        app_context,
+    )
+
+    assert "whoop_streaks" in TOOL_CEILINGS, (
+        "context_budget.TOOL_CEILINGS needs a measured entry for whoop_streaks "
+        "(test_every_registered_tool_has_a_ceiling otherwise fails CI)"
+    )
+    assert estimate_tokens(result) <= TOOL_CEILINGS["whoop_streaks"]
 
 
 # -- truncation surfaces on the tools that actually hit the cap -------------

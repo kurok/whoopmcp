@@ -1012,6 +1012,13 @@ _TOOL_ARGUMENTS: dict[str, dict[str, Any]] = {
         "comparison_end": "2026-01-15T00:00:00Z",
     },
     "whoop_timeseries": {"metric": "recovery_score", **_RANGE_ARGS},
+    "whoop_outliers": {"metric": "recovery_score", **_RANGE_ARGS},
+    "whoop_streaks": {
+        "metric": "recovery_score",
+        "threshold": 50.0,
+        "direction": "above",
+        **_RANGE_ARGS,
+    },
 }
 
 

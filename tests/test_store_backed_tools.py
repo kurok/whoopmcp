@@ -303,6 +303,18 @@ TOOL_ARGS: dict[str, dict[str, Any]] = {
         "comparison_start": "2026-08-04T00:00:00Z",
         "comparison_end": "2026-08-08T00:00:00Z",
     },
+    "whoop_outliers": {
+        "metric": "recovery_score",
+        "start": "2026-08-01T00:00:00Z",
+        "end": "2026-08-08T00:00:00Z",
+    },
+    "whoop_streaks": {
+        "metric": "recovery_score",
+        "start": "2026-08-01T00:00:00Z",
+        "end": "2026-08-08T00:00:00Z",
+        "threshold": 50.0,
+        "direction": "above",
+    },
 }
 
 

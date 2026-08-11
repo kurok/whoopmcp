@@ -107,6 +107,51 @@ class LagResult:
     refused_reason: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class RollingStat:
+    """One day's rolling mean/stdev/z-score, or an explicit reason it could
+    not be scored -- see ``rolling_z_scores``. ``unscored_reason`` is
+    ``None`` if and only if ``rolling_mean``/``rolling_stdev``/``z_score``
+    are all populated (``rolling_stdev``/``z_score`` may still be ``None``
+    on their own when the window has fewer than 2 points -- see
+    ``rolling_z_scores`` -- in which case ``unscored_reason`` explains why).
+    """
+
+    date: str
+    value: float
+    rolling_mean: float | None
+    rolling_stdev: float | None
+    z_score: float | None
+    unscored_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DayStatus:
+    """One calendar day's streak status, per ``find_streaks``.
+
+    ``status`` is exactly one of "missing" (no measurement that day at
+    all), "failing" (measured, does not meet the threshold/direction), or
+    "passing" (measured, meets it). ``value`` is ``None`` if and only if
+    ``status == "missing"`` -- the structural distinction the "missing day
+    vs. failing day" acceptance criterion asks for.
+    """
+
+    date: str
+    status: str
+    value: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class Streak:
+    """A maximal run of consecutive "passing" days, per ``find_streaks``."""
+
+    direction: str
+    start: str
+    end: str
+    length: int
+    mean: float
+
+
 def mean(values: Sequence[float]) -> float:
     """Arithmetic mean.
 
@@ -423,6 +468,213 @@ def _rolling_means(daily: Sequence[RollingPoint], window_days: int) -> list[Roll
         window_values = [point.value for point in daily[window_start_idx : i + 1]]
         points.append(RollingPoint(date=daily[i].date, value=mean(window_values)))
     return points
+
+
+#: rolling_z_scores' warm-up reason: the calendar clock for the current run
+#: of coverage (see that function's docstring) has not yet reached
+#: window_days.
+_UNSCORED_WARM_UP = "warm_up"
+
+#: rolling_z_scores' other unscored reason: past warm-up, but the trailing
+#: window still contains fewer than 2 points, so a standard deviation (and
+#: therefore a z-score) is undefined. Only reachable for window_days <= 1 --
+#: a run's own "gap < window_days between consecutive points" invariant
+#: otherwise guarantees the immediately preceding point falls in-window too.
+_UNSCORED_INSUFFICIENT_VARIANCE = "insufficient_variance"
+
+
+def rolling_z_scores(daily: Sequence[RollingPoint], window_days: int) -> list[RollingStat]:
+    """One ``RollingStat`` per point in ``daily``, scored against a trailing
+    ``window_days``-day rolling mean/stdev -- a *rolling*, not global,
+    z-score, so a genuine sustained level shift ("a slow seasonal drift")
+    re-adapts the baseline instead of reading as a month of anomalies.
+
+    Borrows ``_rolling_means``'s own "current run of coverage" gap-reset
+    rule verbatim (see that function's docstring for the full rationale): a
+    gap between two consecutive daily points that is itself >= ``window_days``
+    resets the warm-up clock. Unlike ``_rolling_means``, this function never
+    drops a day from its own return value -- every input day gets exactly
+    one ``RollingStat``, in the same order, whether or not it could be
+    scored. A day still within warm-up is tagged ``unscored_reason ==
+    "warm_up"`` with ``rolling_mean``/``rolling_stdev``/``z_score`` all
+    ``None`` -- reported, never silently dropped (issue #24's own Notes: "a
+    dropped day reads as a normal day"). A day past warm-up whose own
+    trailing window still has fewer than 2 points is tagged
+    ``"insufficient_variance"``: its ``rolling_mean`` is still reported (a
+    mean of one point is well-defined), but ``rolling_stdev``/``z_score``
+    stay ``None``.
+
+    A window whose stdev is exactly 0 (every value in it identical) defines
+    ``z_score`` as ``0.0`` -- no deviation to score against, not an outlier
+    by construction -- rather than raising or producing inf/NaN.
+
+    This project's own callers (server.py's ``whoop_outliers``) use a
+    14-calendar-day window: short enough to re-adapt to a genuine level
+    shift within roughly half that span, long enough to span a full
+    weekday+weekend cadence twice over. That choice lives in server.py, not
+    here -- this function takes ``window_days`` as a parameter and makes no
+    assumption about its value.
+    """
+    if not daily:
+        return []
+    dates = [datetime.fromisoformat(point.date).date() for point in daily]
+    results: list[RollingStat] = []
+    window_start_idx = 0
+    run_start = dates[0]
+    for i, current_date in enumerate(dates):
+        if i > 0 and (current_date - dates[i - 1]).days >= window_days:
+            run_start = current_date
+        if (current_date - run_start).days < window_days - 1:
+            results.append(
+                RollingStat(
+                    date=daily[i].date,
+                    value=daily[i].value,
+                    rolling_mean=None,
+                    rolling_stdev=None,
+                    z_score=None,
+                    unscored_reason=_UNSCORED_WARM_UP,
+                )
+            )
+            continue
+        window_start = current_date - timedelta(days=window_days - 1)
+        while dates[window_start_idx] < window_start:
+            window_start_idx += 1
+        window_values = [point.value for point in daily[window_start_idx : i + 1]]
+        window_mean = mean(window_values)
+        if len(window_values) < 2:
+            results.append(
+                RollingStat(
+                    date=daily[i].date,
+                    value=daily[i].value,
+                    rolling_mean=window_mean,
+                    rolling_stdev=None,
+                    z_score=None,
+                    unscored_reason=_UNSCORED_INSUFFICIENT_VARIANCE,
+                )
+            )
+            continue
+        window_stdev = stdev(window_values)
+        z_score = 0.0 if window_stdev == 0.0 else (daily[i].value - window_mean) / window_stdev
+        results.append(
+            RollingStat(
+                date=daily[i].date,
+                value=daily[i].value,
+                rolling_mean=window_mean,
+                rolling_stdev=window_stdev,
+                z_score=z_score,
+                unscored_reason=None,
+            )
+        )
+    return results
+
+
+def context_window(
+    daily: Sequence[RollingPoint], index: int, radius: int
+) -> tuple[list[RollingPoint], list[RollingPoint]]:
+    """The up-to-``radius`` measured points immediately before/after
+    ``daily[index]``, via plain list slicing.
+
+    Because ``daily`` is already scoped to the caller's own requested
+    range, slicing truncates naturally at the range's own edges -- an
+    outlier on the first or last day of the range comes back with fewer
+    context points on that side, never an error and never padding.
+    "Before"/"after" are nearest *measured* neighbours in this
+    day-deduplicated series, not literal calendar-adjacent days: a day with
+    no scored record is already simply absent from ``daily`` (the same
+    "unmeasured, not zero" contract ``store.get_metric_series`` guarantees).
+    """
+    before = list(daily[max(0, index - radius) : index])
+    after = list(daily[index + 1 : index + 1 + radius])
+    return before, after
+
+
+#: find_streaks' only two valid ``direction`` values.
+_STREAK_DIRECTIONS: tuple[str, str] = ("above", "below")
+
+
+def _streak_from_run(run: Sequence[DayStatus], direction: str) -> Streak:
+    """Build one ``Streak`` from a maximal run of consecutive passing days."""
+    values = [day.value for day in run if day.value is not None]
+    return Streak(
+        direction=direction,
+        start=run[0].date,
+        end=run[-1].date,
+        length=len(run),
+        mean=mean(values),
+    )
+
+
+def find_streaks(
+    daily: Sequence[RollingPoint],
+    *,
+    threshold: float,
+    direction: str,
+    range_start: str,
+    range_end: str,
+) -> tuple[list[DayStatus], list[Streak]]:
+    """Classify every calendar day in ``[range_start, range_end]`` and find
+    maximal above/below-threshold runs.
+
+    Every calendar day in the inclusive range is enumerated -- not just
+    measured ones -- as exactly one ``DayStatus``: "missing" when ``daily``
+    has no point for that date, "failing" when it has one that does not
+    meet the threshold, "passing" when it does. A streak is a maximal run of
+    consecutive "passing" days; both "failing" and "missing" days end the
+    current run, with no bridging logic -- the simplest, most conservative
+    interpretation, and a deliberate one: whether an unmeasured day *should*
+    break a streak (someone who didn't wear the strap did not fail a
+    recovery streak; they stopped measuring) is a judgement call this
+    function leaves to the caller, per issue #24's own Notes. The full
+    ``days`` list is returned alongside ``streaks`` specifically so a
+    caller who disagrees can reconstruct the alternate interpretation
+    themselves -- e.g. by noticing two streaks are separated only by
+    "missing" days, never "failing" ones.
+
+    ``direction`` accepts exactly "above" (``value >= threshold``) or
+    "below" (``value <= threshold``) -- both inclusive of the threshold
+    itself, so a value exactly at the threshold is never silently excluded
+    from both directions.
+
+    ``range_start > range_end`` (an inverted range) returns ``([], [])``
+    rather than raising; ``range_start == range_end`` is a normal one-day
+    range. Neither ``daily`` nor the range being empty is an error.
+
+    Raises:
+        ValueError: if ``direction`` is not "above" or "below".
+    """
+    if direction not in _STREAK_DIRECTIONS:
+        raise ValueError(f"direction must be one of {_STREAK_DIRECTIONS!r}, got {direction!r}")
+    start = date.fromisoformat(range_start)
+    end = date.fromisoformat(range_end)
+    if start > end:
+        return [], []
+
+    values_by_date = {point.date: point.value for point in daily}
+    days: list[DayStatus] = []
+    current = start
+    while current <= end:
+        iso = current.isoformat()
+        value = values_by_date.get(iso)
+        if value is None:
+            days.append(DayStatus(date=iso, status="missing", value=None))
+        elif (value >= threshold) if direction == "above" else (value <= threshold):
+            days.append(DayStatus(date=iso, status="passing", value=value))
+        else:
+            days.append(DayStatus(date=iso, status="failing", value=value))
+        current += timedelta(days=1)
+
+    streaks: list[Streak] = []
+    run: list[DayStatus] = []
+    for day in days:
+        if day.status == "passing":
+            run.append(day)
+            continue
+        if run:
+            streaks.append(_streak_from_run(run, direction))
+            run = []
+    if run:
+        streaks.append(_streak_from_run(run, direction))
+    return days, streaks
 
 
 def trend(records: Sequence[dict[str, Any]], metric: str) -> Trend:

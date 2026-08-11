@@ -108,4 +108,19 @@ TOOL_CEILINGS: dict[str, int] = {
     # tests/test_whoop_timeseries.py's own 365-day fixture; rounded up to
     # roughly 1.25x.
     "whoop_timeseries": 4500,
+    # #24: measured against tests/test_context_budget.py's own worst-case
+    # fixtures. whoop_outliers' response never echoes the day-series itself
+    # (only detailed outliers, capped at _OUTLIERS_MAX_FLAGGED, plus
+    # compact warm-up entries, capped at _OUTLIERS_MAX_WARMUP) -- the worst
+    # case is sparse isolated spikes (e.g., baseline 50.0 with 90.0 spikes
+    # every 15th day), which under a 14-day rolling window produces z-scores
+    # well above the threshold and maximizes both the flagged-outliers and
+    # per-outlier context payloads. Measured at 6990 against this fixture;
+    # rounded up to roughly 1.25x. whoop_streaks' response DOES echo one
+    # entry per calendar day swept (its own explicit "let the caller decide"
+    # design, so every day's status/value has to be visible) -- measured at
+    # 21293 against a _STREAKS_MAX_DAYS-day alternating pass/fail/missing
+    # sweep; rounded up to roughly 1.25x.
+    "whoop_outliers": 8800,
+    "whoop_streaks": 27000,
 }

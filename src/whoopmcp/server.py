@@ -37,8 +37,14 @@ from whoopmcp.analysis import (
     _METRIC_PATHS,  # reused for whoop_timeseries (#20), not duplicated
     DEFAULT_LAG_SWEEP,
     InsufficientDataError,
+    RollingPoint,
+    context_window,
     correlate_lag_sweep,
+    find_streaks,
+    mean,
+    rolling_z_scores,
     standardized_effect_size,
+    stdev,
     summarize,
     trend,
 )
@@ -1713,6 +1719,87 @@ def _period_length_note(baseline_days: int, comparison_days: int) -> str | None:
     )
 
 
+#: The rolling window for whoop_outliers, in calendar days. 14, not 7 or
+#: 30: a rolling window's own mean absorbs a sustained level shift over
+#: roughly half its length, so a SHORTER window re-adapts to a genuine
+#: change (the "slow seasonal drift" acceptance test) faster than a
+#: longer one; 7 gives a noisier baseline from fewer points and doesn't
+#: span a full weekday+weekend cadence, so 14 is the smallest window
+#: that reliably covers that cadence twice over while still adapting
+#: quickly. Pinned by tests/test_whoop_outliers.py's own WINDOW_DAYS
+#: literal -- keep the two in sync.
+_OUTLIERS_WINDOW_DAYS = 14
+
+#: Nearest-measured-neighbour context radius reported alongside each
+#: outlier ("the few days either side" -- the issue's own Scope). A
+#: fixed internal constant, not a tool parameter: the issue's own
+#: signature has none.
+_OUTLIER_CONTEXT_DAYS = 3
+
+#: Cap on the day-series fetched from the store per call -- mirrors
+#: _TIMESERIES_MAX_POINTS's own role/magnitude.
+_OUTLIERS_MAX_POINTS = 1000
+
+#: Cap on outliers actually detailed (with context + other-metrics) in
+#: the response, independent of _OUTLIERS_MAX_POINTS: an adversarial
+#: series can flag most of its points as outliers.
+_OUTLIERS_MAX_FLAGGED = 50
+
+#: Cap on compact warm-up entries listed in the response.
+_OUTLIERS_MAX_WARMUP = 100
+
+#: Calendar days swept/enumerated per whoop_streaks call -- same
+#: magnitude as _TIMESERIES_MAX_POINTS/_OUTLIERS_MAX_POINTS.
+_STREAKS_MAX_DAYS = 1000
+
+
+def _local_neighborhood_z(
+    daily: Sequence[RollingPoint], index: int, radius: int
+) -> tuple[float, float | None, float | None]:
+    """One point's ``(mean, stdev, z_score)`` against a LOCAL
+    neighbourhood of up to ``radius`` measured points on EACH side
+    (``context_window``'s own point-count radius mechanic, not a
+    strictly causal calendar window) plus the point itself.
+
+    Exists alongside ``analysis.rolling_z_scores`` (the strictly
+    trailing, calendar-day-bounded definition ``whoop_outliers`` still
+    uses for warm-up tagging) because a causal-only trailing window can
+    starve on sparse coverage: two measured points 13 calendar days
+    apart, just inside a 14-day trailing window, produce a 2-point
+    trailing sample whose z-score can never exceed ~0.71 in magnitude,
+    regardless of how extreme the more recent value is -- a
+    mathematical property of a 2-point sample's own standard
+    deviation, not a tuning problem (tests/test_whoop_outliers.py's own
+    context-truncation fixture hits exactly this with sparse, 13-day
+    spaced history). Looking to both sides for the comparison sample
+    fixes this without widening the trailing window enough to make the
+    seasonal-drift acceptance test's own transition period over-flag
+    instead: a wider *trailing* window takes longer to forget an old
+    baseline once one exists, but a wider *radius-bounded*
+    neighbourhood only grows with however much data is actually
+    available nearby, not with elapsed calendar time, so it does not
+    carry that cost.
+
+    Returns ``stdev``/``z_score`` as ``None`` when the neighbourhood
+    (including the point itself) has fewer than 2 points -- a standard
+    deviation needs at least two values; this is only reachable in
+    practice for a pathologically small ``radius``, since a day that
+    clears ``rolling_z_scores``' own warm-up already has at least one
+    earlier point in its run. A neighbourhood whose stdev is exactly 0
+    defines ``z_score`` as ``0.0``, matching ``rolling_z_scores``' own
+    "no deviation to score against" convention.
+    """
+    before, after = context_window(daily, index, radius)
+    neighborhood = [p.value for p in before] + [daily[index].value] + [p.value for p in after]
+    nbhd_mean = mean(neighborhood)
+    if len(neighborhood) < 2:
+        return nbhd_mean, None, None
+    nbhd_stdev = stdev(neighborhood)
+    if nbhd_stdev == 0.0:
+        return nbhd_mean, 0.0, 0.0
+    return nbhd_mean, nbhd_stdev, (daily[index].value - nbhd_mean) / nbhd_stdev
+
+
 def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
     @server.tool(name="summarize_period", title="Summarise a period", annotations=READ_ONLY)
     async def summarize_period(
@@ -2137,4 +2224,295 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 "returned; narrow the date range or use a coarser granularity for the "
                 "full series."
             )
+        return response
+
+    # -- issue #24: whoop_outliers / whoop_streaks --------------------------
+
+    @server.tool(
+        name="whoop_outliers", title="Find anomalous days for one metric", annotations=READ_ONLY
+    )
+    async def whoop_outliers(
+        metric: str,
+        start: str,
+        end: str,
+        ctx: Context[AppContext, Any],
+        z: float = 2.0,
+    ) -> dict[str, Any]:
+        """Find days whose value is a local outlier, with nearby context.
+
+        Outliers are found against a LOCAL baseline, not a global one, so a
+        genuine sustained shift in the metric does not read as a month of
+        anomalies -- see this tool's own acceptance test for a fixture that
+        would false-positive under a naive global z-score but correctly
+        stays quiet here.
+
+        Whether a day has enough trailing calendar history to be scored at
+        all ("warm-up") is decided by a strict, causal 14-calendar-day
+        window: a day is unscored until 14 calendar days have elapsed since
+        the start of its current run of coverage (a gap of >= 14 days
+        resets that clock), and is reported under "warmup_days" rather than
+        silently dropped -- a dropped day would read as a normal one. A day
+        that clears warm-up is scored against a LOCAL neighbourhood instead
+        (up to 14 measured points on each side, plus the day itself, via
+        nearest-measured-neighbour slicing) rather than that same trailing
+        window: a strictly-trailing window can starve on sparse coverage in
+        a way a neighbourhood-based one does not (see this module's own
+        ``_local_neighborhood_z`` docstring). Each outlier's "baseline_mean"/
+        "baseline_stdev" therefore reflect that two-sided neighbourhood, not
+        a strictly-historical trailing average -- a day near the end of the
+        requested range can be scored against measured points that come
+        after it in calendar time, so re-running this tool later, once more
+        recent days have been synced, can change a near-the-edge day's
+        z_score and flagged status. This does not affect "rolling, not
+        global": the baseline is still local to the day, never the whole
+        range's own mean/stdev.
+
+        Each outlier is reported with up to 3 nearest measured days either
+        side (truncated at the range's own edges, never an error) and,
+        for that day only, whichever of the other 5 friendly metrics have
+        a value -- "your HRV cratered on the 14th" is only useful alongside
+        what else happened that day.
+
+        Args:
+            metric: One of "recovery_score", "hrv", "resting_heart_rate",
+                "sleep_performance", "sleep_efficiency", "strain".
+            start: ISO 8601 start of the range.
+            end: ISO 8601 end of the range.
+            z: The absolute z-score a day must cross to be an outlier
+                (default 2.0).
+
+        Served from the local store, never a live call. Never refuses on
+        an empty or single-day range -- both return a coherent, empty-but-
+        honest response rather than raising. Every response carries
+        "coverage" and "range_coverage" (metric_trend's own full envelope).
+        """
+        app = ctx.request_context.lifespan_context
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        entity, value_column, date_column = _resolve_metric_timeseries_source(metric)
+
+        rows = store.get_metric_series(
+            conn,
+            whoop_user_id,
+            table=entity,
+            value_column=value_column,
+            date_column=date_column,
+            granularity="day",
+            start=start,
+            end=end,
+            limit=_OUTLIERS_MAX_POINTS + 1,
+        )
+        points_truncated = len(rows) > _OUTLIERS_MAX_POINTS
+        daily = [RollingPoint(date=b, value=v) for b, v in rows[:_OUTLIERS_MAX_POINTS]]
+
+        # 5 extra, cheap SQL-aggregated queries total (never one per
+        # outlier) -- "the other metrics for that day", per this tool's own
+        # Scope. Applied only to the outlier day itself, never its context
+        # days, matching the issue's literal wording.
+        other_metric_series: dict[str, dict[str, float]] = {}
+        for other_metric in _METRIC_COLLECTION:
+            if other_metric == metric:
+                continue
+            o_entity, o_value_column, o_date_column = _resolve_metric_timeseries_source(
+                other_metric
+            )
+            o_rows = store.get_metric_series(
+                conn,
+                whoop_user_id,
+                table=o_entity,
+                value_column=o_value_column,
+                date_column=o_date_column,
+                granularity="day",
+                start=start,
+                end=end,
+                limit=_OUTLIERS_MAX_POINTS + 1,
+            )
+            other_metric_series[other_metric] = dict(o_rows[:_OUTLIERS_MAX_POINTS])
+
+        warmup_stats = rolling_z_scores(daily, window_days=_OUTLIERS_WINDOW_DAYS)
+
+        scores: dict[int, tuple[float, float | None, float | None]] = {}
+        outlier_indices: list[int] = []
+        scored_days_count = 0
+        for i, stat in enumerate(warmup_stats):
+            if stat.unscored_reason is not None:
+                continue
+            scored_days_count += 1
+            nbhd_mean, nbhd_stdev, nbhd_z = _local_neighborhood_z(daily, i, _OUTLIERS_WINDOW_DAYS)
+            scores[i] = (nbhd_mean, nbhd_stdev, nbhd_z)
+            if nbhd_z is not None and abs(nbhd_z) >= z:
+                outlier_indices.append(i)
+
+        flagged_truncated = len(outlier_indices) > _OUTLIERS_MAX_FLAGGED
+        outliers: list[dict[str, Any]] = []
+        for i in outlier_indices[:_OUTLIERS_MAX_FLAGGED]:
+            nbhd_mean, nbhd_stdev, nbhd_z = scores[i]
+            before, after = context_window(daily, i, _OUTLIER_CONTEXT_DAYS)
+            other_metrics: dict[str, Any] = {}
+            for other_metric, series in other_metric_series.items():
+                value = series.get(daily[i].date)
+                if value is not None:
+                    other_metrics[other_metric] = {
+                        "value": value,
+                        "unit": _METRIC_UNIT[other_metric],
+                    }
+            outliers.append(
+                {
+                    "date": daily[i].date,
+                    "value": daily[i].value,
+                    "z_score": nbhd_z,
+                    "baseline_mean": nbhd_mean,
+                    "baseline_stdev": nbhd_stdev,
+                    "context_before": [{"date": p.date, "value": p.value} for p in before],
+                    "context_after": [{"date": p.date, "value": p.value} for p in after],
+                    "other_metrics": other_metrics,
+                }
+            )
+
+        warmup_all = [stat for stat in warmup_stats if stat.unscored_reason is not None]
+        warmup_truncated = len(warmup_all) > _OUTLIERS_MAX_WARMUP
+        warmup_days = [
+            {"date": stat.date, "value": stat.value, "reason": stat.unscored_reason}
+            for stat in warmup_all[:_OUTLIERS_MAX_WARMUP]
+        ]
+
+        truncated = points_truncated or flagged_truncated or warmup_truncated
+        response: dict[str, Any] = {
+            "metric": metric,
+            "window_days": _OUTLIERS_WINDOW_DAYS,
+            "z_threshold": z,
+            "scored_days_count": scored_days_count,
+            "outliers": outliers,
+            "warmup_days": warmup_days,
+            "period": {"start": start, "end": end},
+            "truncated": truncated,
+        }
+        notes: list[str] = []
+        if points_truncated:
+            notes.append(
+                f"Only the first {_OUTLIERS_MAX_POINTS} day(s) in this range were used; "
+                "narrow the date range for complete coverage."
+            )
+        if flagged_truncated:
+            notes.append(
+                f"Only the first {_OUTLIERS_MAX_FLAGGED} outlier(s) are detailed here; "
+                "narrow the date range or raise z to see fewer."
+            )
+        if warmup_truncated:
+            notes.append(f"Only the first {_OUTLIERS_MAX_WARMUP} warm-up day(s) are listed here.")
+        if notes:
+            response["note"] = " ".join(notes)
+
+        ec = _entity_coverage(conn, whoop_user_id, entity)
+        response["coverage"] = {entity: ec}
+        response["range_coverage"] = {
+            entity: _range_coverage_entry(ec["earliest"], ec["latest"], start, end)
+        }
+        return response
+
+    @server.tool(
+        name="whoop_streaks",
+        title="Find consecutive-day streaks for one metric",
+        annotations=READ_ONLY,
+    )
+    async def whoop_streaks(
+        metric: str,
+        start: str,
+        end: str,
+        threshold: float,
+        direction: str,
+        ctx: Context[AppContext, Any],
+    ) -> dict[str, Any]:
+        """Find maximal consecutive-day runs of one metric above or below a threshold.
+
+        Every calendar day in the requested range is enumerated in "days"
+        -- not just measured ones. A day absent from the store is
+        "missing" (unmeasured -- e.g. the strap wasn't worn); a day that
+        was measured but does not meet the threshold is "failing"; a day
+        that does is "passing". Both "missing" and "failing" end a streak,
+        with no bridging logic -- the simplest, most conservative
+        interpretation. Whether an unmeasured day *should* break a streak
+        is a judgement call this tool leaves to the caller (per the
+        issue's own Notes): "days" is returned in full alongside "streaks"
+        so a caller who disagrees can reconstruct the alternate
+        interpretation, e.g. by noticing two streaks are separated only by
+        "missing" days, never "failing" ones.
+
+        Args:
+            metric: One of "recovery_score", "hrv", "resting_heart_rate",
+                "sleep_performance", "sleep_efficiency", "strain".
+            start: ISO 8601 start of the range.
+            end: ISO 8601 end of the range.
+            threshold: The value a day must cross to "pass".
+            direction: "above" (a day passes when value >= threshold) or
+                "below" (value <= threshold) -- both inclusive of the
+                threshold itself, so a value exactly at it is never
+                silently excluded from both directions.
+
+        Served from the local store, never a live call. Never refuses on
+        an empty or single-day range. Every response carries "coverage"
+        and "range_coverage" (metric_trend's own full envelope). Per-streak
+        entries omit "direction": it is constant across the whole response
+        and stated once at the top level.
+        """
+        if direction not in ("above", "below"):
+            raise ValueError(f"direction must be 'above' or 'below', got {direction!r}")
+        app = ctx.request_context.lifespan_context
+        whoop_user_id = _ensure_matches_live_grant(ctx)
+        conn = _require_store(app)
+        entity, value_column, date_column = _resolve_metric_timeseries_source(metric)
+
+        range_start_date = _parse_iso(start).date()
+        range_end_date = _parse_iso(end).date()
+        truncated = False
+        effective_end_date = range_end_date
+        if range_start_date <= range_end_date:
+            span_days = (range_end_date - range_start_date).days + 1
+            if span_days > _STREAKS_MAX_DAYS:
+                truncated = True
+                effective_end_date = range_start_date + timedelta(days=_STREAKS_MAX_DAYS - 1)
+
+        rows = store.get_metric_series(
+            conn,
+            whoop_user_id,
+            table=entity,
+            value_column=value_column,
+            date_column=date_column,
+            granularity="day",
+            start=start,
+            end=end,
+            limit=_STREAKS_MAX_DAYS + 1,
+        )
+        daily = [RollingPoint(date=b, value=v) for b, v in rows]
+
+        days, streaks = find_streaks(
+            daily,
+            threshold=threshold,
+            direction=direction,
+            range_start=range_start_date.isoformat(),
+            range_end=effective_end_date.isoformat(),
+        )
+
+        response: dict[str, Any] = {
+            "metric": metric,
+            "direction": direction,
+            "threshold": threshold,
+            "days": [{"date": d.date, "status": d.status, "value": d.value} for d in days],
+            "streaks": [
+                {"start": s.start, "end": s.end, "length": s.length, "mean": s.mean}
+                for s in streaks
+            ],
+            "period": {"start": start, "end": end},
+            "truncated": truncated,
+        }
+        if truncated:
+            response["note"] = (
+                f"Only the first {_STREAKS_MAX_DAYS} calendar day(s) in this range were "
+                "swept; narrow the date range for complete coverage."
+            )
+        ec = _entity_coverage(conn, whoop_user_id, entity)
+        response["coverage"] = {entity: ec}
+        response["range_coverage"] = {
+            entity: _range_coverage_entry(ec["earliest"], ec["latest"], start, end)
+        }
         return response
