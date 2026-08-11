@@ -366,7 +366,7 @@ async def test_two_concurrent_backfills_share_the_real_rate_limiter(tmp_path: Pa
             task.cancel()
         for task in (task_a, task_b):
             with contextlib.suppress(asyncio.CancelledError):
-                await task
+                _ = await task
     conn_a.close()
     conn_b.close()
 
@@ -411,7 +411,7 @@ async def test_interactive_request_is_not_delayed_behind_backfill(tmp_path: Path
 
         backfill_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await backfill_task
+            _ = await backfill_task
     conn.close()
 
 
