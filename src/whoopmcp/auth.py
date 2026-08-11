@@ -45,6 +45,28 @@ class AuthError(RuntimeError):
     """Authorisation failed, or no usable credentials are available."""
 
 
+class GrantAlreadyGoneError(AuthError):
+    """An ``AuthError`` raised only when there is nothing left to revoke.
+
+    Two producing sites, both below: ``access_token`` when there is no
+    stored token at all, and ``_do_refresh`` when WHOOP rejects the refresh
+    token as ``invalid_grant`` (the member revoked the grant in WHOOP's own
+    app settings, or an operator already ran ``whoop_logout``/``logout``).
+    Both mean the upstream grant is already gone -- not that revocation
+    failed -- so a caller of ``revoke_and_forget`` that wants "nothing to
+    revoke" to count as revoke-step success (issue #65: ``__main__.py``'s
+    ``_delete_member``/``_erase_member``) can catch this narrower type
+    specifically and continue, while still treating a plain ``AuthError``
+    (e.g. ``revoke_upstream``'s own non-2xx-response path, a genuine
+    transport failure) as a real failure that must abort.
+
+    Subclassing ``AuthError`` rather than introducing an unrelated type
+    means every existing ``except AuthError`` elsewhere in this codebase
+    keeps catching this exactly as before -- this widens the taxonomy
+    without changing what any current call site sees.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class Token:
     """An access token and everything needed to renew it."""
@@ -578,7 +600,9 @@ class Authenticator:
         if response.status_code == 400 and _is_invalid_grant(response):
             self._store.clear()
             self._token = None
-            raise AuthError(
+            # GrantAlreadyGoneError, not plain AuthError: the grant is gone,
+            # not merely unreachable -- see that class's own docstring.
+            raise GrantAlreadyGoneError(
                 "WHOOP rejected the refresh token (invalid_grant); it will not become valid "
                 "on retry -- run whoop_login to re-authorise"
             )
@@ -594,7 +618,11 @@ class Authenticator:
             self._token = self._store.load()
         token = self._token
         if token is None:
-            raise AuthError("no stored credentials found; run whoop_login to authenticate")
+            # GrantAlreadyGoneError, not plain AuthError: see that class's
+            # own docstring -- this is "nothing to revoke", not a failure.
+            raise GrantAlreadyGoneError(
+                "no stored credentials found; run whoop_login to authenticate"
+            )
         if token.expired:
             if token.refresh_token is None:
                 raise AuthError(

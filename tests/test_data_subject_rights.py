@@ -50,7 +50,7 @@ import respx
 
 from whoopmcp import store, webhook_processor
 from whoopmcp.__main__ import main
-from whoopmcp.auth import USER_ACCESS_URL, FileTokenStore, Token
+from whoopmcp.auth import TOKEN_URL, USER_ACCESS_URL, FileTokenStore, Token
 from whoopmcp.config import Config
 
 # Two WHOOP members. Large, distinctive integers so their decimal string
@@ -471,6 +471,177 @@ def test_erase_member_subcommand_refuses_a_mismatched_whoop_user_id(
     conn = store_module.open_store(config.cache_path)
     rows = conn.execute("SELECT * FROM recoveries WHERE whoop_user_id = ?", (42,)).fetchall()
     assert rows != [], "a refused erase-member call must not delete anything"
+    conn.close()
+
+
+# =============================================================================
+# erase-member: revoke-ordering / attribution fixes (issue #65) -- mirrors
+# the three test_main.py delete-member additions above, for erase-member's
+# fuller local-deletion story (health data, webhook events, audit rows, and
+# the principal link, via erase_member_data + delete_principal_links_for_member).
+# =============================================================================
+
+
+def test_erase_member_subcommand_deletes_locally_when_refresh_hits_invalid_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stored token is expired and its refresh_token has been revoked in
+    WHOOP's own app settings -- WHOOP's token endpoint answers invalid_grant.
+    That must be treated as revoke-step success (the grant is already gone,
+    not merely unreachable) and erasure must still complete."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("stale-access", expires_at=time.time() - 3600, refresh_token="stale-refresh")
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    _seed_every_entity_table(conn, 42, "erase-me-tag")
+    conn.close()
+
+    with respx.mock:
+        token_route = respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={"error": "invalid_grant", "error_description": "revoked in-app"},
+            )
+        )
+        revoke_route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+        exit_code = main(["erase-member", "--whoop-user-id", "42"])
+
+    assert exit_code == 0
+    assert token_route.called
+    # The refresh failed before a live access token ever existed, so the
+    # revoke endpoint itself is never reached.
+    assert not revoke_route.called
+    # invalid_grant's own handling in Authenticator._do_refresh already
+    # clears the token store -- nothing left to assert about the token file
+    # beyond it being gone, which the local-deletion assertions below don't
+    # depend on.
+
+    conn = store_module.open_store(config.cache_path)
+    for table in sorted(store_module._ERASURE_TABLES):
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (42,),
+        ).fetchall()
+        assert rows == [], f"erase-member left rows behind in {table} after invalid_grant"
+    assert (
+        store_module.get_member_for_principal(conn, client_id="local", issuer=None, subject=None)
+        is None
+    )
+    conn.close()
+
+
+def test_erase_member_subcommand_skips_revoke_for_an_unattributable_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors test_main.py's delete-member equivalent: members A and B have
+    both been linked, but there is only one stored token file, so it cannot
+    be attributed to either. erase-member on A must not revoke that token --
+    it may be B's live grant -- yet must still erase A's own rows and link."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="client-a", issuer=None, subject=None, whoop_user_id=MEMBER_A
+    )
+    store_module.link_principal_to_member(
+        conn, client_id="client-b", issuer=None, subject=None, whoop_user_id=MEMBER_B
+    )
+    _seed_every_entity_table(conn, MEMBER_A, "member-a-tag")
+    _seed_every_entity_table(conn, MEMBER_B, "member-b-tag")
+    conn.close()
+
+    with respx.mock:
+        route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+        exit_code = main(["erase-member", "--whoop-user-id", str(MEMBER_A)])
+
+    assert exit_code == 0
+    assert not route.called
+    assert FileTokenStore(config.token_path).load() is not None
+
+    conn = store_module.open_store(config.cache_path)
+    for table in sorted(store_module._ERASURE_TABLES):
+        a_rows = conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (MEMBER_A,),
+        ).fetchall()
+        assert a_rows == [], f"erase-member left MEMBER_A rows behind in {table}"
+        b_rows = conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (MEMBER_B,),
+        ).fetchall()
+        assert b_rows != [], f"erase-member for A wrongly removed B's rows in {table}"
+    assert (
+        store_module.get_member_for_principal(conn, client_id="client-a", issuer=None, subject=None)
+        is None
+    )
+    assert (
+        store_module.get_member_for_principal(conn, client_id="client-b", issuer=None, subject=None)
+        is not None
+    )
+    conn.close()
+
+
+def test_erase_member_subcommand_still_aborts_on_a_genuine_transport_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard mirroring test_main.py's delete-member equivalent: a
+    real failure talking to WHOOP's revoke endpoint (mocked as a 500, distinct
+    from the invalid_grant/no-credentials "nothing to revoke" cases) must
+    still abort with nothing erased -- the fix must not loosen this path."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    _seed_every_entity_table(conn, 42, "erase-me-tag")
+    conn.close()
+
+    with respx.mock:
+        route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(500))
+        exit_code = main(["erase-member", "--whoop-user-id", "42"])
+
+    assert exit_code != 0
+    assert route.called
+    assert FileTokenStore(config.token_path).load() is not None
+
+    conn = store_module.open_store(config.cache_path)
+    for table in sorted(store_module._ERASURE_TABLES):
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (42,),
+        ).fetchall()
+        assert rows != [], f"a failed revoke must not erase {table}"
+    assert (
+        store_module.get_member_for_principal(conn, client_id="local", issuer=None, subject=None)
+        is not None
+    )
     conn.close()
 
 

@@ -196,6 +196,144 @@ def test_delete_member_subcommand_refuses_a_mismatched_whoop_user_id(
     assert FileTokenStore(config.token_path).load() is not None
 
 
+# -- delete-member: revoke-ordering / attribution fixes (issue #65) ---------
+#
+# Three regressions on top of the two tests above: (1) "grant already gone"
+# (no stored credentials) must count as revoke-step success and still reach
+# local deletion, instead of aborting with data intact; (2) a stored token
+# that cannot be attributed to the requested member (linked ids != {id})
+# must never be revoked -- upstream revoke is skipped entirely, and local
+# deletion still proceeds; (3) a genuine transport failure on the revoke
+# call must still abort with nothing deleted, unchanged from today.
+
+
+def test_delete_member_subcommand_deletes_locally_when_no_credentials_are_stored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """access_token() raising "no stored credentials found" (no token file at
+    all -- e.g. an operator already ran whoop_logout) must be treated as
+    revoke-step success, not a reason to abort before local deletion."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config
+
+    config = Config.from_env()
+    # Deliberately no FileTokenStore(...).save(...) call: there is no token
+    # file at all.
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    conn.close()
+
+    with respx.mock:
+        route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+        exit_code = main(["delete-member", "--whoop-user-id", "42"])
+
+    assert exit_code == 0
+    # access_token() fails before revoke_upstream is ever reached, so the
+    # HTTP endpoint is never called -- there was nothing to revoke.
+    assert not route.called
+    conn = store_module.open_store(config.cache_path)
+    assert (
+        store_module.get_member_for_principal(conn, client_id="local", issuer=None, subject=None)
+        is None
+    )
+    conn.close()
+
+
+def test_delete_member_subcommand_skips_revoke_for_an_unattributable_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two members have ever been linked (42 and 43), but there is only ever
+    one stored token file -- it cannot be attributed to either. delete-member
+    on 42 must not revoke that token (it may well be 43's live grant), yet
+    must still remove 42's own principal link."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config
+
+    config = Config.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local-old", issuer=None, subject=None, whoop_user_id=42
+    )
+    store_module.link_principal_to_member(
+        conn, client_id="local-new", issuer=None, subject=None, whoop_user_id=43
+    )
+    conn.close()
+
+    with respx.mock:
+        route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+        exit_code = main(["delete-member", "--whoop-user-id", "42"])
+
+    assert exit_code == 0
+    assert not route.called
+    # The token is not this member's to revoke, so it's left alone entirely.
+    assert FileTokenStore(config.token_path).load() is not None
+
+    conn = store_module.open_store(config.cache_path)
+    assert (
+        store_module.get_member_for_principal(
+            conn, client_id="local-old", issuer=None, subject=None
+        )
+        is None
+    )
+    assert (
+        store_module.get_member_for_principal(
+            conn, client_id="local-new", issuer=None, subject=None
+        )
+        is not None
+    )
+    conn.close()
+
+
+def test_delete_member_subcommand_still_aborts_on_a_genuine_transport_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard: a real failure talking to WHOOP's revoke endpoint
+    (mocked here as a 500, distinct from the invalid_grant/no-credentials
+    "nothing to revoke" cases) must still abort before any local deletion --
+    the fix must not loosen this path."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config
+
+    config = Config.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    conn.close()
+
+    with respx.mock:
+        route = respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(500))
+        exit_code = main(["delete-member", "--whoop-user-id", "42"])
+
+    assert exit_code != 0
+    assert route.called
+    # Nothing was deleted: neither the token nor the principal link.
+    assert FileTokenStore(config.token_path).load() is not None
+    conn = store_module.open_store(config.cache_path)
+    assert (
+        store_module.get_member_for_principal(conn, client_id="local", issuer=None, subject=None)
+        is not None
+    )
+    conn.close()
+
+
 # -- doctor subcommand argparse wiring (issue #35) ---------------------------
 #
 # doctor takes no arguments (a zero-argument health check, unlike
