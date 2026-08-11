@@ -85,4 +85,10 @@ TOOL_CEILINGS: dict[str, int] = {
     # a top-level period_length_note, measured at 675 against this file's own
     # worst-case fixture (previously 600 was calibrated pre-#21).
     "compare_periods": 900,
+    # #15: four small per-entity {count, cursor} dicts, never echoed records --
+    # response size does not grow with the number of records synced, only
+    # with the (fixed, small) number of entities, so one record per entity is
+    # already the worst case. Measured at 74 against
+    # tests/test_context_budget.py's own fixture; rounded up to roughly 1.25x.
+    "whoop_sync": 100,
 }

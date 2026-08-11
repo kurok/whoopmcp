@@ -44,6 +44,7 @@ EXPECTED_TOOLS = {
     "list_workouts",
     "get_sleep",
     "get_workout",
+    "whoop_sync",
     "summarize_period",
     "metric_trend",
     "correlate_metrics",
@@ -51,7 +52,10 @@ EXPECTED_TOOLS = {
 }
 
 #: The only tools allowed to change anything. Everything else is a read.
-MUTATING_TOOLS = {"whoop_complete_login", "whoop_logout"}
+#: ``whoop_sync`` (#15) writes upserted records to the local store -- never
+#: to WHOOP itself, which it only ever GETs -- but that is still a real
+#: environment change per MCP's own read_only_hint semantics.
+MUTATING_TOOLS = {"whoop_complete_login", "whoop_logout", "whoop_sync"}
 
 
 def fast_forwarding_clock() -> Callable[[], float]:
@@ -2372,9 +2376,11 @@ async def test_summarize_period_zero_records_all_metrics_insufficient(
 
 # -- identity tests (issue #8) ----------------------------------------------
 
-#: The 12 tools _ensure_matches_live_grant must gate -- every data and
-#: analysis tool, and none of the 4 auth tools (those are how a principal
-#: gets created, or must keep working regardless of one). Issue #29 renamed
+#: The 13 tools _ensure_matches_live_grant must gate -- every data and
+#: analysis tool (including #15's whoop_sync, which writes to the local
+#: store but still resolves identity through the same gate before touching
+#: WHOOP), and none of the 4 auth tools (those are how a principal gets
+#: created, or must keep working regardless of one). Issue #29 renamed
 #: the gate from a bare `_ensure_principal(app)` to `_ensure_matches_live
 #: _grant(ctx)`, which still calls `_ensure_principal` internally (so an
 #: unauthenticated caller still fails exactly as before) and additionally
@@ -2389,6 +2395,7 @@ _PRINCIPAL_GATED_TOOLS = {
     "list_workouts",
     "get_sleep",
     "get_workout",
+    "whoop_sync",
     "summarize_period",
     "metric_trend",
     "correlate_metrics",

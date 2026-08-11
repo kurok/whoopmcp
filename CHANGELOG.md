@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #15: incremental sync from an `updated_at` high-water mark. A new
+  `sync.py` (`run_sync`) walks the same four collections `backfill.py` (#14)
+  does -- recoveries, sleeps, cycles, workouts -- forward from each one's own
+  high-water `updated_at` mark (never `created_at`, so a rescored recovery or
+  sleep is picked up, not just a newly-created one), upserting every record
+  and advancing the cursor only after a page commits, so a crash mid-page
+  re-fetches rather than skipping. A ~60s overlap margin is subtracted from
+  the stored mark before every request; upsert idempotency absorbs the
+  resulting redelivery. Steady state costs one request per collection.
+  Progress lives in `sync_state` under its own entity namespace
+  (`f"{entity}:incremental"`, e.g. `"cycles:incremental"`) so an interrupted
+  backfill's own bare-entity resume cursor is never overwritten or
+  reinterpreted, and vice versa. A new `whoop_sync` MCP tool exposes this for
+  a user who doesn't want to wait for a schedule (none exists yet -- see
+  #35); it is gated on `Config.cache_enabled` like backfill, but -- since,
+  unlike backfill, it is sanctioned for the tool surface -- returns a plain
+  `{"synced": false, ...}` tool result instead of raising when the store is
+  disabled.
 - Issue #35: local mode stays a first-class, tested distribution. A new
   `whoopmcp doctor` CLI subcommand (`__main__.py`, backed by a new
   `doctor.py`) checks configuration, stored credentials, the local store,
