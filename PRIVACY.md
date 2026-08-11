@@ -1,34 +1,63 @@
 # Privacy Policy
 
-**Last updated:** 2026-08-10 · **Applies to:** `whoopmcp` (all versions)
+**Last updated:** 2026-08-11 · **Applies to:** `whoopmcp` (all versions)
 
 ## Summary
 
-`whoopmcp` is software you run on your own computer. It is not a hosted
-service. **The maintainers of this project operate no servers, receive no
-data from you, and cannot see your WHOOP data.**
+`whoopmcp` can run in one of two modes, and this policy is different for
+each:
 
-There is, however, one thing you should understand before you connect real
-health data, and it is not obvious: **your MCP client forwards tool results
-to whichever AI model it is configured to use.** That is how MCP works. The
-data leaves your machine at that point, under that provider's terms — not
-under this project's. [Details below.](#3-your-mcp-client-and-its-model-provider)
+- **Local mode** (the default): software you run on your own computer. It is
+  not a hosted service. **The maintainers of this project operate no
+  servers, receive no data from you, and cannot see your WHOOP data.**
+- **Hosted mode** (`WHOOPMCP_TRANSPORT=streamable-http`, #27): someone —
+  possibly you, possibly a third party — runs `whoopmcp` as a persistent
+  server that other people's MCP clients connect to. That operator's
+  process now holds *other people's* health data in its own SQLite store
+  (#13). Once that is true, the operator is a data **controller** of
+  special-category personal data (GDPR Article 9), not a bystander. If you
+  are that operator, this document's hosted-mode sections are about you, not
+  about the maintainers of this repository.
+
+Every section below is split where the two modes actually differ. Where a
+section isn't split, the same statement is true of both.
+
+There is, however, one thing every mode shares and that you should
+understand before you connect real health data: **your MCP client forwards
+tool results to whichever AI model it is configured to use.** That is how
+MCP works. The data leaves the machine running the server at that point,
+under that provider's terms — not under this project's.
+[Details below.](#3-your-mcp-client-and-its-model-provider)
 
 ---
 
 ## 1. Who is responsible for what
+
+### Local mode
 
 This project has no legal entity behind it and does not act as a data
 controller or processor, because it never receives your data. In GDPR terms,
 when you run `whoopmcp` on your own machine for your own purposes you are
 handling your own personal data.
 
-The parties that *do* process your data are:
+### Hosted mode
+
+If you run `whoopmcp` as a server other people's MCP clients connect to, you
+— the operator — are the data controller for whatever this software stores
+about them (see §2's hosted-mode row). This project having no legal entity
+behind *it* does not mean nobody is a controller: it means the maintainers
+of this repository are not, and your own deployment is your own legal
+responsibility, including registering as a controller where your
+jurisdiction requires it.
+
+### Both modes
+
+The parties that *do* process personal data are:
 
 | Party | Role | Governed by |
 | --- | --- | --- |
-| **WHOOP, Inc.** | Holds your health data; you authorise access | [WHOOP's privacy policy](https://www.whoop.com/privacy/) |
-| **You** | Run the software, hold the tokens | — |
+| **WHOOP, Inc.** | Holds the underlying health data; access is authorised per member | [WHOOP's privacy policy](https://www.whoop.com/privacy/) |
+| **You (local mode) / the operator (hosted mode)** | Runs the software, holds the tokens and any stored data | — |
 | **Your MCP client's model provider** | Receives whatever tool results your client sends it | That provider's terms |
 
 Read WHOOP's policy and your model provider's policy. This document only
@@ -58,7 +87,7 @@ URLs are the only ones in the source, in `auth.py` and `client.py`.
 
 | Item | Location | Protection |
 | --- | --- | --- |
-| Access + refresh token | `$WHOOPMCP_STATE_DIR/token.json`, default `~/.local/state/whoopmcp/` | File mode `0600`, directory `0700` — **macOS and Linux only** |
+| Access + refresh token | `$WHOOPMCP_STATE_DIR/token.json`, default `~/.local/state/whoopmcp/` | File mode `0600`, directory `0700` — **macOS and Linux only**; encrypted at rest with `WHOOPMCP_TOKEN_BACKEND=encrypted-file` |
 | Access + refresh token (alternative) | OS keychain | Whatever your OS provides |
 
 > **Windows:** file modes are not enforced — Windows uses ACLs, and the token
@@ -66,14 +95,43 @@ URLs are the only ones in the source, in `auth.py` and `client.py`.
 > warning when it first writes one. Use the keychain backend instead:
 > `pip install 'whoopmcp[keyring]'` and `WHOOPMCP_TOKEN_BACKEND=keyring`,
 > which stores the token in the Windows Credential Manager.
-| Cached responses | `$WHOOPMCP_STATE_DIR/cache.sqlite3` | **Off by default**; only written if you set `WHOOPMCP_CACHE=true` |
+| Cached responses (local mode only) | `$WHOOPMCP_STATE_DIR/cache.sqlite3` | **Off by default**; only written if you set `WHOOPMCP_CACHE=true` |
 | Logs | stderr only | Never written to a file by this software |
 
-By default, the only thing this software persists is your token. WHOOP
-records are fetched, returned, and forgotten.
+By default in **local mode**, the only thing this software persists is your
+token. WHOOP records are fetched, returned, and forgotten, unless you
+explicitly opt into the cache above.
 
-**Retention.** Nothing expires on its own, because nothing is stored on a
-server. Files persist until you delete them ([see below](#5-deleting-your-data)).
+**Hosted mode stores materially more, unconditionally — not opt-in.** The
+same SQLite store (`$WHOOPMCP_STATE_DIR/cache.sqlite3`) that is an optional
+cache in local mode is where a hosted server keeps, for every linked member:
+profile, body measurements, recovery, sleep, cycle and workout records
+(every table `src/whoopmcp/store.py` defines), the webhook event log, and a
+tool-call audit trail (member id, tool name, and timestamp only — never
+arguments or results). This is health data held server-side, for people who
+are not the operator, which is exactly the situation that makes the operator
+a GDPR controller (see §1). Access tokens live in the same encrypted or
+plaintext file described above regardless of mode.
+
+**Retention.**
+
+- *Local mode:* nothing expires on its own, because nothing is stored on a
+  server. Files persist until you delete them
+  ([see below](#5-deleting-your-data)).
+- *Hosted mode:* nothing expires automatically inside the running process
+  either — but an operator can run `whoopmcp enforce-retention
+  --max-age-days N` (defaulting to 730, i.e. two years) to delete rows past a
+  configured age from every table named above. This only happens when an
+  operator schedules it (their own cron or systemd timer, since this project
+  ships no scheduler of its own); it is a real, verified-at-the-database-level
+  deletion when it runs, not merely a documented promise.
+
+**Backups.** This project takes no backups of its own and implements no
+backup mechanism, in either mode — there is no backup script, scheduled job,
+or external storage configuration anywhere in this codebase. If an operator
+running this software configures backups of the underlying token file or
+SQLite database as part of their own infrastructure, that is entirely their
+own decision and outside anything this document can describe or control.
 
 ## 3. Your MCP client and its model provider
 
@@ -112,6 +170,8 @@ Practical mitigations, in rough order of effectiveness:
 
 ## 5. Deleting your data
 
+### Local mode
+
 1. **Forget the local token** — run the `whoop_logout` tool, or delete
    `~/.local/state/whoopmcp/token.json` (or the `whoopmcp` keychain entry).
 2. **Remove everything else** — `rm -rf ~/.local/state/whoopmcp` clears the
@@ -121,6 +181,39 @@ Practical mitigations, in rough order of effectiveness:
    revoke, the authorisation still exists on WHOOP's side.
 4. **Your data at WHOOP and at your model provider** is theirs to delete;
    use their respective controls. Nothing in this repository can reach it.
+
+### Hosted mode
+
+A hosted member's export and erasure rights are exercised by the **operator**
+running two CLI commands — deliberately operator-run, not self-serve from
+inside a chat: an LLM-driven tool call must never be able to trigger a
+member's own irreversible export or erasure, or another member's, so neither
+capability is exposed as an MCP tool.
+
+- **Export** — `whoopmcp export-member --whoop-user-id N` writes one JSON
+  document containing every entity this store holds for member `N` (profile,
+  body measurements, recovery, sleep, cycle and workout records, webhook
+  events, tool-call audit rows, and the principal links recording what was
+  authorised and when) and nothing belonging to any other member.
+- **Erasure** — `whoopmcp erase-member --whoop-user-id N` revokes the
+  member's WHOOP grant upstream, then permanently `DELETE`s every one of
+  those rows for member `N` — a real removal, not a flag — plus their token
+  and principal link.
+
+Ask the operator running your `whoopmcp` instance to run these on your
+behalf if you want your data or its removal; there is no in-app self-service
+path today.
+
+**Consent and scope transparency.** The export document above states which
+WHOOP scopes were granted and whether a token is currently stored
+(`Token.scopes`, never the token itself), plus when each MCP client was
+linked (`principal_members.linked_at`). There is exactly one token file per
+server, so scopes are reported only when the store has ever linked exactly
+one distinct WHOOP member — if more than one has ever been linked (e.g. an
+operator re-authorised against a different WHOOP account), nothing local
+records which member the stored token belongs to, and the export says so
+honestly instead of guessing. Withdrawing consent is the same as erasure
+above, or revoking the app directly in WHOOP's own Settings.
 
 ## 6. Children
 

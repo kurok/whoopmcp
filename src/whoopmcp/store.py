@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -227,6 +227,40 @@ _TENANT_SCOPED_TABLES: frozenset[str] = frozenset(
         "sync_state",
     }
 )
+
+#: Every table a member's data-subject erasure (#32) must remove a real row
+#: from -- ``_TENANT_SCOPED_TABLES`` (the six entity/body/profile tables plus
+#: ``sync_state``) plus the two bookkeeping tables the issue names by name,
+#: ``webhook_events`` and ``tool_call_audit``. Deliberately excludes
+#: ``principal_members``: that table is erased separately, by the
+#: already-existing ``delete_principal_links_for_member`` (#30), composed
+#: with ``erase_member_data`` by the ``erase-member`` CLI subcommand rather
+#: than duplicated here. ``tests/test_data_subject_rights.py
+#: ::test_erasure_registry_covers_every_schema_table`` asserts this constant,
+#: plus that one documented exception, equals the *live* schema's own table
+#: list (``PRAGMA table_list``) -- not a second hand-written list -- so a
+#: future migration that adds a table without adding it here fails that test
+#: immediately rather than shipping an uncovered table silently.
+_ERASURE_TABLES: frozenset[str] = _TENANT_SCOPED_TABLES | frozenset(
+    {"webhook_events", "tool_call_audit"}
+)
+
+#: Which column on each ``_ERASURE_TABLES`` table names "how old is this
+#: row" for ``enforce_retention``. Not always ``updated_at``: ``sync_state``
+#: has no such column and ages off its own ``last_run_at``, ``webhook_events``
+#: off ``created_at`` (it is never updated in place the way an entity row
+#: is -- see its own section), and ``tool_call_audit`` off ``called_at``.
+_RETENTION_TIMESTAMP_COLUMNS: dict[str, str] = {
+    "recoveries": "updated_at",
+    "sleeps": "updated_at",
+    "cycles": "updated_at",
+    "workouts": "updated_at",
+    "body_measurements": "updated_at",
+    "profiles": "updated_at",
+    "sync_state": "last_run_at",
+    "webhook_events": "created_at",
+    "tool_call_audit": "called_at",
+}
 
 
 class UnscopedQueryError(RuntimeError):
@@ -953,6 +987,24 @@ def principal_is_linked_to_member(conn: sqlite3.Connection, whoop_user_id: int) 
     return cursor.fetchone() is not None
 
 
+def all_linked_whoop_user_ids(conn: sqlite3.Connection) -> set[int]:
+    """Every distinct WHOOP member id ``principal_members`` has ever linked,
+    across all principals and all time.
+
+    Used by ``export-member`` (#32) to decide whether attaching the single
+    locally-stored token's scopes to an export document is safe: today's
+    architecture keeps exactly one live grant per process (see
+    ``CONTRIBUTING.md``), but ``principal_members`` rows are never pruned on
+    their own, so a store that has ever been re-authorised against a
+    different WHOOP account can still list more than one distinct id here
+    even though only one token file exists. When this returns more than a
+    single id, no local record says which of them the current token belongs
+    to -- callers must not guess.
+    """
+    cursor = _execute_scoped(conn, "SELECT DISTINCT whoop_user_id FROM principal_members")
+    return {row[0] for row in cursor.fetchall()}
+
+
 def delete_principal_links_for_member(conn: sqlite3.Connection, whoop_user_id: int) -> None:
     """Remove every ``principal_members`` row linked to ``whoop_user_id``.
 
@@ -990,3 +1042,181 @@ def record_tool_call(conn: sqlite3.Connection, whoop_user_id: int, tool_name: st
         (whoop_user_id, tool_name, _now()),
     )
     conn.commit()
+
+
+# -- data subject rights (#32): export, erasure, retention -------------------
+#
+# Every function below is operator-only, CLI-exposed plumbing (see
+# ``__main__.py``'s ``export-member``/``erase-member``/``enforce-retention``
+# subcommands) -- none of it is, or may become, an MCP tool. See
+# ``client.py``'s own module docstring and ``auth.revoke_upstream``'s for why:
+# an LLM-driven tool must never be able to trigger a member's own irreversible
+# export or erasure, or another member's.
+
+
+def get_all_sync_state_for_member(
+    conn: sqlite3.Connection, whoop_user_id: int
+) -> list[dict[str, Any]]:
+    """Every recorded sync outcome for ``whoop_user_id``, one dict per entity
+    that has ever been synced (see ``set_sync_state``) -- unlike
+    ``get_sync_state``, which reads one named entity at a time, this reads
+    all of them, for ``export_member_data``."""
+    _require_user_id(whoop_user_id)
+    rows = _execute_scoped(
+        conn,
+        "SELECT entity, cursor, last_run_at, outcome FROM sync_state WHERE whoop_user_id = ?",
+        (whoop_user_id,),
+    ).fetchall()
+    columns = ("entity", "cursor", "last_run_at", "outcome")
+    return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def get_webhook_events_for_member(
+    conn: sqlite3.Connection, whoop_user_id: int
+) -> list[dict[str, Any]]:
+    """Every ``webhook_events`` row recorded for ``whoop_user_id``, using the
+    same column set ``get_webhook_event`` reads by ``trace_id`` alone -- this
+    reads every row for a member instead, for ``export_member_data``."""
+    _require_user_id(whoop_user_id)
+    rows = _execute_scoped(
+        conn,
+        # _WEBHOOK_EVENT_COLUMNS is a fixed, internal tuple of literal column
+        # names, never user input.
+        f"SELECT {', '.join(_WEBHOOK_EVENT_COLUMNS)} FROM webhook_events "  # noqa: S608
+        f"WHERE whoop_user_id = ?",
+        (whoop_user_id,),
+    ).fetchall()
+    return [dict(zip(_WEBHOOK_EVENT_COLUMNS, row, strict=True)) for row in rows]
+
+
+_TOOL_CALL_AUDIT_COLUMNS = ("id", "whoop_user_id", "tool_name", "called_at")
+
+
+def get_tool_call_audit_for_member(
+    conn: sqlite3.Connection, whoop_user_id: int
+) -> list[dict[str, Any]]:
+    """Every ``tool_call_audit`` row recorded for ``whoop_user_id``, for
+    ``export_member_data``."""
+    _require_user_id(whoop_user_id)
+    rows = _execute_scoped(
+        conn,
+        f"SELECT {', '.join(_TOOL_CALL_AUDIT_COLUMNS)} FROM tool_call_audit "  # noqa: S608
+        f"WHERE whoop_user_id = ?",
+        (whoop_user_id,),
+    ).fetchall()
+    return [dict(zip(_TOOL_CALL_AUDIT_COLUMNS, row, strict=True)) for row in rows]
+
+
+def get_principal_links_for_member(
+    conn: sqlite3.Connection, whoop_user_id: int
+) -> list[dict[str, Any]]:
+    """Every MCP principal currently (or previously) linked to
+    ``whoop_user_id``, with ``linked_at`` -- the "what was authorised and
+    when" half of consent transparency the issue asks for; nothing new is
+    tracked, this just surfaces what ``link_principal_to_member`` already
+    records."""
+    _require_user_id(whoop_user_id)
+    rows = _execute_scoped(
+        conn,
+        """
+        SELECT client_id, issuer, subject, linked_at FROM principal_members
+        WHERE whoop_user_id = ?
+        """,
+        (whoop_user_id,),
+    ).fetchall()
+    columns = ("client_id", "issuer", "subject", "linked_at")
+    return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def export_member_data(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str, Any]:
+    """Everything this store holds about ``whoop_user_id``, as one portable,
+    JSON-serialisable document -- the data-subject *export* half of #32.
+
+    Built entirely from the existing member-scoped read functions (plus the
+    four small ``get_*_for_member`` helpers above), so every field is already
+    enforced member-scoped by ``_execute_scoped`` -- there is no separate
+    query in this function for a second member's data to leak through.
+    """
+    _require_user_id(whoop_user_id)
+    return {
+        "whoop_user_id": whoop_user_id,
+        "exported_at": _now(),
+        "profile": get_profile(conn, whoop_user_id),
+        "body_measurement": get_body_measurement(conn, whoop_user_id),
+        "recoveries": get_recoveries(conn, whoop_user_id),
+        "sleeps": get_sleeps(conn, whoop_user_id),
+        "cycles": get_cycles(conn, whoop_user_id),
+        "workouts": get_workouts(conn, whoop_user_id),
+        "sync_state": get_all_sync_state_for_member(conn, whoop_user_id),
+        "webhook_events": get_webhook_events_for_member(conn, whoop_user_id),
+        "tool_call_audit": get_tool_call_audit_for_member(conn, whoop_user_id),
+        "principal_links": get_principal_links_for_member(conn, whoop_user_id),
+    }
+
+
+def erase_member_data(conn: sqlite3.Connection, whoop_user_id: int) -> None:
+    """Permanently ``DELETE`` every row belonging to ``whoop_user_id`` across
+    every table in ``_ERASURE_TABLES`` -- the data-subject *erasure* half of
+    #32. A real removal, verified at the database level by this module's own
+    tests: it never sets a soft-delete marker the way the ``*.deleted``
+    webhook path does (see ``webhook_processor``'s own soft-delete helper for
+    that entirely separate, unrelated code path) -- there is no column write
+    here at all, only ``DELETE FROM ... WHERE whoop_user_id = ?``, run
+    through the same ``_execute_scoped`` enforcement every other write in
+    this module goes through.
+
+    ``principal_members`` is deliberately NOT among ``_ERASURE_TABLES``: that
+    table's own erasure is ``delete_principal_links_for_member`` (#30),
+    reused as-is and composed with this function by the ``erase-member`` CLI
+    subcommand, not duplicated here.
+    """
+    _require_user_id(whoop_user_id)
+    for table in sorted(_ERASURE_TABLES):
+        _execute_scoped(
+            conn,
+            # table is drawn from the fixed, internal _ERASURE_TABLES
+            # frozenset, never user input.
+            f"DELETE FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (whoop_user_id,),
+        )
+    conn.commit()
+
+
+def enforce_retention(
+    conn: sqlite3.Connection, *, max_age_days: int, now: datetime | None = None
+) -> dict[str, int]:
+    """Delete every row in ``_ERASURE_TABLES`` whose own age column (per
+    ``_RETENTION_TIMESTAMP_COLUMNS``) is older than ``max_age_days`` relative
+    to ``now`` (the real current time, when omitted) -- the retention *job*
+    #32 asks for: something that actually runs and deletes, not a documented
+    promise. Returns the number of rows removed per table (``cursor.rowcount``).
+
+    Deliberately a cross-tenant sweep, not a per-member loop: retention
+    applies to every member at once by its very nature, so each table below
+    is swept in one statement rather than enumerating ids first (and, for the
+    six tables also in ``_TENANT_SCOPED_TABLES``, an id-first loop is not
+    even available here -- discovering *which* ids have stale data would
+    itself require reading a tenant-scoped table's ``whoop_user_id`` column
+    with no equality predicate, which ``_execute_scoped``'s own SELECT check
+    refuses). ``_execute_scoped``'s enforcement (see its own docstring) only
+    requires that a touched tenant-scoped table's ``whoop_user_id`` column is
+    actually read by the statement -- it does not require a specific id -- so
+    ``whoop_user_id IS NOT NULL`` (always true: every ``_TENANT_SCOPED_TABLES``
+    table declares that column ``NOT NULL``) satisfies that requirement
+    honestly, for what is a genuinely deliberate, all-members-at-once
+    statement rather than a missed member filter.
+    """
+    as_of = now if now is not None else datetime.now(UTC)
+    cutoff = (as_of - timedelta(days=max_age_days)).isoformat()
+
+    counts: dict[str, int] = {}
+    for table in sorted(_ERASURE_TABLES):
+        column = _RETENTION_TIMESTAMP_COLUMNS[table]
+        if table in _TENANT_SCOPED_TABLES:
+            sql = f"DELETE FROM {table} WHERE whoop_user_id IS NOT NULL AND {column} < ?"  # noqa: S608
+        else:
+            sql = f"DELETE FROM {table} WHERE {column} < ?"  # noqa: S608
+        cursor = _execute_scoped(conn, sql, (cutoff,))
+        counts[table] = cursor.rowcount
+    conn.commit()
+    return counts
