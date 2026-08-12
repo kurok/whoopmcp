@@ -602,6 +602,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #102: `MCPTokenVerifier.verify_token` now rejects a token whose
+  issuer is not one of `MCPAuthConfig.authorization_servers`, closing an
+  audience-is-right-but-issuer-is-untrusted substitution -- previously the
+  trust list was consumed only to publish RFC 9728 metadata, never to gate
+  acceptance. A missing `claims` dict, a missing or non-`str` `iss`, and an
+  empty `iss` are all rejected the same way a wrong `iss` is (mirroring
+  `_names_this_resource`'s own precedent for a missing resource claim); the
+  comparison tolerates exactly one trailing slash, nothing looser. New
+  `_issued_by_trusted_as` runs alongside the existing audience check, and
+  neither check can be satisfied by the other passing.
 - Issue #105: `webhook_events.whoop_user_id` is now `NOT NULL` (migration 5),
   since a NULL there made a row invisible to both `export_member_data` and
   `erase_member_data` -- both select on `WHERE whoop_user_id = ?` -- the
