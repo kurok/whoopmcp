@@ -38,6 +38,7 @@ negative.
 from __future__ import annotations
 
 import inspect
+import io
 import os
 import sqlite3
 import stat
@@ -1095,12 +1096,14 @@ def test_export_member_tightens_a_pre_existing_world_readable_out_file(
 def test_export_member_does_not_inherit_the_mode_of_a_stale_temp_neighbour(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``Path.with_suffix(".tmp")`` *replaces* the suffix, so the temp file for
-    ``export.json`` is ``export.tmp``. ``touch(mode=0o600, exist_ok=True)``
-    does not chmod a file that already exists, so a stale world-readable
-    ``export.tmp`` -- left behind by an interrupted earlier run -- would be
-    reused and then renamed straight over the destination, carrying 0644 with
-    it. The mode has to be asserted, not just requested at creation."""
+    """Historically, ``Path.with_suffix(".tmp")`` *replaced* the suffix, so the
+    temp file for ``export.json`` was the predictable ``export.tmp`` --
+    reused as-is if a stale, world-readable one from an earlier interrupted
+    run was left behind, carrying its old mode straight through to the
+    destination. Since #98, the temp file is an unpredictable
+    ``tempfile.mkstemp`` name instead, so a stale ``export.tmp`` neighbour is
+    simply never reused: it is left exactly as it was, and the destination
+    still ends up 0600 regardless of what that neighbour's mode was."""
     _set_required_env_and_state_dir(monkeypatch, tmp_path)
     _link_and_seed_one_member(tmp_path)
     out_path = tmp_path / "export.json"
@@ -1111,6 +1114,12 @@ def test_export_member_does_not_inherit_the_mode_of_a_stale_temp_neighbour(
     exit_code = main(["export-member", "--whoop-user-id", "42", "--out", str(out_path)])
 
     assert exit_code == 0
+    assert stale_tmp.read_text(encoding="utf-8") == "interrupted", (
+        "the stale export.tmp neighbour was overwritten -- it should never be reused"
+    )
+    assert stat.S_IMODE(stale_tmp.stat().st_mode) == 0o644, (
+        "the stale export.tmp neighbour's mode was changed -- it should never be touched"
+    )
     mode = stat.S_IMODE(out_path.stat().st_mode)
 
     assert mode & _GROUP_OR_OTHER == 0, f"export file is mode {mode:o}"
@@ -1126,30 +1135,47 @@ def test_export_member_never_opens_a_world_readable_window(
     still having published the whole health record at 0644 for as long as the
     write took. The property that rules that out is checkable at the moment
     content first reaches the filesystem: the file being written into must
-    already exist, and must already carry no group or other bits. This spies
-    on ``Path.write_text`` (the call ``auth``'s atomic helper uses) and
-    checks exactly that for whichever write carries the export payload.
+    already exist, and must already carry no group or other bits. Since #98,
+    ``auth``'s atomic helper writes through the file object ``os.fdopen``
+    hands back for the ``tempfile.mkstemp`` fd, never via ``Path.write_text``
+    -- and ``io.TextIOWrapper`` is an immutable extension type pytest's
+    monkeypatch can't patch directly, so this wraps ``os.fdopen`` itself in a
+    spy that checks exactly that (via ``fstat`` on the fd) for whichever
+    write carries the export payload, then delegates to the real write. A
+    stronger guarantee than before, since ``mkstemp`` itself creates the file
+    at 0600 with ``O_EXCL``, before any content lands.
     """
     _set_required_env_and_state_dir(monkeypatch, tmp_path)
     _link_and_seed_one_member(tmp_path)
     out_path = tmp_path / "export.json"
 
-    writes: list[tuple[Path, bool, int | None, str]] = []
-    real_write_text = Path.write_text
+    writes: list[tuple[int, bool, int | None, str]] = []
+    real_fdopen = os.fdopen
 
-    def spy(
-        self: Path,
-        data: str,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> int:
-        existed = self.is_file()
-        mode = stat.S_IMODE(self.stat().st_mode) if existed else None
-        writes.append((self, existed, mode, data))
-        return real_write_text(self, data, encoding=encoding, errors=errors, newline=newline)
+    class _SpyOnWrite:
+        def __init__(self, real: io.TextIOWrapper) -> None:
+            self._real = real
 
-    monkeypatch.setattr(Path, "write_text", spy)
+        def __enter__(self) -> _SpyOnWrite:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            self._real.close()
+
+        def write(self, data: str) -> int:
+            try:
+                mode: int | None = stat.S_IMODE(os.fstat(self._real.fileno()).st_mode)
+                existed = True
+            except OSError:
+                mode = None
+                existed = False
+            writes.append((self._real.fileno(), existed, mode, data))
+            return self._real.write(data)
+
+    def fake_fdopen(fd: int, *args: object, **kwargs: object) -> _SpyOnWrite:
+        return _SpyOnWrite(real_fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(os, "fdopen", fake_fdopen)
 
     exit_code = main(["export-member", "--whoop-user-id", "42", "--out", str(out_path)])
 
@@ -1157,17 +1183,16 @@ def test_export_member_never_opens_a_world_readable_window(
 
     payload_writes = [w for w in writes if "export-me-tag" in w[3]]
     assert payload_writes, (
-        f"no write carried the export payload; writes seen: {[str(w[0]) for w in writes]}"
+        f"no write carried the export payload; writes seen: {[w[0] for w in writes]}"
     )
 
-    for path, existed, mode, _data in payload_writes:
+    for fd, existed, mode, _data in payload_writes:
         assert existed, (
-            f"{path.name} did not exist before the payload was written to it -- it was "
-            "created by the write itself, at the umask default"
+            f"fd {fd} did not already exist (via fstat) when the payload was written to it"
         )
         assert mode is not None
         assert mode & _GROUP_OR_OTHER == 0, (
-            f"{path.name} was mode {mode:o} at the instant the health record was "
+            f"fd {fd} was mode {mode:o} at the instant the health record was "
             "written into it -- a world-readable window existed"
         )
 

@@ -602,6 +602,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #98: `atomic_write_text`'s temp file was `path.with_suffix(".tmp")`
+  -- a predictable name in the destination directory, created via
+  `touch`/`chmod`/`write_text`/`replace`, all of which follow symlinks. An
+  attacker able to write to that directory (e.g. `/tmp`, for
+  `export-member --out`, which sends a member's full health record through
+  this helper in plaintext) could pre-create that name as a symlink and
+  have the plaintext delivered wherever they pointed it, with the
+  destination itself left as a symlink so later reads followed it too. Now
+  uses `tempfile.mkstemp(dir=path.parent)` -- `O_EXCL`, an unpredictable
+  name, mode 0600 in one atomic step -- and writes through the returned
+  file descriptor directly rather than reopening by path, which would have
+  reintroduced the same race. `os.replace` performs the final move, so a
+  destination that is itself a pre-existing symlink is replaced rather than
+  written through. The temp file is now unlinked if the write fails,
+  without masking the original exception. Caller-visible behaviour is
+  unchanged: same signature, same final mode 0600, same atomic replace,
+  same parent creation (`store._secure_db_path`'s own, separate
+  parent-tightening was left alone -- its parent is always our own state
+  dir, but this helper's is operator-chosen for exports, and tightening an
+  operator's shared directory would lock other users out of it).
 - Issue #71: CONTRIBUTING.md's "Where things go" map claimed `server.py`
   was "the only file that imports mcp" -- false: `webhooks.py` and
   `mcpauth.py` also do, confirmed by AST across all 18 modules. The map

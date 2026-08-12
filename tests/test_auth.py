@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ from whoopmcp.auth import (
     EncryptedFileTokenStore,
     FileTokenStore,
     Token,
+    atomic_write_text,
     build_authorize_url,
 )
 from whoopmcp.config import Config
@@ -513,19 +515,38 @@ async def test_concurrent_refresh_failure_is_not_retried_by_every_waiter(
 def test_interrupted_write_leaves_previous_token_intact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # FileTokenStore.save() has been atomic (write-to-.tmp, then Path.replace)
-    # since issue #1, but never had a test proving an interrupted write can't
-    # corrupt or lose the previously-saved token. This should already pass
-    # against the current, unchanged FileTokenStore.
+    # FileTokenStore.save() has been atomic (write-to-temp, then an atomic
+    # replace) since issue #1, but never had a test proving an interrupted
+    # write can't corrupt or lose the previously-saved token. Since #98 the
+    # write goes through the file object `os.fdopen` hands back for the
+    # `tempfile.mkstemp` fd, not `Path.write_text` -- and `io.TextIOWrapper`
+    # is an immutable extension type pytest's monkeypatch can't patch
+    # directly, so the injection point is `os.fdopen` itself, wrapped to
+    # return a stand-in whose `write` fails.
     path = tmp_path / "token.json"
     store = FileTokenStore(path)
     original = Token("orig-access", expires_at=1234.0, refresh_token="orig-refresh")
     store.save(original)
 
-    def boom(self: Path, *args: object, **kwargs: object) -> int:
-        raise OSError("disk full")
+    real_fdopen = os.fdopen
 
-    monkeypatch.setattr(Path, "write_text", boom)
+    class _BoomOnWrite:
+        def __init__(self, real: io.TextIOWrapper) -> None:
+            self._real = real
+
+        def __enter__(self) -> _BoomOnWrite:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            self._real.close()
+
+        def write(self, data: str) -> int:
+            raise OSError("disk full")
+
+    def fake_fdopen(fd: int, *args: object, **kwargs: object) -> _BoomOnWrite:
+        return _BoomOnWrite(real_fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(os, "fdopen", fake_fdopen)
 
     new_token = Token("new-access", expires_at=5678.0, refresh_token="new-refresh")
     with pytest.raises(OSError):
@@ -917,3 +938,105 @@ async def test_revoke_and_forget_raises_auth_error_without_leaking_the_token_on_
         await auth.revoke_and_forget()
 
     assert "access-tok" not in str(exc_info.value)
+
+
+# -- atomic_write_text's temp file (issue #98) --------------------------------
+#
+# The helper writes a member's full health record in plaintext for
+# `export-member --out PATH`, at a path the *operator* chooses -- possibly a
+# world-writable one like /tmp. So the temp file it writes through must be
+# unpredictably named and created O_EXCL: a name an attacker can guess can be
+# pre-created as a symlink, and every step of a
+# touch/chmod/write_text/replace sequence follows symlinks.
+#
+# `os.symlink` needs privileges on Windows, and POSIX modes mean nothing
+# there, so both kinds of assertion below are skipped on it (#89).
+
+
+@pytest.mark.skipif(os.name == "nt", reason="os.symlink needs privileges on Windows")
+def test_write_does_not_follow_a_pre_created_symlink_at_the_predictable_temp_name(
+    tmp_path: Path,
+) -> None:
+    """The #98 regression test.
+
+    ``path.with_suffix(".tmp")`` is guessable from the destination alone, so
+    an attacker who can write to the destination's directory can plant a
+    symlink there *before* the write and have the plaintext delivered
+    wherever they point it -- and, because the symlink is what then gets
+    renamed onto the destination, have every later read follow it too.
+    """
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    attacker = tmp_path / "attacker" / "stolen.json"
+    attacker.parent.mkdir()
+    path = out_dir / "export.json"
+    (out_dir / "export.tmp").symlink_to(attacker)
+
+    atomic_write_text(path, "SECRET-HEALTH-RECORD")
+
+    assert not attacker.exists(), (
+        f"the plaintext was written through the planted symlink to {attacker}"
+    )
+    assert not path.is_symlink(), "the destination is a symlink -- later reads follow it too"
+    assert path.read_text(encoding="utf-8") == "SECRET-HEALTH-RECORD"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="os.symlink needs privileges on Windows")
+def test_write_replaces_a_destination_that_is_itself_a_symlink(tmp_path: Path) -> None:
+    """A pre-existing symlink *at the destination* must be replaced, not
+    written through -- which is what ``os.replace`` does, unlike opening the
+    destination path for writing."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    attacker = tmp_path / "attacker" / "stolen.json"
+    attacker.parent.mkdir()
+    path = out_dir / "export.json"
+    path.symlink_to(attacker)
+
+    atomic_write_text(path, "SECRET-HEALTH-RECORD")
+
+    assert not attacker.exists(), (
+        f"the plaintext was written through the destination symlink to {attacker}"
+    )
+    assert not path.is_symlink()
+    assert path.read_text(encoding="utf-8") == "SECRET-HEALTH-RECORD"
+
+
+def test_a_successful_write_leaves_no_temp_file_behind(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    path = out_dir / "export.json"
+
+    atomic_write_text(path, "contents")
+
+    assert sorted(p.name for p in out_dir.iterdir()) == ["export.json"]
+
+
+def test_a_failed_write_leaves_no_temp_file_behind(tmp_path: Path) -> None:
+    """A lone surrogate cannot be encoded as UTF-8, so the write raises
+    whichever way the helper writes it -- and the temp file it had already
+    created must not survive the failure (nor may cleanup swallow the
+    original error)."""
+    out_dir = tmp_path / "out"
+    path = out_dir / "export.json"
+
+    with pytest.raises(UnicodeEncodeError):
+        atomic_write_text(path, "\ud800")
+
+    assert list(out_dir.iterdir()) == [], (
+        f"a temp file survived the failed write: {[p.name for p in out_dir.iterdir()]}"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_write_keeps_its_existing_guarantees(tmp_path: Path) -> None:
+    """The properties callers already rely on, restated so a rewrite of the
+    internals cannot quietly drop them: mode 0600, exact contents, and a
+    pre-existing destination replaced rather than appended to."""
+    path = tmp_path / "state" / "token.json"
+
+    atomic_write_text(path, "first")
+    atomic_write_text(path, "second")
+
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert mode & (stat.S_IRWXG | stat.S_IRWXO) == 0, f"file is mode {mode:o}"
+    assert path.read_text(encoding="utf-8") == "second"
