@@ -602,6 +602,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #101: `delete-member`, `export-member`, `erase-member`, and
+  `enforce-retention` each opened `config.cache_path` unconditionally, so in
+  default local mode -- the mode #90 made in-memory precisely so
+  PRIVACY.md's "the only thing this software writes to
+  `$WHOOPMCP_STATE_DIR` is your token" would hold -- all four instead created
+  a `cache.sqlite3` on disk, and `enforce-retention` went on to print a
+  per-table "retention enforced" summary and exit 0 for work performed
+  against a store it had just created. All four now refuse (exit 2, stderr
+  only, no mention of enabling the cache) when the store is ephemeral and no
+  file exists yet -- the same `store_is_ephemeral and not
+  config.cache_path.exists()` check `doctor.py` already used. A leftover
+  `cache.sqlite3` from an earlier `WHOOPMCP_CACHE=true` period is still
+  opened and operated on exactly as before: refusing on that file would deny
+  a data subject their erasure/export right, which the guard's second clause
+  exists to avoid.
 - Issue #99: `store._execute_scoped` required a restrictive
   `whoop_user_id = ?` equality predicate on `SELECT` only. For a non-`SELECT`
   statement it required merely that the column be *read at all*, so

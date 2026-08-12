@@ -355,6 +355,36 @@ def _revoke_before_local_deletion(
     return None
 
 
+def _refuse_if_store_is_ephemeral(config: Config, action: str) -> int | None:
+    """Shared guard for the four data-rights/retention subcommands (#101).
+
+    Returns exit code 2 when the store is guaranteed in-memory and no file
+    has ever been created for it, or ``None`` when the caller should proceed
+    to ``open_store``.
+
+    Copies ``doctor.py``'s own ``_check_store`` condition verbatim --
+    ``config.store_is_ephemeral and not config.cache_path.exists()`` -- and
+    for the same two-part reason: a user who once ran with
+    ``WHOOPMCP_CACHE=true`` has a real ``cache.sqlite3`` holding real health
+    data, and refusing to touch it here would deny a data subject their
+    erasure/export right, which is a worse bug than the one this guard
+    exists to fix. The condition therefore only refuses when the file would
+    have to be *created* to proceed; a leftover file is opened exactly as
+    before. Unlike ``_backfill``/``_replay_webhook``/``_reconcile_webhooks``'s
+    own ``not cache_enabled`` guards, the message here must never advise
+    enabling the persistent store: telling someone who asked to delete,
+    export, or erase their data (or enforce retention on it) to first turn
+    on a cache is absurd advice for this class of subcommand.
+    """
+    if config.store_is_ephemeral and not config.cache_path.exists():
+        print(
+            f"whoopmcp: nothing is stored in default local mode; there is no data to {action}",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
 def _delete_member(config: Config, whoop_user_id: int) -> int:
     """Handle ``whoopmcp delete-member --whoop-user-id N``.
 
@@ -370,6 +400,9 @@ def _delete_member(config: Config, whoop_user_id: int) -> int:
     Local deletion is no longer conditioned on the upstream grant still
     being alive, nor does it revoke a token it cannot attribute to this
     member -- see ``_revoke_before_local_deletion`` (issue #65).
+
+    Refuses -- before opening anything -- when the store is ephemeral and no
+    file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101).
     """
     from whoopmcp.auth import Authenticator
     from whoopmcp.store import (
@@ -377,6 +410,10 @@ def _delete_member(config: Config, whoop_user_id: int) -> int:
         open_store,
         principal_is_linked_to_member,
     )
+
+    abort_code = _refuse_if_store_is_ephemeral(config, "delete")
+    if abort_code is not None:
+        return abort_code
 
     conn = open_store(config.cache_path)
     try:
@@ -421,6 +458,9 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
     its scopes to *this* member's export would risk silently misattributing
     another member's consent. In that case ``consent.scopes`` is reported as
     ``None`` with an explanatory note instead of guessing.
+
+    Refuses -- before opening anything -- when the store is ephemeral and no
+    file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101).
     """
     from whoopmcp.auth import atomic_write_text, build_store
     from whoopmcp.store import (
@@ -429,6 +469,10 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
         open_store,
         principal_is_linked_to_member,
     )
+
+    abort_code = _refuse_if_store_is_ephemeral(config, "export")
+    if abort_code is not None:
+        return abort_code
 
     conn = open_store(config.cache_path)
     try:
@@ -485,6 +529,9 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
     Local deletion is no longer conditioned on the upstream grant still
     being alive, nor does it revoke a token it cannot attribute to this
     member -- see ``_revoke_before_local_deletion`` (issue #65).
+
+    Refuses -- before opening anything -- when the store is ephemeral and no
+    file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101).
     """
     from whoopmcp.auth import Authenticator
     from whoopmcp.store import (
@@ -493,6 +540,10 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
         open_store,
         principal_is_linked_to_member,
     )
+
+    abort_code = _refuse_if_store_is_ephemeral(config, "erase")
+    if abort_code is not None:
+        return abort_code
 
     conn = open_store(config.cache_path)
     try:
@@ -522,8 +573,17 @@ def _enforce_retention(config: Config, max_age_days: int) -> int:
     the retention job; an operator wires it into their own cron or systemd
     timer. Prints a one-line per-table summary to stderr and never a token
     value, since nothing here ever reads one.
+
+    Refuses -- before opening anything -- when the store is ephemeral and no
+    file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101). Printing
+    the per-table summary in that case would be a false success: no
+    retention work happened against a store that does not exist.
     """
     from whoopmcp.store import enforce_retention, open_store
+
+    abort_code = _refuse_if_store_is_ephemeral(config, "expire")
+    if abort_code is not None:
+        return abort_code
 
     conn = open_store(config.cache_path)
     try:
