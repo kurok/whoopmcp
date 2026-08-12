@@ -9,6 +9,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlparse
 
 from whoopmcp import __version__
 from whoopmcp.config import Config, ConfigError
@@ -224,6 +225,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    subparsers.add_parser(
+        "login",
+        help=(
+            "Terminal-native OAuth login (#76): prints the authorize URL, prompts for "
+            "the pasted redirect (or the code/state query parameters), and exchanges "
+            "them via the same Authenticator the in-chat whoop_login/whoop_complete_login "
+            "pair uses -- that pair stays exactly as it is; this is an additional path, "
+            "not a replacement. Deliberately CLI-only: it exists so the authorization "
+            "code never has to travel through the MCP client or its model provider on "
+            "the way to the exchange. Takes no arguments."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     # stderr, never stdout: on stdio transport stdout carries the JSON-RPC
@@ -266,6 +280,8 @@ def main(argv: list[str] | None = None) -> int:
         return _replay_webhook(config, args.trace_id)
     if args.command == "reconcile-webhooks":
         return _reconcile_webhooks(config, args.whoop_user_id, args.window_days)
+    if args.command == "login":
+        return _login(config)
 
     from whoopmcp.server import build_server
 
@@ -717,6 +733,104 @@ def _reconcile_webhooks(config: Config, whoop_user_id: int, window_days: int) ->
         f"(window_days={window_days}): {summary}",
         file=sys.stderr,
     )
+    return 0
+
+
+def _extract_code_and_state(pasted: str) -> tuple[str | None, str | None]:
+    """Parse ``code``/``state`` out of whatever the user pasted (D1, steps 1-2).
+
+    Tries ``urlparse`` first: its ``query`` reads correctly whether the
+    paste is a full redirect URL with a custom scheme or an ``https://``
+    one, since either way ``code``/``state`` are ordinary query parameters.
+    Falls back to ``parse_qs`` on the raw string for a bare
+    ``code=...&state=...`` fragment -- verified empirically that ``urlparse``
+    alone cannot read that shape: with no scheme, the whole string lands in
+    ``path`` and ``query`` comes back empty. Returns ``(None, None)`` if
+    neither yields both keys; the caller prompts separately in that case
+    (D1 step 3) rather than guessing from a partial match.
+    """
+    for query in (urlparse(pasted).query, pasted):
+        parsed = parse_qs(query)
+        code = parsed.get("code", [None])[0]
+        state = parsed.get("state", [None])[0]
+        if code is not None and state is not None:
+            return code, state
+    return None, None
+
+
+def _login(config: Config) -> int:
+    """Handle ``whoopmcp login`` (#76).
+
+    The terminal-native counterpart to the in-chat ``whoop_login``/
+    ``whoop_complete_login`` pair, which stays exactly as it is -- some MCP
+    clients have no terminal a user can reach. Today the authorization code
+    travels through the MCP client and its model provider on its way back to
+    ``whoop_complete_login``; running the same exchange here, with no model
+    in the loop, is the entire point of this subcommand. Reuses
+    ``Authenticator`` unchanged (the OAuth exchange itself is not
+    reimplemented here) and constructs exactly one instance for the whole
+    invocation: the pending ``state`` from ``start_login`` lives only on
+    that instance, so a second ``Authenticator`` would break
+    ``verify_state``.
+
+    No localhost listener -- ``config.py`` rejects any non-``https://``
+    redirect URI outright (WHOOP's dashboard rejects plain ``http://``,
+    including ``http://localhost``), so manual paste is the only mechanism
+    the redirect scheme leaves. No browser auto-launch either, a deliberate
+    choice rather than an omission: it adds a failure mode for zero benefit
+    to the likely user of a terminal subcommand (headless box, SSH session,
+    container), and printing the URL is enough -- most terminals make it
+    clickable. Every prompt goes to stderr and is read from stdin, matching
+    this CLI's stderr-only output discipline; no TUI, no spinner, no colour.
+
+    ``verify_state`` runs strictly before ``exchange_code`` (D4): a
+    mismatched state must mean the code is never spent at all, not
+    exchanged and then discarded. ``exchange_code`` already persists to
+    whichever store ``WHOOPMCP_TOKEN_BACKEND`` selects, so there is no
+    separate save step here. Never echoes the code or the state anywhere --
+    not on success, not in an error message, not in a log line -- since an
+    authorization code is a credential; only the granted scopes are
+    reported on success, mirroring ``whoop_complete_login``'s own line.
+    Error shape copied from ``_delete_member``/``_erase_member``: catch
+    ``AuthError``, print one ``whoopmcp: ...`` line to stderr, return
+    non-zero -- never let an ``AuthError`` reach the user as a traceback.
+    """
+    from whoopmcp.auth import Authenticator, AuthError
+
+    auth = Authenticator(config)
+    url = auth.start_login()
+    print(
+        "Open this URL in a browser to authorise whoopmcp with WHOOP:\n"
+        f"  {url}\n"
+        "After you approve access, WHOOP redirects you to this server's "
+        "configured redirect URI. If that redirect URI uses a custom scheme "
+        "(anything other than https://), or nothing is listening on it, the "
+        "browser will show what looks like an error page once it gets "
+        "there -- that is expected, not a bug. Paste that page's full URL "
+        "below, or just its `code` and `state` query parameters.",
+        file=sys.stderr,
+    )
+    code, state = _extract_code_and_state(input())
+    if code is None or state is None:
+        print(
+            "whoopmcp: could not find both `code` and `state` in that paste; "
+            "enter them separately.",
+            file=sys.stderr,
+        )
+        print("code: ", end="", file=sys.stderr, flush=True)
+        code = input()
+        print("state: ", end="", file=sys.stderr, flush=True)
+        state = input()
+
+    try:
+        auth.verify_state(state)
+        token = asyncio.run(auth.exchange_code(code))
+    except AuthError as exc:
+        print(f"whoopmcp: {exc}", file=sys.stderr)
+        return 1
+
+    granted = ", ".join(token.scopes) if token.scopes else "(none)"
+    print(f"whoopmcp: login complete. Granted scopes: {granted}", file=sys.stderr)
     return 0
 
 

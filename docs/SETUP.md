@@ -117,16 +117,32 @@ Full variable list is in the [README](../README.md#configuration).
 
 ## 4. Log in
 
-Ask your client to run **`whoop_login`**. It returns a URL.
+**Preferred: run `whoopmcp login` in a terminal.** It prints the authorize
+URL, waits for you to paste back the redirect (or just its `code` and
+`state` query parameters), and exchanges them itself. This is preferred
+over the in-chat steps below because the authorization code never has to
+travel through your MCP client or its model provider on its way to the
+exchange.
 
-1. Open the URL in a browser and approve the WHOOP consent screen.
-2. You are redirected. With a custom scheme the browser shows an error page —
+1. Run `whoopmcp login`. It prints a URL.
+2. Open the URL in a browser and approve the WHOOP consent screen.
+3. You are redirected. With a custom scheme the terminal shows an error
+   page — expected. Paste that page's URL back at the prompt (a bare
+   `code=...&state=...` fragment also works; if neither parses, it asks for
+   `code` and `state` separately).
+
+If your MCP client has no terminal you can reach, use the in-chat pair
+instead:
+
+1. Ask your client to run **`whoop_login`**. It returns a URL.
+2. Open the URL in a browser and approve the WHOOP consent screen.
+3. You are redirected. With a custom scheme the browser shows an error page —
    expected. Read the URL bar.
-3. Copy the `code` and `state` query parameters.
-4. Ask your client to run **`whoop_complete_login`** with both.
+4. Copy the `code` and `state` query parameters.
+5. Ask your client to run **`whoop_complete_login`** with both.
 
-`state` is verified against the pending login, so a code from a different
-flow is rejected. Confirm with **`whoop_auth_status`**.
+Either way, `state` is verified against the pending login, so a code from a
+different flow is rejected. Confirm with **`whoop_auth_status`**.
 
 **On data freshness:** local mode has no scheduled incremental sync today —
 that's #15, and it hasn't merged yet. Every tool call fetches live from
