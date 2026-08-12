@@ -263,6 +263,43 @@ async def test_token_with_no_resource_rejected(monkeypatch: pytest.MonkeyPatch) 
     assert result is None, "Token without resource indicator must be rejected"
 
 
+async def test_token_with_empty_string_resource_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MCPTokenVerifier rejects a token whose resource claim is present but empty.
+
+    #69 test 1's "if not already covered" clause: `resource=None` (missing)
+    is already pinned by `test_token_with_no_resource_rejected` above, but
+    `resource=""` takes a different branch through `_names_this_resource` --
+    it fails the `is None` guard and falls through to the equality check
+    instead, so it is not proven by that test and is worth its own case.
+    Also distinguishes this from `test_token_with_wrong_resource_rejected`:
+    an empty string isn't "some other server's identifier", it's the
+    resource-indicator equivalent of an absent claim, and must not be
+    accidentally treated as falsy-but-matching by some future rewrite of
+    the equality check (e.g. a `resource in (None, config.resource_url)`-
+    style refactor that only special-cases `None`).
+    """
+    verifier = MCPTokenVerifier()
+    config = MCPAuthConfig(
+        resource_url=AnyHttpUrl("https://whoopmcp.example.com/mcp"),
+        authorization_servers=[AnyHttpUrl("https://auth.example.com")],
+    )
+    verifier.config = config
+
+    from mcp.server.auth.provider import AccessToken
+
+    token_empty_resource = AccessToken(
+        token="token123",
+        client_id="client1",
+        scopes=["read"],
+        resource="",  # Empty, not missing -- a different code path than None
+        subject="user123",
+    )
+    monkeypatch.setattr(verifier, "_resolve", AsyncMock(return_value=token_empty_resource))
+
+    result = await verifier.verify_token(token_empty_resource.token)
+    assert result is None, "Token with an empty resource claim must be rejected"
+
+
 # -- Token verification: Expiration and malformation -------------------------
 
 

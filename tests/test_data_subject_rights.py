@@ -312,6 +312,78 @@ def test_erasure_registry_covers_every_schema_table() -> None:
     assert tables == store._ERASURE_TABLES | {"principal_members"}
 
 
+def test_erasure_covers_every_table_export_actually_reads_from(
+    store_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#69 test 5: erase-member covers every table export-member reads from --
+    the two must enumerate the same table set, so a table added to one but
+    not the other is caught here rather than shipping silently uncovered.
+
+    Genuinely new: no existing test compares these two sets dynamically.
+    ``test_erasure_registry_covers_every_schema_table`` above compares
+    ``_ERASURE_TABLES`` against the *live schema*'s table list, and
+    ``test_export_returns_every_entity_held_for_the_member`` asserts
+    export's *field* presence -- neither ever asks "which tables did
+    ``export_member_data`` itself actually touch, at the sqlite level, and
+    is that the same set ``erase_member_data`` deletes from?" A table that
+    export starts reading from (or stops reading from) without a matching
+    change to ``_ERASURE_TABLES`` would pass both existing tests untouched;
+    this one exists to catch exactly that drift.
+
+    Every entity read in ``export_member_data`` goes through
+    ``store._execute_scoped`` (enforced structurally by
+    ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper`` in
+    test_tenancy.py). ``sqlite3.Connection`` is a C extension type and
+    cannot be monkeypatched at the class level (tried first; raises
+    ``TypeError: cannot set ... attribute of immutable type``), and
+    ``_execute_scoped`` installs its own authorizer unconditionally on every
+    call, so a callback set on the connection *before* calling it would just
+    be clobbered. Instead this monkeypatches ``store._execute_scoped`` itself
+    for the duration of the test: the replacement installs its own
+    ``SQLITE_READ``-recording authorizer and runs the same ``sql``/``params``
+    directly, so every table an export statement's compiled query actually
+    names is captured straight from sqlite, not from a hand-maintained guess
+    at which tables ``export_member_data`` "should" touch. (It does not
+    replicate ``_execute_scoped``'s own scoping validation -- that property
+    is test_tenancy.py's job, not this test's; every query the fixtures below
+    issue is already known-correctly-scoped.)
+
+    ``principal_members`` is read via the identity join but is not itself in
+    ``_ERASURE_TABLES`` (erased separately, by
+    ``delete_principal_links_for_member`` -- see that table's own comment in
+    store.py), which is exactly why the assertion below adds it explicitly
+    rather than asserting equality with ``_ERASURE_TABLES`` alone.
+    """
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+
+    tables_read: set[str] = set()
+
+    def recording_execute_scoped(
+        conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+    ) -> sqlite3.Cursor:
+        def authorizer(action: int, arg1: str | None, *_rest: object) -> int:
+            if action == sqlite3.SQLITE_READ and arg1 is not None:
+                tables_read.add(arg1)
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(authorizer)
+        try:
+            return conn.execute(sql, params)
+        finally:
+            conn.set_authorizer(None)
+
+    monkeypatch.setattr(store, "_execute_scoped", recording_execute_scoped)
+
+    store.export_member_data(store_conn, MEMBER_A)
+
+    expected = store._ERASURE_TABLES | {"principal_members"}
+    assert tables_read == expected, (
+        "export_member_data's actual table reads and the erasure registry have "
+        f"drifted apart: read-by-export-only={tables_read - expected}, "
+        f"erasure-registry-only={expected - tables_read}"
+    )
+
+
 def test_erase_member_data_deletes_rows_from_every_erasure_table(
     store_conn: sqlite3.Connection,
 ) -> None:
