@@ -191,8 +191,12 @@ Practical mitigations, in rough order of effectiveness:
 - Send data to the maintainers or any third party other than WHOOP.
 - Collect telemetry, analytics, crash reports, or usage statistics.
 - Write your WHOOP data to a file, unless you explicitly enable the cache.
-- Modify anything in your WHOOP account. Every data tool is read-only, and
-  the one mutating endpoint WHOOP exposes to OAuth clients is not wired up.
+- Modify anything in your WHOOP account through any MCP tool. Every data
+  tool is read-only, and the one mutating endpoint WHOOP exposes to OAuth
+  clients (`DELETE /v2/user/access`) is never registered as an MCP tool — no
+  model can call it. It is reachable only from a terminal on the machine
+  running the server, as the operator-run `whoopmcp delete-member
+  --whoop-user-id N` (§5, below).
 - Include tokens or health data in log output.
 
 ## 5. Deleting your data
@@ -205,7 +209,12 @@ Practical mitigations, in rough order of effectiveness:
    cache too.
 3. **Revoke the grant at WHOOP** — in the WHOOP app under Settings, remove
    this application's authorisation. Step 1 does not do this; until you
-   revoke, the authorisation still exists on WHOOP's side.
+   revoke, the authorisation still exists on WHOOP's side. If you have
+   terminal access to the machine running the server, `whoopmcp
+   delete-member --whoop-user-id N` does the same revocation without
+   opening the app — but you need your own WHOOP user id first (it's in
+   your profile) and this is a CLI-only operator command, never an MCP
+   tool, so no model can run it on your behalf.
 4. **Your data at WHOOP and at your model provider** is theirs to delete;
    use their respective controls. Nothing in this repository can reach it.
 

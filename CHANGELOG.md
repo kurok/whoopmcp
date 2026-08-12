@@ -602,6 +602,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #75: `README.md` and `PRIVACY.md` both claimed the one mutating
+  endpoint WHOOP exposes (`DELETE /v2/user/access`) "is not wired up" --
+  true before #30, false since: `whoopmcp delete-member --whoop-user-id N`
+  calls exactly that endpoint via `Authenticator.revoke_and_forget`. Reworded
+  both to the true, narrower claim -- never registered as an MCP tool, so no
+  model can revoke your grant, but reachable from a terminal as that
+  operator-run command -- and added `delete-member` to the README's
+  operator-command list (distinct from `erase-member`, which also erases
+  stored data) and to `PRIVACY.md`'s local-mode deletion steps as the
+  same-machine alternative to revoking in the WHOOP app. `docs/SETUP.md` now
+  points to `whoopmcp --help` for the full operator-command list and names
+  `delete-member` explicitly. `whoop_logout`'s return string now names
+  `whoopmcp delete-member` alongside the existing WHOOP-app instruction. No
+  behaviour change.
 - Issue #70: `README.md`'s Install section told users to `uvx whoopmcp` or
   `pip install whoopmcp`, but the package isn't published (#34) -- either
   command fails or, worse, silently installs an unrelated package of a

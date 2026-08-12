@@ -39,11 +39,13 @@ before hosting this for anyone but yourself.
 | Records | `list_recoveries`, `list_sleeps`, `list_cycles`, `list_workouts`, `get_sleep`, `get_workout` |
 | Analysis | `summarize_period`, `metric_trend`, `correlate_metrics`, `compare_periods` |
 
-Every data tool is annotated `readOnlyHint`. There is no write path to your
-WHOOP account in this server — the one mutating endpoint WHOOP exposes
-(`DELETE /v2/user/access`) is deliberately not wired up, so a model cannot
-revoke your grant. `whoop_logout` only deletes the token stored on your own
-disk.
+Every data tool is annotated `readOnlyHint`. No MCP tool can mutate your
+WHOOP account — the one mutating endpoint WHOOP exposes
+(`DELETE /v2/user/access`) is never registered as an MCP tool, so no model
+can revoke your grant. It is reachable only from a terminal on the machine
+running the server, as the operator-run `whoopmcp delete-member
+--whoop-user-id N` (see [Privacy](#privacy)); `whoop_logout` itself only
+deletes the token stored on your own disk.
 
 Questions it is meant to answer:
 
@@ -162,9 +164,12 @@ document. The essential points:
 - **Hosted mode:** an operator holds other members' health data server-side
   (#13) and is a data controller for it (GDPR Article 9). Per-member export
   and erasure are operator-run CLI commands, deliberately not MCP tools —
-  `whoopmcp export-member --whoop-user-id N` and
-  `whoopmcp erase-member --whoop-user-id N` (the latter also revokes the
-  WHOOP grant upstream) — and `whoopmcp enforce-retention --max-age-days N`
+  `whoopmcp export-member --whoop-user-id N`,
+  `whoopmcp delete-member --whoop-user-id N` (revokes the member's WHOOP
+  grant upstream and forgets their local token and principal link — nothing
+  more), and `whoopmcp erase-member --whoop-user-id N` (also revokes the
+  grant, then additionally erases the member's stored health data, webhook
+  events, and audit rows) — and `whoopmcp enforce-retention --max-age-days N`
   deletes data past a configured age when an operator schedules it. This
   project takes no backups of its own in either mode.
 

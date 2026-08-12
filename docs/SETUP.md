@@ -327,3 +327,11 @@ requests per collection.
 configuration, stored credentials, the local store, and sync state in one
 pass and reports each in a sentence, exiting non-zero if anything needs
 attention.
+
+**Looking for the operator-only commands** (export, erasure, revocation,
+retention)? None of them are MCP tools a model can call — run `whoopmcp
+--help` for the full list. Among them, `whoopmcp delete-member
+--whoop-user-id N` revokes a member's WHOOP grant upstream and forgets their
+local token and principal link; it needs that member's WHOOP user id (look
+it up in their profile first) and is distinct from `erase-member`, which
+also erases their stored health data.
