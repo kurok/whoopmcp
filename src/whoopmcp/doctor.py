@@ -133,7 +133,30 @@ def _check_store(config: Config) -> tuple[sqlite3.Connection | None, DoctorCheck
 
     Any failure is reported by exception type only, never the path or a
     traceback -- same precedent as the credentials check above.
+
+    In default local mode (``WHOOPMCP_CACHE`` unset) ``lifespan()`` now opens
+    an in-memory store instead of ``config.cache_path`` (#74), so that
+    PRIVACY.md's "nothing but the token" promise holds for the running
+    server. If this check went ahead and called ``open_store(config
+    .cache_path)`` unconditionally anyway, ``doctor`` itself would become the
+    *only* thing that ever creates ``cache.sqlite3`` on disk in that mode --
+    an operator who reads the promise, then runs `doctor`, would find the
+    file the document says isn't there. So when there is no cache opt-in and
+    no such file already exists (e.g. left over from a past
+    ``WHOOPMCP_CACHE=true`` period), report the true, in-memory state instead
+    of creating one just to check it. If a file *does* already exist, the
+    check proceeds exactly as before -- that store is real and worth
+    opening.
     """
+    if config.store_is_ephemeral and not config.cache_path.exists():
+        return None, DoctorCheck(
+            name="store",
+            ok=True,
+            message=(
+                "the local store is in-memory only in default local mode "
+                "(WHOOPMCP_CACHE is not set); nothing is persisted to disk"
+            ),
+        )
     try:
         conn = open_store(config.cache_path)
     except Exception as exc:

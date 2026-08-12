@@ -97,13 +97,37 @@ URLs are the only ones in the source, in `auth.py` and `client.py`.
 > `pip install 'whoopmcp[keyring]'` and `WHOOPMCP_TOKEN_BACKEND=keyring`,
 > which stores the token in the Windows Credential Manager — it does not
 > cover the database or an export, which have no keychain equivalent.
-| Cached responses (local mode only) | `$WHOOPMCP_STATE_DIR/cache.sqlite3` | **Off by default**; only written if you set `WHOOPMCP_CACHE=true`. File mode `0600`, directory `0700` — **macOS and Linux only** — the same discipline as the token above, and the mechanism that protects sqlite's transient `-journal` sidecar (this software never enables WAL, so `-wal`/`-shm` never exist) |
+| Cached responses (local mode only) | `$WHOOPMCP_STATE_DIR/cache.sqlite3` | **Not written to disk by default.** By default the store — the principal/member link and the tool-call audit trail described below — lives **in memory only**, for the life of the running process, and `cache.sqlite3` is never created. It moves to disk, with the same protection as the token above (file mode `0600`, directory `0700` — **macOS and Linux only** — including the mechanism that protects sqlite's transient `-journal` sidecar; this software never enables WAL, so `-wal`/`-shm` never exist), only if you set `WHOOPMCP_CACHE=true` or enable webhooks (`WHOOPMCP_WEBHOOKS_ENABLED=true`) |
 | Data-subject export (`export-member --out`) | Wherever you point `--out` | File mode `0600` — **macOS and Linux only** |
 | Logs | stderr only | Never written to a file by this software |
 
-By default in **local mode**, the only thing this software persists is your
-token. WHOOP records are fetched, returned, and forgotten, unless you
-explicitly opt into the cache above.
+By default in **local mode**, the only thing this software writes to
+`$WHOOPMCP_STATE_DIR` is your token. The server also keeps, in memory only,
+for the life of the running process: the link between your MCP session and
+your WHOOP member id, and a tool-call audit trail (tool name and timestamp
+only, never arguments or results) — both vanish when the process exits, and
+neither is ever written to disk. **No WHOOP health record is fetched live**:
+every data and analysis tool answers only from the local store, and each of
+the three things that can put a record into that store is off by default —
+`whoop_sync` and the operator-run `whoopmcp backfill` command both refuse to
+run unless `WHOOPMCP_CACHE=true`, and the webhook receiver, which is the one
+path where WHOOP pushes records to you rather than you pulling them, does
+nothing unless `WHOOPMCP_WEBHOOKS_ENABLED=true`. So by
+default, no WHOOP health record (recovery, sleep, cycle, workout) is ever
+fetched from WHOOP or held anywhere, on disk or in memory, and every data
+tool reports "not synced yet" until you opt in. The one live call outside
+login is `GET /v2/user/profile/basic` at startup, to resolve which member
+your token belongs to; only the resulting member id is kept, in memory, for
+the life of the process. Setting `WHOOPMCP_CACHE=true` moves the principal
+link and audit trail to `cache.sqlite3` on disk, where they persist across
+restarts, and enables `whoop_sync`/`backfill` to populate it with the WHOOP
+records tools then answer from; enabling webhooks
+(`WHOOPMCP_WEBHOOKS_ENABLED=true`) also moves the store to disk, since a
+webhook consumer whose work vanished on every restart would be pointless —
+and note that webhooks write WHOOP health records (recovery, sleep and
+workout) into that store as WHOOP pushes them, independently of
+`WHOOPMCP_CACHE`, so enabling webhooks alone is enough to put health data on
+your disk.
 
 **Hosted mode stores materially more, unconditionally — not opt-in.** The
 same SQLite store (`$WHOOPMCP_STATE_DIR/cache.sqlite3`) that is an optional

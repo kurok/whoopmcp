@@ -563,6 +563,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #74: `lifespan()` opened `cache.sqlite3` unconditionally, so a
+  default local stdio session (no `WHOOPMCP_CACHE`, webhooks disabled)
+  created the database, linked a principal to a member on login, and wrote a
+  `tool_call_audit` row on every data/analysis tool call -- despite
+  PRIVACY.md promising that mode persists nothing but the token. The store
+  now lives in memory only in that default mode; the principal link is
+  seeded at startup from the already-resolved live grant so a valid token
+  still resolves after a restart with no re-login required
+  (`resolve_member_id` has no fallback to fall back on -- #29 -- so an
+  unseeded ephemeral store would otherwise break every data tool). Hosted
+  mode, `WHOOPMCP_CACHE=true`, and `WHOOPMCP_WEBHOOKS_ENABLED=true` are
+  unaffected and keep writing to disk exactly as before. PRIVACY.md's local
+  storage table and prose are corrected to match, including a stale
+  "fetched, returned, and forgotten" claim that predated this issue.
 - Issue #68: `open_store` created the sqlite database (and `export-member
   --out`'s data-subject export) at the process umask default -- typically
   `0644` -- despite holding the same category of health data
