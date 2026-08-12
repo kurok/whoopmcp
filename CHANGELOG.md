@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #76: a `whoopmcp login` terminal subcommand for the OAuth dance --
+  prints the authorize URL, prompts for the pasted redirect (a full URL, or
+  a bare `code=...&state=...` fragment, falling back to separate `code`/
+  `state` prompts if neither parses), and exchanges them via the same
+  `Authenticator` the in-chat `whoop_login`/`whoop_complete_login` pair
+  uses. Additive, not a replacement -- that pair stays exactly as it is for
+  MCP clients with no terminal a user can reach. Preferred when a terminal
+  is reachable, since the authorization code never has to travel through
+  the MCP client or its model provider to reach the exchange. No browser
+  auto-launch (printing the URL is enough, and a launch adds a failure mode
+  for zero benefit on a headless box, SSH session, or container) and no
+  localhost listener (WHOOP rejects plain `http://` redirect URIs outright,
+  so manual paste is the only mechanism the redirect scheme leaves).
 - Issue #17: `/webhooks/whoop` now enforces its own inbound rate limit --
   the one scope bullet the original merge left out. A fixed per-minute
   window, checked after the `webhooks_enabled` 404 but before the body is

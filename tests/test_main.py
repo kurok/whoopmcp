@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
@@ -10,7 +11,8 @@ import pytest
 import respx
 
 from whoopmcp.__main__ import main
-from whoopmcp.auth import USER_ACCESS_URL, FileTokenStore, Token
+from whoopmcp.auth import AUTHORIZE_URL, TOKEN_URL, USER_ACCESS_URL, FileTokenStore, Token
+from whoopmcp.config import Config
 
 
 def test_version_exits_cleanly(capsys: pytest.CaptureFixture[str]) -> None:
@@ -517,3 +519,307 @@ def test_replay_webhook_subcommand_reports_a_terminal_replay_as_a_no_op(
     assert "nothing was reprocessed" in err
     # Must not claim a replay happened when it didn't.
     assert "whoopmcp: replayed" not in err
+
+
+# -- login subcommand (issue #76) --------------------------------------------
+#
+# The in-chat pair (whoop_login / whoop_complete_login) stays exactly as it
+# is -- some MCP clients have no terminal a user can reach -- and its own
+# tests in test_server.py must keep passing unmodified. This subcommand is
+# the additional path that runs the same exchange with no model in the loop,
+# so the authorization code never travels through the MCP client or its
+# model provider. Everything below drives the paste prompt by monkeypatching
+# builtins.input; nothing here may ever block on real stdin.
+#
+# The two load-bearing assertions in this section are:
+#   * a mismatched state means exchange_code is NEVER CALLED (asserted as
+#     zero hits on the token route, not merely as a nonzero exit code -- an
+#     exchange-then-discard implementation would pass an exit-code-only
+#     check while having already spent the code upstream), and
+#   * neither the code nor the state is ever echoed back to stdout or
+#     stderr, on the success path or a failure path.
+
+_CODE = "pasted-authorization-code"
+_STATE = "pinned-login-state"
+
+_TOKEN_RESPONSE = {
+    "access_token": "login-access-tok",
+    "expires_in": 3600,
+    "refresh_token": "login-refresh-tok",
+    "scope": "offline read:recovery read:sleep",
+}
+
+
+def _pin_login_state(monkeypatch: pytest.MonkeyPatch, state: str = _STATE) -> str:
+    """Pin the state ``start_login()`` generates so a test can paste it back.
+
+    ``build_authorize_url`` mints a fresh ``secrets.token_urlsafe(32)`` per
+    login, and the value lives only on the ``Authenticator`` instance the
+    handler builds (``_pending_state``) -- a test has no other way to know
+    what to echo. Patched at the module attribute the handler's own
+    ``start_login`` looks up at call time, and it still delegates to the real
+    implementation, so the URL under test is the real URL.
+    """
+    from whoopmcp import auth as auth_module
+
+    real_build_authorize_url = auth_module.build_authorize_url
+
+    def build_with_pinned_state(config: Config, *, state: str | None = None) -> tuple[str, str]:
+        return real_build_authorize_url(config, state=state or _STATE)
+
+    monkeypatch.setattr(auth_module, "build_authorize_url", build_with_pinned_state)
+    return state
+
+
+class _Prompts:
+    """A ``builtins.input`` stand-in that answers each prompt from a queue.
+
+    Positional, not prompt-text-matching: D2 puts the prompt on stderr, so
+    ``input()`` may well be called with no argument at all and there is no
+    text to match on. Running out of answers is an assertion failure rather
+    than a hang -- a test that blocks on real stdin is the one outcome this
+    class exists to make impossible.
+    """
+
+    def __init__(self, *answers: str) -> None:
+        self._answers = list(answers)
+        self.calls = 0
+
+    def __call__(self, prompt: object = "") -> str:
+        self.calls += 1
+        if not self._answers:
+            raise AssertionError(
+                f"login prompted {self.calls} times; only {self.calls - 1} answers were queued"
+            )
+        return self._answers.pop(0)
+
+
+def _authorize_url_removed(captured: pytest.CaptureResult[str]) -> str:
+    """stdout+stderr with the printed authorize URL masked out.
+
+    The authorize URL necessarily carries ``state`` as a query parameter --
+    that is the whole mechanism, and the user has to open it -- so D6's
+    "never echo the state" is asserted against everything *except* that one
+    URL. The code is asserted absent from the raw text, unmasked: nothing
+    can justify the code appearing anywhere.
+    """
+    return re.sub(re.escape(AUTHORIZE_URL) + r"\S*", "<authorize-url>", captured.out + captured.err)
+
+
+def test_login_subcommand_exchanges_a_full_pasted_redirect_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # D1 step 1: urlparse the paste and use its `code`/`state` query
+    # parameters. The redirect the user lands on is an error page (nothing is
+    # listening on the redirect URI -- config.py refuses plain http, so no
+    # localhost listener is possible), and its address bar is the whole
+    # mechanism.
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _pin_login_state(monkeypatch)
+    config = Config.from_env()
+    monkeypatch.setattr(
+        "builtins.input",
+        _Prompts(f"https://localhost:8443/callback?code={_CODE}&state={_STATE}"),
+    )
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=_TOKEN_RESPONSE))
+        exit_code = main(["login"])
+
+    assert exit_code == 0
+    assert route.called
+    # Verified through the configured store, not merely by the exit code:
+    # exchange_code persists on success, so a completed login means the token
+    # is there for the next process to load.
+    stored = FileTokenStore(config.token_path).load()
+    assert stored is not None
+    assert stored.access_token == "login-access-tok"
+    assert stored.scopes == ("offline", "read:recovery", "read:sleep")
+    # The granted scopes are what a successful login reports, mirroring
+    # whoop_complete_login's own "Login complete. Granted scopes: ..." line.
+    captured = capsys.readouterr()
+    assert "read:recovery" in captured.out + captured.err
+
+
+def test_login_subcommand_accepts_a_bare_code_and_state_query_fragment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D1 step 2: a paste of just `code=...&state=...`, with no scheme and no
+    # host, is what a user copying the tail of the address bar produces.
+    # urlparse alone cannot read it -- with no scheme the whole string lands
+    # in `path` and the query comes back empty -- so parse_qs on the raw
+    # string is the fallback that makes this shape work.
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _pin_login_state(monkeypatch)
+    config = Config.from_env()
+    monkeypatch.setattr("builtins.input", _Prompts(f"code={_CODE}&state={_STATE}"))
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=_TOKEN_RESPONSE))
+        exit_code = main(["login"])
+
+    assert exit_code == 0
+    assert route.called
+    assert FileTokenStore(config.token_path).load() is not None
+
+
+def test_login_subcommand_prompts_separately_when_the_paste_parses_to_neither(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D1 step 3: a paste that yields neither key -- here the bare code value
+    # on its own, which is what a user who copied only `code` ends up with --
+    # falls through to a separate prompt for the code and then for the state.
+    # The parse cannot tell a bare code from a typo, so it asks rather than
+    # guessing, and asking is what makes this user recoverable instead of
+    # stuck.
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _pin_login_state(monkeypatch)
+    config = Config.from_env()
+    prompts = _Prompts(_CODE, _CODE, _STATE)
+    monkeypatch.setattr("builtins.input", prompts)
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=_TOKEN_RESPONSE))
+        exit_code = main(["login"])
+
+    assert exit_code == 0
+    assert route.called
+    assert prompts.calls == 3
+    assert FileTokenStore(config.token_path).load() is not None
+    request = route.calls.last.request
+    assert f"code={_CODE}" in request.content.decode()
+
+
+def test_login_subcommand_never_exchanges_a_code_whose_state_does_not_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D4, and the security-relevant assertion of this whole section.
+
+    A mismatched state is the signal that a third party may be feeding us
+    their own authorization code, so the code must never be spent at all.
+    The assertion is therefore the ABSENCE of the exchange -- zero hits on
+    the token route -- not the nonzero exit code: an implementation that
+    exchanged the code and then discarded the token would satisfy an
+    exit-code-only check while having already burned the code upstream.
+    """
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _pin_login_state(monkeypatch)
+    config = Config.from_env()
+    monkeypatch.setattr(
+        "builtins.input",
+        _Prompts(f"https://localhost:8443/callback?code={_CODE}&state=not-the-pinned-state"),
+    )
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=_TOKEN_RESPONSE))
+        exit_code = main(["login"])
+
+        assert not route.called
+        assert respx.calls.call_count == 0
+
+    assert exit_code != 0
+    # Nothing was persisted either.
+    assert FileTokenStore(config.token_path).load() is None
+    err = capsys.readouterr().err
+    assert "state mismatch" in err
+    assert "Traceback" not in err
+
+
+def test_login_subcommand_reports_a_token_endpoint_error_as_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # D5: the same error shape _delete_member/_erase_member use -- catch
+    # AuthError, one `whoopmcp: ...` line on stderr, nonzero exit. An
+    # AuthError must never reach the user as a traceback.
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _pin_login_state(monkeypatch)
+    config = Config.from_env()
+    monkeypatch.setattr(
+        "builtins.input",
+        _Prompts(f"https://localhost:8443/callback?code={_CODE}&state={_STATE}"),
+    )
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "authorization code expired",
+                },
+            )
+        )
+        exit_code = main(["login"])
+
+    assert exit_code != 0
+    assert route.called
+    assert FileTokenStore(config.token_path).load() is None
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    whoopmcp_lines = [line for line in err.splitlines() if line.startswith("whoopmcp: ")]
+    assert len(whoopmcp_lines) == 1
+    assert "invalid_grant" in whoopmcp_lines[0]
+
+
+def test_main_dispatches_the_login_subcommand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Dispatch wiring only, the way the sibling subcommands' dispatch is
+    # tested: argparse recognises `login`, and main() calls _login with the
+    # validated Config and returns its exit code rather than falling through
+    # to build_server() and starting a transport.
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    recorded: list[Config] = []
+
+    def fake_login(config: Config) -> int:
+        recorded.append(config)
+        return 7
+
+    monkeypatch.setattr("whoopmcp.__main__._login", fake_login)
+
+    assert main(["login"]) == 7
+    assert len(recorded) == 1
+    assert recorded[0].client_id == "cid"
+
+
+def test_login_subcommand_never_echoes_the_code_or_the_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D6, across a success path and a failure path.
+
+    An authorization code is a credential; keeping it out of places it does
+    not belong is the entire point of this subcommand, and terminal
+    scrollback and CI logs are two of those places. So neither value may
+    appear on stdout or stderr -- not in a success message, not inside an
+    error message, not in a log line. The state is checked against
+    everything except the authorize URL itself, which has to carry it.
+    """
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _pin_login_state(monkeypatch)
+    pasted = f"https://localhost:8443/callback?code={_CODE}&state={_STATE}"
+
+    # Success path.
+    monkeypatch.setattr("builtins.input", _Prompts(pasted))
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=_TOKEN_RESPONSE))
+        assert main(["login"]) == 0
+
+    captured = capsys.readouterr()
+    assert _CODE not in captured.out + captured.err
+    assert _STATE not in _authorize_url_removed(captured)
+    # Nor the credential the exchange returned.
+    assert "login-access-tok" not in captured.out + captured.err
+    assert "login-refresh-tok" not in captured.out + captured.err
+
+    # Failure path: WHOOP rejects the code. The error message is built from
+    # WHOOP's own error fields, and must not quote back what we sent.
+    monkeypatch.setattr("builtins.input", _Prompts(pasted))
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(400, json={"error": "invalid_grant"})
+        )
+        assert main(["login"]) != 0
+
+    captured = capsys.readouterr()
+    assert _CODE not in captured.out + captured.err
+    assert _STATE not in _authorize_url_removed(captured)
