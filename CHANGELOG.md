@@ -602,6 +602,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #70: `README.md`'s Install section told users to `uvx whoopmcp` or
+  `pip install whoopmcp`, but the package isn't published (#34) -- either
+  command fails or, worse, silently installs an unrelated package of a
+  similar name. Replaced with the git-clone + editable-install path that
+  actually works. The Configuration table's `WHOOPMCP_TOKEN_BACKEND` row
+  listed only `file` or `keyring`, omitting the shipped `encrypted-file`
+  backend; now lists all three. The table was also missing a
+  `WHOOPMCP_TRANSPORT` row despite the README's own intro naming that
+  variable -- added, with default `stdio` and values `stdio` or
+  `streamable-http`.
 - Issue #73: `README.md`'s status banner still called this a pre-alpha
   scaffold whose internals raise `NotImplementedError`, and its Roadmap
   table listed #1–#6 (all closed) as the tracked gaps; `docs/SETUP.md`
