@@ -249,11 +249,12 @@ async def _read_resource_as(
 # =============================================================================
 
 
-def test_schema_version_bumped_to_four() -> None:
+def test_schema_version_bumped_to_five() -> None:
     """#18's webhook_events was v2, #29's principal_members/tool_call_audit
-    was v3; #19's per-user webhook_delivery_state (for #31's future
-    silence-alerting) is the next migration in the ladder."""
-    assert store.CURRENT_SCHEMA_VERSION == 4
+    was v3, #19's per-user webhook_delivery_state was v4; #105's rebuild of
+    webhook_events.whoop_user_id to NOT NULL is the next migration in the
+    ladder."""
+    assert store.CURRENT_SCHEMA_VERSION == 5
 
 
 def test_principal_members_table_has_expected_columns() -> None:

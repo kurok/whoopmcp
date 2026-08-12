@@ -41,7 +41,7 @@ _warned_about_unenforced_modes = False
 
 #: Bump this and append to ``_MIGRATIONS`` when the schema changes. Never
 #: edit an already-shipped migration -- append a new one instead.
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 # -- schema ------------------------------------------------------------------
 #
@@ -246,6 +246,110 @@ CREATE TABLE IF NOT EXISTS webhook_delivery_state (
 );
 """
 
+#: Version 5 (#105): ``webhook_events.whoop_user_id`` becomes ``NOT NULL``.
+#: A NULL there made a row invisible to both ``export_member_data`` and
+#: ``erase_member_data`` (both select on ``WHERE whoop_user_id = ?``), which
+#: defeats a data-subject's rights under those two names simultaneously --
+#: the repo owner's call was to make that gap structurally impossible via
+#: the schema rather than adding a NULL sweep to those two functions (D6).
+#:
+#: sqlite has no ``ALTER COLUMN``, so this is a rebuild -- deliberately
+#: without the ``ALTER TABLE ... RENAME TO ...`` step the textbook sqlite
+#: recipe uses to swap the new table into place, because that statement has
+#: two measured side effects that are each disqualifying on their own here:
+#:
+#: * It quotes the identifier when sqlite rewrites the stored ``CREATE
+#:   TABLE`` text (``ALTER TABLE t RENAME TO t2`` leaves ``sqlite_master
+#:   .sql`` as ``CREATE TABLE "t2" (...)```), which would make the live
+#:   schema's own DDL text disagree with this module's DDL strings for no
+#:   functional reason -- and fail D5's schema-equivalence check.
+#: * It attaches a ``temp`` database to the connection (measured: even a
+#:   bare, index-free, trigger-free rename does this) -- which is exactly
+#:   the signal ``test_local_mode_privacy.py``'s ``database_files`` guard
+#:   exists to catch, since local mode's whole guarantee is that nothing
+#:   but the token ever touches disk.
+#:
+#: So the swap here goes through a second real table instead of a rename:
+#: copy every row into ``webhook_events_old`` (same, nullable, v4 shape),
+#: drop the original, create the real ``webhook_events`` under its own
+#: name with the ``NOT NULL`` constraint, copy the rows back in, drop
+#: ``webhook_events_old``. Two copies rather than one, but neither
+#: quotes anything or touches ``temp``, and the ``DROP TABLE IF EXISTS
+#: webhook_events_old`` up front is D3's retry guard either way. The
+#: PRIMARY KEY's own index (``sqlite_autoindex_webhook_events_1``) is
+#: regenerated for free by the plain ``CREATE TABLE``; there are no
+#: foreign keys anywhere in this schema (measured), so no FK pragma dance
+#: is needed either.
+#:
+#: Unlike every other entry in this ladder, this script is NOT idempotent
+#: DDL (no ``IF NOT EXISTS`` would help a rename or a cross-table copy), so
+#: it wraps itself in its own ``BEGIN``/``COMMIT`` -- measured to actually
+#: protect a mid-script failure here, because ``executescript`` committing
+#: any *already-pending* transaction before it runs is a separate fact from
+#: a ``BEGIN`` written into the script text itself; see ``_migrate``'s
+#: docstring for the distinction. ``DROP TABLE IF EXISTS`` on the working
+#: table name is the other half of making a retry after an aborted run
+#: safe: a previous attempt that got past the ``CREATE TABLE`` but died
+#: before ``COMMIT`` would otherwise block every subsequent attempt with a
+#: "table already exists" error forever.
+#:
+#: This migration never runs against a row that still has a NULL
+#: ``whoop_user_id`` -- ``_migrate`` runs the pre-flight NULL count in
+#: Python, before this script, and refuses (leaving the database at its
+#: current version, untouched) rather than let sqlite's own
+#: ``IntegrityError`` surface bare from inside the rebuild (D2).
+_SCHEMA_V5 = """
+BEGIN;
+
+DROP TABLE IF EXISTS webhook_events_old;
+
+CREATE TABLE webhook_events_old (
+    trace_id TEXT NOT NULL PRIMARY KEY,
+    whoop_user_id INTEGER,
+    event_type TEXT NOT NULL,
+    event_body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    processed_at TEXT
+);
+
+INSERT INTO webhook_events_old (
+    trace_id, whoop_user_id, event_type, event_body, status,
+    attempt_count, created_at, processed_at
+)
+SELECT trace_id, whoop_user_id, event_type, event_body, status,
+       attempt_count, created_at, processed_at
+FROM webhook_events;
+
+DROP TABLE webhook_events;
+
+CREATE TABLE webhook_events (
+    trace_id TEXT NOT NULL PRIMARY KEY,
+    whoop_user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    event_body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    processed_at TEXT
+);
+
+INSERT INTO webhook_events (
+    trace_id, whoop_user_id, event_type, event_body, status,
+    attempt_count, created_at, processed_at
+)
+SELECT trace_id, whoop_user_id, event_type, event_body, status,
+       attempt_count, created_at, processed_at
+FROM webhook_events_old;
+
+DROP TABLE webhook_events_old;
+
+CREATE INDEX IF NOT EXISTS ix_webhook_events_status ON webhook_events (status);
+
+COMMIT;
+"""
+
 #: Migration ladder: version N's script, applied when the database's
 #: `PRAGMA user_version` is below N. Keyed by the version it produces, so
 #: appending a real migration later is `_MIGRATIONS[5] = "ALTER TABLE ..."`.
@@ -254,6 +358,7 @@ _MIGRATIONS: dict[int, str] = {
     2: _SCHEMA_V2,
     3: _SCHEMA_V3,
     4: _SCHEMA_V4,
+    5: _SCHEMA_V5,
 }
 
 #: Tables filtered by ``whoop_user_id`` that ``_execute_scoped`` enforces a
@@ -711,26 +816,65 @@ def open_store(path: str | Path) -> sqlite3.Connection:
     is tightened rather than left as found (#68). See ``_secure_db_path``
     for the mechanism, its sidecar reasoning, and its Windows caveat, and
     PRIVACY.md for the operator-facing version of the same.
+
+    If ``_migrate`` raises -- e.g. #105's D2 pre-flight refusing a database
+    that still has a NULL ``webhook_events.whoop_user_id`` -- the connection
+    this function opened is closed before the exception propagates, rather
+    than handed nowhere and leaked: a caller catching that error never
+    received a ``Connection`` to close themselves.
     """
     if not _is_special_sqlite_path(path):
         _secure_db_path(Path(path))
     conn = sqlite3.connect(path)
-    _migrate(conn)
+    try:
+        _migrate(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """Bring ``conn``'s schema up to ``CURRENT_SCHEMA_VERSION``, in order.
 
-    Each step's DDL uses ``IF NOT EXISTS``, so it is safe to re-run if a
-    previous attempt got partway through and never reached the version
-    bump below -- there is no destructive statement in any migration to
-    roll back. (``executescript`` commits any pending transaction before it
-    runs, which would make wrapping it in our own ``BEGIN`` a no-op, so we
-    lean on idempotent DDL instead of a transaction for atomicity here.)
+    Every step through version 4 uses idempotent DDL (``IF NOT EXISTS``),
+    so it is safe to re-run if a previous attempt got partway through and
+    never reached the version bump below -- there is no destructive
+    statement in any of those migrations to roll back. (``executescript``
+    commits any pending transaction before it runs, which would make
+    wrapping *that call* in our own ``conn.execute("BEGIN")`` a no-op --
+    but that is a fact about a transaction started from Python before the
+    call, not about a ``BEGIN`` written into the script text itself. A
+    ``BEGIN``/``COMMIT`` *inside* the script sqlite executes is a normal
+    transaction and rolls back a mid-script failure like any other, which
+    is exactly what version 5's table rebuild below relies on, since
+    dropping and recreating a table is not the kind of statement ``IF NOT
+    EXISTS`` can make safe to half-apply.)
+
+    Version 5's pre-flight (D2, #105) runs inline here, in Python,
+    immediately before its DDL and for the same reason that DDL is
+    transactional: a NULL-user ``webhook_events`` row must be caught and
+    reported with its count before any schema change starts, not
+    discovered as a bare ``IntegrityError`` thrown from partway through
+    the rebuild. Inlined into this function rather than a separate helper
+    so the extra ``SELECT`` still runs through an entry point
+    ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper``
+    already allows (``_migrate`` itself), not a new one that test would
+    have to be told about.
     """
     current: int = conn.execute("PRAGMA user_version").fetchone()[0]
     for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
+        if version == 5:
+            (null_count,) = conn.execute(
+                "SELECT COUNT(*) FROM webhook_events WHERE whoop_user_id IS NULL"
+            ).fetchone()
+            if null_count:
+                raise ValueError(
+                    "Cannot migrate webhook_events.whoop_user_id to NOT "
+                    f"NULL: {null_count} row(s) still have a NULL "
+                    "whoop_user_id. Resolve or remove those rows before "
+                    "retrying (see issue #105)."
+                )
         conn.executescript(_MIGRATIONS[version])
         conn.execute(f"PRAGMA user_version = {version}")
     conn.commit()
@@ -1630,7 +1774,7 @@ def get_webhook_delivery_state_for_member(
 def insert_webhook_event(
     conn: sqlite3.Connection,
     trace_id: str,
-    whoop_user_id: int | None,
+    whoop_user_id: int,
     event_type: str,
     event_body: str,
 ) -> None:
@@ -1644,6 +1788,14 @@ def insert_webhook_event(
     has not seen, so that error should never actually surface in practice --
     it is the ``PRIMARY KEY``'s job to make that guarantee load-bearing
     rather than advisory.
+
+    ``whoop_user_id`` was typed ``int | None`` before #105 made the column
+    itself ``NOT NULL``; the single call site (``webhook_processor.py``)
+    never passed ``None`` (an event with no resolvable user id is dropped
+    before any insert is attempted), so the wider type was strictly
+    optimistic -- it let a caller's type checker miss what would now be a
+    guaranteed ``IntegrityError`` at runtime. Narrowing it to ``int`` closes
+    that gap at the same layer the schema change closes it at the database.
     """
     _execute_scoped(
         conn,
