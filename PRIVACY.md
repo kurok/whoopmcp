@@ -234,7 +234,8 @@ capability is exposed as an MCP tool.
 - **Erasure** — `whoopmcp erase-member --whoop-user-id N` revokes the
   member's WHOOP grant upstream, then permanently `DELETE`s every one of
   those rows for member `N` — a real removal, not a flag — plus their token
-  and principal link.
+  and principal link. The database file is then compacted via `VACUUM` so
+  those bytes are no longer present in the database file.
 
 Ask the operator running your `whoopmcp` instance to run these on your
 behalf if you want your data or its removal; there is no in-app self-service

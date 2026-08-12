@@ -530,11 +530,23 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
     being alive, nor does it revoke a token it cannot attribute to this
     member -- see ``_revoke_before_local_deletion`` (issue #65).
 
+    After the erasure commits, compacts the database file to overwrite freed
+    pages (issue #100): deleted bytes are otherwise recoverable in the file
+    in free space. A failed compaction does not abort or report as erasure
+    failure (the deletes are already committed and irreversible); it prints
+    a distinct stderr message (issue #100, decision D3) and returns exit
+    code 3 -- distinct from the pre-deletion abort's 1, so callers can tell
+    "nothing was deleted" from "deleted, compaction pending" without
+    parsing stderr.
+
     Refuses -- before opening anything -- when the store is ephemeral and no
     file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101).
     """
+    import sqlite3
+
     from whoopmcp.auth import Authenticator
     from whoopmcp.store import (
+        compact_database,
         erase_member_and_links_atomically,
         open_store,
         principal_is_linked_to_member,
@@ -559,6 +571,15 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
             return abort_code
 
         erase_member_and_links_atomically(conn, whoop_user_id)
+        try:
+            compact_database(conn)
+        except sqlite3.Error as exc:
+            print(
+                f"whoopmcp: member {whoop_user_id} is deleted but the database file "
+                f"was not compacted ({exc})",
+                file=sys.stderr,
+            )
+            return 3
     finally:
         conn.close()
     return 0

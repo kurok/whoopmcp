@@ -452,9 +452,11 @@ def test_completely_unfiltered_update_with_no_where_clause_fails_closed() -> Non
 def test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper() -> None:
     """Structural half of the DB-level guarantee: every ``conn.execute``/
     ``.executemany`` call in store.py must live inside
-    ``_execute_with_tenancy_authorizer`` itself, ``_migrate``, or
-    ``open_store`` (migration/PRAGMA bootstrap code, which never touches an
-    entity table) -- otherwise a future store.py function could quietly route
+    ``_execute_with_tenancy_authorizer`` itself, ``_migrate``, ``open_store``,
+    or ``compact_database`` (bootstrap/PRAGMA/specialized code: ``_migrate``
+    and ``open_store`` bootstrap the schema, ``compact_database`` runs ``VACUUM``
+    to reclaim freed pages after erasure, which cannot go through the tenancy
+    guard) -- otherwise a future store.py function could quietly route
     around the authorizer-backed check entirely. AST-based, not a text grep,
     so it can't be fooled by a comment or a string literal containing
     "conn.execute(".
@@ -475,7 +477,7 @@ def test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper() -> None:
     """
     source = inspect.getsource(store)
     tree = ast.parse(source)
-    allowed = {"_execute_with_tenancy_authorizer", "_migrate", "open_store"}
+    allowed = {"_execute_with_tenancy_authorizer", "_migrate", "open_store", "compact_database"}
     violations: list[str] = []
 
     for node in ast.walk(tree):
@@ -491,7 +493,8 @@ def test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper() -> None:
 
     assert violations == [], (
         "store.py calls .execute()/.executemany() outside "
-        f"_execute_with_tenancy_authorizer, _migrate, or open_store: {violations}"
+        f"_execute_with_tenancy_authorizer, _migrate, open_store, or "
+        f"compact_database: {violations}"
     )
 
 
