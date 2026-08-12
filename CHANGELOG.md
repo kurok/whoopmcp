@@ -602,6 +602,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #71: CONTRIBUTING.md's "Where things go" map claimed `server.py`
+  was "the only file that imports mcp" -- false: `webhooks.py` and
+  `mcpauth.py` also do, confirmed by AST across all 18 modules. The map
+  itself named only 8 of those 18 files, missing `__init__.py`,
+  `__main__.py`, `backfill.py`, `doctor.py`, `mcpauth.py`, `metrics.py`,
+  `reconciliation.py`, `sync.py`, `webhook_processor.py`, and `webhooks.py`
+  -- now complete. Two new guard tests (`tests/test_module_map.py`) keep
+  both facts honest going forward: one asserts every `src/whoopmcp/*.py`
+  has a map entry and vice versa, the other asserts via AST that only
+  those three files import `mcp`.
 - Issue #75: `README.md` and `PRIVACY.md` both claimed the one mutating
   endpoint WHOOP exposes (`DELETE /v2/user/access`) "is not wired up" --
   true before #30, false since: `whoopmcp delete-member --whoop-user-id N`

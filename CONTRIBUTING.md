@@ -34,16 +34,31 @@ mypy
 ## Where things go
 
 ```
-config.py            environment -> Config, validated once at startup
-auth.py              OAuth 2.0 flow + token storage
-crypto.py            envelope encryption primitive (AES-GCM, versioned keys); no auth/WHOOP knowledge
-client.py            one method per documented WHOOP endpoint, nothing more
-store.py             sqlite3 persistence: schema, migrations, per-user upserts and reads
-analysis.py          pure functions over already-fetched records
-context_budget.py    response-shaping/measurement shared by tools (token
-                     estimation, null-stripping); not network, not statistics
-server.py            MCP tool definitions; the only file that imports mcp
+__init__.py            package marker; only __version__, no placement decisions
+config.py              environment -> Config, validated once at startup
+auth.py                OAuth 2.0 flow + token storage
+mcpauth.py             inbound OAuth 2.1 resource server: bearer-token validation
+                       for MCP clients; never touches WHOOP's own grant
+crypto.py              envelope encryption primitive (AES-GCM, versioned keys); no auth/WHOOP knowledge
+client.py              one method per documented WHOOP endpoint, nothing more
+store.py               sqlite3 persistence: schema, migrations, per-user upserts and reads
+analysis.py            pure functions over already-fetched records
+context_budget.py      response-shaping/measurement shared by tools (token
+                       estimation, null-stripping); not network, not statistics
+webhooks.py            webhook receiver: HMAC verification, raw-body handling,
+                       hands verified events to a queue
+webhook_processor.py   webhook event consumer: idempotent processing keyed on trace_id
+backfill.py            resumable, throttled full history import; CLI-only, never a tool
+sync.py                incremental sync from an updated_at high-water mark
+reconciliation.py      periodic full reconciliation: the webhook backstop for missed deletions
+metrics.py             Prometheus exposition: sync lag, webhook health, rate budget, token failures
+doctor.py              whoopmcp doctor: one-pass health check for a local-mode install
+server.py              MCP tool definitions; the outward-facing MCP surface
+__main__.py            CLI entry point; MCP clients launch this over stdio, --http for testing
 ```
+
+Only `server.py`, `webhooks.py`, and `mcpauth.py` import `mcp`; no other
+module does -- enforced by `tests/test_module_map.py`, not just stated here.
 
 The split is the point. Keep network code out of `analysis.py` and statistics
 out of `client.py`, so each stays testable without the other. Anything that
