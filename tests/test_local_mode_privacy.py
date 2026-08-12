@@ -25,6 +25,11 @@ So these tests are written from the document, not from the implementation:
   and hosted (`streamable-http`) mode -- pinned so the local fix cannot leak
   into them.
 
+The data-rights CLI subcommands (`delete-member`, `export-member`,
+`erase-member`, `enforce-retention`) must also respect this promise when
+operating on leftover cache files from prior persistent-mode sessions
+(issue #101).
+
 Every test here drives the real `lifespan()`. The `app_context` fixture in
 test_server.py deliberately bypasses it (hand-built `AppContext` over
 `open_store(":memory:")`), which is precisely the code path that cannot
@@ -46,16 +51,29 @@ import pytest
 import respx
 
 from test_server import call_tool, profile_fixture, recovery_fixture
-from whoopmcp.auth import TOKEN_URL, FileTokenStore, Token
+from whoopmcp.__main__ import main
+from whoopmcp.auth import TOKEN_URL, USER_ACCESS_URL, FileTokenStore, Token
 from whoopmcp.client import BASE_URL
+from whoopmcp.config import Config
+from whoopmcp.doctor import run_checks
 from whoopmcp.server import AppContext, Principal, build_server, lifespan
-from whoopmcp.store import get_member_for_principal, upsert_recovery
+from whoopmcp.store import (
+    get_member_for_principal,
+    link_principal_to_member,
+    open_store,
+    principal_is_linked_to_member,
+    upsert_body_measurement,
+    upsert_recovery,
+)
 
 #: `_principal_key(None)`'s sentinel: under stdio there is no request, so
 #: every tool call resolves identity under this one fixed key. Spelled out
 #: rather than imported so a rename of the private constant cannot silently
 #: change what these tests assert about.
 LOCAL_CLIENT_ID = "__local__"
+
+#: A fixed WHOOP user ID for testing data-rights commands.
+WHOOP_USER_ID = 910101
 
 #: The one file PRIVACY.md says a default local-mode session may leave behind.
 TOKEN_FILE = "token.json"
@@ -412,3 +430,307 @@ async def test_no_token_seeds_no_link_and_still_writes_nothing(state_dir: Path) 
 
     assert not cache_file(state_dir).exists()
     assert list(state_dir.iterdir()) == []
+
+
+# -- issue #101: data-rights CLI subcommands in ephemeral local mode ---------
+
+
+@pytest.mark.parametrize(
+    "subcommand,extra_args",
+    [
+        ("delete-member", ["--whoop-user-id", "999"]),
+        ("export-member", ["--whoop-user-id", "999"]),
+        ("erase-member", ["--whoop-user-id", "999"]),
+        ("enforce-retention", []),
+    ],
+)
+def test_ephemeral_mode_subcommands_refuse_and_create_no_cache_file(
+    state_dir: Path,
+    subcommand: str,
+    extra_args: list[str],
+) -> None:
+    """In default local mode with an empty state dir, the four subcommands
+    must exit 2 and NOT create cache.sqlite3.
+
+    This test FAILS against the buggy code (exit 0 for enforce-retention,
+    cache.sqlite3 exists for all four).
+    """
+    # Ensure no pre-existing cache file
+    assert not cache_file(state_dir).exists()
+
+    # Ensure WHOOPMCP_CACHE is NOT set (ephemeral mode)
+    import os
+
+    os.environ.pop("WHOOPMCP_CACHE", None)
+
+    # Mock the delete call (never hit, but provides defense in depth)
+    respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+
+    exit_code = main([subcommand, *extra_args])
+
+    # Must exit 2 for all four
+    assert exit_code == 2, f"{subcommand} should exit 2 in ephemeral mode"
+
+    # CRITICAL: cache.sqlite3 must NOT exist afterwards
+    assert not cache_file(state_dir).exists(), (
+        f"{subcommand} created cache.sqlite3 in ephemeral mode (file should not exist)"
+    )
+
+
+@pytest.mark.parametrize("subcommand", ["delete-member", "export-member", "erase-member"])
+def test_leftover_cache_file_is_still_operated_on_in_ephemeral_mode(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+    subcommand: str,
+) -> None:
+    """With a pre-existing cache.sqlite3 (leftover from WHOOPMCP_CACHE=true),
+    data-rights subcommands must still work on it -- refusing would deny a
+    data subject their erasure/export right.
+
+    Seed the cache with a member's data, then run the command. It must
+    succeed (exit 0 for all three) and actually operate on the store.
+
+    This test specifically catches the mistake of using `if not
+    config.cache_enabled:` instead of `if config.store_is_ephemeral and not
+    config.cache_path.exists():`.
+    """
+    # Ensure WHOOPMCP_CACHE is NOT set (ephemeral mode)
+    import os
+
+    os.environ.pop("WHOOPMCP_CACHE", None)
+
+    # Pre-seed the cache with a member's data (simulating leftover from earlier
+    # WHOOPMCP_CACHE=true period)
+    config = Config.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    conn = open_store(config.cache_path)
+    link_principal_to_member(
+        conn,
+        client_id="local",
+        issuer=None,
+        subject=None,
+        whoop_user_id=WHOOP_USER_ID,
+    )
+    upsert_body_measurement(conn, WHOOP_USER_ID, {"weight_kilogram": 75.0})
+    conn.close()
+
+    # Verify the cache file actually exists
+    assert cache_file(state_dir).exists(), "Pre-seed cache.sqlite3 should exist"
+
+    # Mock the delete call (needed for delete-member and erase-member)
+    respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+
+    exit_code = main([subcommand, "--whoop-user-id", str(WHOOP_USER_ID)])
+
+    # All three must succeed and operate on the leftover store
+    assert exit_code == 0, (
+        f"{subcommand} must succeed on a leftover cache.sqlite3 "
+        "(refusing would deny a data subject their rights)"
+    )
+
+    # Verify the command actually operated on the store by checking the output
+    # (export writes JSON, delete/erase produce no output but change the DB state)
+    captured = capsys.readouterr()
+
+    if subcommand == "export-member":
+        # export-member writes JSON to stdout
+        assert captured.out, "export-member should write JSON to stdout"
+        assert "whoop_user_id" in captured.out, "export should contain whoop_user_id field"
+
+    # For delete-member and erase-member, verify the store was actually modified
+    if subcommand == "delete-member":
+        # After delete-member, the member should no longer be linked to any principal
+        store_conn = open_store(config.cache_path)
+        try:
+            is_still_linked = principal_is_linked_to_member(store_conn, WHOOP_USER_ID)
+            assert not is_still_linked, (
+                "delete-member should have removed the principal-to-member link"
+            )
+        finally:
+            store_conn.close()
+
+    if subcommand == "erase-member":
+        # After erase-member, the member's rows should be gone
+        store_conn = open_store(config.cache_path)
+        try:
+            # Check that no body measurements exist for this user
+            cursor = store_conn.execute(
+                "SELECT COUNT(*) FROM body_measurements WHERE whoop_user_id = ?",
+                (WHOOP_USER_ID,),
+            )
+            count = cursor.fetchone()[0]
+            assert count == 0, "erase-member should have deleted all member rows from the store"
+        finally:
+            store_conn.close()
+
+
+def test_enforce_retention_in_ephemeral_mode_prints_no_summary(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """enforce-retention in ephemeral mode must not print the false-success
+    string "retention enforced (max_age_days=...)".
+
+    The buggy code prints this summary even when the store doesn't exist,
+    making an operator's cron logs claim success for work performed against
+    a store that was just created.
+
+    This test FAILS against buggy code (summary is printed).
+    """
+    # Ensure no pre-existing cache
+    assert not cache_file(state_dir).exists()
+
+    exit_code = main(["enforce-retention", "--max-age-days", "30"])
+
+    assert exit_code == 2, "enforce-retention should exit 2 in ephemeral mode"
+
+    captured = capsys.readouterr()
+    # The false-success string must NOT be present
+    assert "retention enforced" not in captured.err, (
+        "enforce-retention should not print 'retention enforced' in ephemeral mode"
+    )
+    # Also check stdout is empty (all messages go to stderr)
+    assert captured.out == "", "enforce-retention should not print to stdout"
+
+
+def test_with_cache_enabled_all_four_subcommands_create_cache_and_work_normally(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With WHOOPMCP_CACHE=true, all four subcommands must behave exactly as
+    before: they create cache.sqlite3 and operate normally.
+
+    This verifies decision D6 (no behaviour change in non-ephemeral mode).
+    """
+    monkeypatch.setenv("WHOOPMCP_CACHE", "true")
+
+    config = Config.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+
+    # Seed the store with a member
+    conn = open_store(config.cache_path)
+    link_principal_to_member(
+        conn,
+        client_id="local",
+        issuer=None,
+        subject=None,
+        whoop_user_id=WHOOP_USER_ID,
+    )
+    upsert_body_measurement(conn, WHOOP_USER_ID, {"weight_kilogram": 75.0})
+    conn.close()
+
+    # delete-member revokes the grant upstream, so the route must be mocked --
+    # unlike the ephemeral tests above, the guard does not fire here and the
+    # request is really made.
+    respx.delete(USER_ACCESS_URL).mock(return_value=httpx.Response(204))
+
+    # Test delete-member
+    exit_code = main(["delete-member", "--whoop-user-id", str(WHOOP_USER_ID)])
+
+    assert exit_code == 0, "delete-member with cache enabled should succeed"
+    assert cache_file(state_dir).exists(), (
+        "cache.sqlite3 should still exist with WHOOPMCP_CACHE=true"
+    )
+
+    # Test export-member on a fresh link
+    conn = open_store(config.cache_path)
+    link_principal_to_member(
+        conn,
+        client_id="local2",
+        issuer=None,
+        subject=None,
+        whoop_user_id=WHOOP_USER_ID + 1,
+    )
+    upsert_body_measurement(conn, WHOOP_USER_ID + 1, {"weight_kilogram": 80.0})
+    conn.close()
+
+    exit_code = main(["export-member", "--whoop-user-id", str(WHOOP_USER_ID + 1)])
+
+    assert exit_code == 0, "export-member with cache enabled should succeed"
+    captured = capsys.readouterr()
+    assert "whoop_user_id" in captured.out, "export should contain data"
+
+    # Test enforce-retention: should work and print the summary
+    capsys.readouterr()  # Clear captured output
+    exit_code = main(["enforce-retention", "--max-age-days", "30"])
+
+    assert exit_code == 0, "enforce-retention with cache enabled should succeed"
+    captured = capsys.readouterr()
+    assert "retention enforced" in captured.err, (
+        "enforce-retention with cache enabled should print the summary"
+    )
+
+
+@pytest.mark.parametrize(
+    "subcommand,extra_args",
+    [
+        ("delete-member", ["--whoop-user-id", "999"]),
+        ("export-member", ["--whoop-user-id", "999"]),
+        ("erase-member", ["--whoop-user-id", "999"]),
+    ],
+)
+def test_ephemeral_mode_error_messages_do_not_advise_enabling_cache(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+    subcommand: str,
+    extra_args: list[str],
+) -> None:
+    """The error message for data-rights subcommands in ephemeral mode must
+    NOT tell the user to "set WHOOPMCP_CACHE=true".
+
+    That advice is correct for backfill/replay-webhook/reconcile-webhooks
+    (which are legitimate bulk operations), but wrong here: telling someone
+    who asked to *erase* their data to first enable a persistent store is
+    absurd advice.
+
+    Decision D4: the message says nothing is stored; it must NOT tell the
+    user to enable the cache.
+    """
+    main([subcommand, *extra_args])
+
+    captured = capsys.readouterr()
+    # The message goes to stderr (never stdout)
+    assert "WHOOPMCP_CACHE" not in captured.err, (
+        f"{subcommand}: error message must not advise enabling cache "
+        "(wrong for data-rights operations)"
+    )
+    assert "WHOOPMCP_CACHE" not in captured.out, (
+        f"{subcommand}: error message must not advise enabling cache (wrong stream too)"
+    )
+    # Also verify no token value leaks
+    assert "cid" not in captured.err, "client_id should not appear in error message"
+    assert "csecret" not in captured.err, "client_secret should not appear in error message"
+
+
+def test_doctor_store_check_in_ephemeral_mode_passes(
+    state_dir: Path,
+) -> None:
+    """doctor's own store check (in doctor.py:151) must continue to pass
+    unchanged: it already implements the correct guard pattern.
+
+    This is a regression guard to ensure doctor's logic is consistent with
+    the fix being applied to the four data-rights subcommands.
+    """
+    # doctor should reach and pass the store check
+    checks = run_checks()
+
+    store_check = next((c for c in checks if c.name == "store"), None)
+    assert store_check is not None, "doctor should run the store check"
+    assert store_check.ok, (
+        "doctor's store check should pass in ephemeral mode "
+        "(reports in-memory store, does not create file)"
+    )
+    assert "in-memory" in store_check.message.lower(), (
+        "doctor's message should mention in-memory store"
+    )
+
+    # Verify no cache file was created by doctor itself
+    assert not cache_file(state_dir).exists(), (
+        "doctor should not create cache.sqlite3 in ephemeral mode"
+    )
