@@ -162,6 +162,14 @@ see the reconciliation backstop below.
    - `WHOOPMCP_CACHE=true` -- webhook processing writes the fetched
      resource into the persistent store; without it there is nowhere for
      the result to go.
+3. `/webhooks/whoop` also enforces its own inbound rate limit, independent
+   of the outbound WHOOP API budget above -- checked before the body is
+   even read, so a flood costs neither that nor a signature check.
+   `WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE` (default `120`) caps requests
+   per minute; set it to `0` or a negative number to disable inbound
+   limiting entirely. Under more than one uvicorn worker, each process
+   holds its own counter, so the effective limit is per worker, not
+   fleet-wide.
 
 ### Rotating the signing secret
 

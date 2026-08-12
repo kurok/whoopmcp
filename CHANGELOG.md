@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #17: `/webhooks/whoop` now enforces its own inbound rate limit --
+  the one scope bullet the original merge left out. A fixed per-minute
+  window, checked after the `webhooks_enabled` 404 but before the body is
+  read or the signature verified, so a flood costs neither a body read nor
+  an HMAC, and a 429 leaks nothing about signature validity. Deliberately
+  independent of `client.RateLimiter`'s outbound WHOOP budget -- sharing a
+  counter would let an inbound flood spend it, the exact coupling the issue
+  forbids. New config: `WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE` (default
+  `120`; `0` or negative disables it). Under more than one uvicorn worker
+  each process holds its own counter, same per-process caveat as
+  `metrics.py` and `create_streamable_http_app` already document.
 - Issue #31: a `/metrics` endpoint exposing Prometheus-format observability
   for sync lag per member, webhook delivery silence (per member and
   fleet-wide), webhook signature-verification failure rate, WHOOP API 429s
