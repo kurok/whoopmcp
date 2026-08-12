@@ -53,7 +53,11 @@ from whoopmcp.analysis import (
 from whoopmcp.auth import Authenticator, AuthError, build_store
 from whoopmcp.client import WhoopClient
 from whoopmcp.config import Config
-from whoopmcp.context_budget import strip_nulls
+from whoopmcp.context_budget import (
+    ROLLING_MAX_POINTS_PER_SERIES,
+    shape_rolling_series,
+    strip_nulls,
+)
 from whoopmcp.store import open_store
 from whoopmcp.sync import SyncDisabledError, run_sync
 from whoopmcp.webhook_processor import _consume_webhooks
@@ -1994,6 +1998,12 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 "range_coverage": range_coverage,
             }
         range_start, range_end = _actual_range(records)
+        rolling_series = {
+            "rolling_7d": [{"date": p.date, "value": p.value} for p in result.rolling_7d],
+            "rolling_30d": [{"date": p.date, "value": p.value} for p in result.rolling_30d],
+            "rolling_90d": [{"date": p.date, "value": p.value} for p in result.rolling_90d],
+        }
+        shaped_rolling, rolling_resolution, rolling_truncated = shape_rolling_series(rolling_series)
         response: dict[str, Any] = {
             "metric": result.metric,
             "count": result.count,
@@ -2002,9 +2012,10 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             "last": result.last,
             "r_squared": result.r_squared,
             "fit_quality": result.fit_quality,
-            "rolling_7d": [{"date": p.date, "value": p.value} for p in result.rolling_7d],
-            "rolling_30d": [{"date": p.date, "value": p.value} for p in result.rolling_30d],
-            "rolling_90d": [{"date": p.date, "value": p.value} for p in result.rolling_90d],
+            "rolling_7d": shaped_rolling["rolling_7d"],
+            "rolling_30d": shaped_rolling["rolling_30d"],
+            "rolling_90d": shaped_rolling["rolling_90d"],
+            "rolling_resolution": rolling_resolution,
             "period": {"start": range_start, "end": range_end},
             "truncated": truncated,
         }
@@ -2012,6 +2023,25 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             response["note"] = (
                 f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
                 "narrow the date range for a complete trend."
+            )
+        # #54: distinguishable from the record-count "truncated"/"note" pair
+        # above (fact #5) -- this is a *presentation* cap on how many rolling
+        # points come back, not a statement about how many source records
+        # were read, so it gets its own flag and its own note, legible even
+        # when both caps apply to the same response at once.
+        if rolling_resolution != "daily":
+            response["rolling_note"] = (
+                f"rolling_7d/rolling_30d/rolling_90d were downsampled to {rolling_resolution} "
+                "resolution to keep the response a manageable size; every returned point is "
+                "still a real computed rolling mean for its date, not an average of averages."
+            )
+        if rolling_truncated:
+            response["rolling_truncated"] = True
+            response["rolling_note"] = (
+                response.get("rolling_note", "")
+                + " Even at monthly resolution the series exceeded the "
+                f"{ROLLING_MAX_POINTS_PER_SERIES}-point-per-series cap; only the most recent "
+                f"{ROLLING_MAX_POINTS_PER_SERIES} monthly points are included."
             )
         response["coverage"] = coverage
         response["range_coverage"] = range_coverage
