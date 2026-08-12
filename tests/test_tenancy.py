@@ -61,6 +61,7 @@ import inspect
 import json
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -74,7 +75,7 @@ from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolRequestParams, GetPromptResult
 
-from whoopmcp import store
+from whoopmcp import store, webhook_processor
 from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
@@ -476,6 +477,150 @@ def test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper() -> None:
         "store.py calls .execute()/.executemany() outside _execute_scoped, "
         f"_migrate, or open_store: {violations}"
     )
+
+
+# =============================================================================
+# #67: webhook_processor.py must reach entity tables only through store.py's
+# _execute_scoped-backed accessors, never through its own conn.execute.
+#
+# The test above proves store.py cannot route around the authorizer -- but it
+# parses store.py *only*, so it never had visibility into a sibling module
+# issuing its own raw SQL against the same tenant-scoped tables. These three
+# tests close that gap: the structural half (no raw execute survives in
+# webhook_processor.py), and the behavioural half (the accessors the relocated
+# SQL now lives behind really are scoped -- a mismatched member reads nothing,
+# and the soft-delete writer would fail closed if it ever lost its predicate).
+# =============================================================================
+
+
+def test_webhook_processor_has_no_unwrapped_sqlite_execute() -> None:
+    """Sibling of ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped
+    _wrapper`` for webhook_processor.py (#67): it must contain *no*
+    ``conn.execute``/``.executemany`` at all -- there is no equivalent of
+    store.py's ``_execute_scoped``/``_migrate``/``open_store`` allowlist here,
+    because nothing in this module has any business touching ``conn``
+    directly; every entity read/write goes through a store.py accessor.
+
+    Deliberately a strict superset of its sibling's coverage: it walks the
+    whole module tree rather than only function bodies, so a module-level or
+    comprehension-level raw execute is caught too. Like its sibling it is
+    AST-based rather than a text grep, so it cannot be fooled by a comment or
+    a string literal containing "conn.execute(".
+    """
+    source = inspect.getsource(webhook_processor)
+    tree = ast.parse(source)
+    violations: list[str] = []
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("execute", "executemany")
+        ):
+            violations.append(f"line {node.lineno}")
+
+    assert violations == [], (
+        "webhook_processor.py calls .execute()/.executemany() directly instead of "
+        f"going through store.py's _execute_scoped-backed accessors: {violations}"
+    )
+
+
+def test_webhook_store_reads_return_nothing_for_a_mismatched_member() -> None:
+    """The two reads #67 relocates into store.py must be member-scoped, not
+    merely resource-scoped: asked for member B's copy of a resource_id that
+    only member A holds, they must return ``None`` rather than A's row.
+
+    WHOOP resource ids are opaque and not namespaced per member, so a bug
+    that dropped the ``whoop_user_id`` predicate would silently answer B's
+    webhook with A's stored record -- and for ``get_resource_updated_at``
+    that answer feeds ``_upsert_if_not_older``'s out-of-order comparison,
+    so the leak would also corrupt B's write decisions, not just read A's
+    data. Each assertion is paired with a positive control under A so the
+    test cannot pass vacuously (e.g. by the seed never landing).
+
+    ``closing`` rather than a trailing ``conn.close()`` because a mid-test
+    failure would otherwise leak an authorizer-bearing connection to be
+    finalized at an arbitrary later GC point, and ``filterwarnings = error``
+    turns the resulting ``PytestUnraisableExceptionWarning`` into a spurious
+    failure on whatever unrelated test happens to be running then.
+    """
+    with closing(store.open_store(":memory:")) as conn:
+        store.upsert_sleep(
+            conn,
+            MEMBER_A,
+            {
+                "id": _FIXED_SLEEP_ID,
+                "start": "2026-01-01T00:00:00Z",
+                "score_state": "SCORED",
+                "cycle_id": 4321,
+                "updated_at": "2026-01-01T12:00:00Z",
+            },
+        )
+
+        assert store.get_sleep_cycle_id(conn, MEMBER_A, _FIXED_SLEEP_ID) == 4321
+        assert store.get_sleep_cycle_id(conn, MEMBER_B, _FIXED_SLEEP_ID) is None, (
+            "get_sleep_cycle_id handed member B the cycle_id off member A's sleep"
+        )
+
+        assert (
+            store.get_resource_updated_at(conn, "sleep", MEMBER_A, _FIXED_SLEEP_ID)
+            == "2026-01-01T12:00:00Z"
+        )
+        assert store.get_resource_updated_at(conn, "sleep", MEMBER_B, _FIXED_SLEEP_ID) is None, (
+            "get_resource_updated_at handed member B the updated_at off member A's sleep"
+        )
+
+
+def test_webhook_soft_delete_write_runs_through_the_scoped_wrapper() -> None:
+    """The ``deleted_at`` writer #67 relocates into store.py must genuinely
+    run through ``_execute_scoped``, so that losing its ``whoop_user_id``
+    predicate would fail closed rather than soft-deleting every member's copy
+    of a resource id.
+
+    Same technique as ``test_completely_unfiltered_update_with_no_where
+    _clause_fails_closed``: hand ``_execute_scoped`` the de-scoped form of the
+    statement ``set_deleted_at`` issues and watch it raise, then confirm the
+    would-be mutation did not survive the rollback. That, combined with the
+    unchanged store.py AST test above (which proves ``set_deleted_at`` cannot
+    be reaching sqlite by any path *other* than ``_execute_scoped``), pins the
+    property. The positive control below additionally shows the real,
+    correctly-scoped call still soft-deletes -- and soft-deletes exactly one
+    member's row.
+
+    See the test above on why ``closing`` rather than a trailing
+    ``conn.close()``.
+    """
+    with closing(store.open_store(":memory:")) as conn:
+        for member in (MEMBER_A, MEMBER_B):
+            store.upsert_sleep(
+                conn,
+                member,
+                {"id": _FIXED_SLEEP_ID, "start": "2026-01-01T00:00:00Z", "score_state": "SCORED"},
+            )
+
+        with pytest.raises(store.UnscopedQueryError):
+            store._execute_scoped(
+                conn, "UPDATE sleeps SET deleted_at = ?", ("2026-01-02T00:00:00Z",)
+            )
+
+        # Simulate a later, unrelated legitimate write committing the
+        # connection: the rejected statement's mutation must not ride along.
+        conn.commit()
+        stamped = conn.execute(
+            "SELECT COUNT(*) FROM sleeps WHERE deleted_at IS NOT NULL"
+        ).fetchone()
+        assert stamped[0] == 0, "the unscoped soft-delete's mutation must never survive"
+
+        store.set_deleted_at(conn, "sleep", MEMBER_A, _FIXED_SLEEP_ID)
+
+        rows = dict(
+            conn.execute(
+                "SELECT whoop_user_id, deleted_at FROM sleeps WHERE resource_id = ?",
+                (_FIXED_SLEEP_ID,),
+            ).fetchall()
+        )
+        assert rows[MEMBER_A] is not None, "set_deleted_at did not stamp member A's row"
+        assert rows[MEMBER_B] is None, "set_deleted_at soft-deleted member B's row too"
 
 
 # =============================================================================

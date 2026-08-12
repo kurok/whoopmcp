@@ -297,6 +297,18 @@ _RETENTION_TIMESTAMP_COLUMNS: dict[str, str] = {
     "webhook_delivery_state": "last_delivered_at",
 }
 
+#: Resource half of a webhook event_type ("recovery"/"sleep"/"workout") --
+#: to the table it is stored in. Recoveries key on cycle_id (this module's
+#: own convention, unrelated to webhook_processor), sleeps and workouts on
+#: their own UUID. Backs the three cross-entity accessors below (#67 moved
+#: this mapping here from webhook_processor.py, which now keeps only a
+#: keys-only vocabulary of its own -- see its ``_WEBHOOK_RESOURCES``).
+_TABLE_BY_RESOURCE: dict[str, str] = {
+    "recovery": "recoveries",
+    "sleep": "sleeps",
+    "workout": "workouts",
+}
+
 
 class UnscopedQueryError(RuntimeError):
     """A query against a tenant-scoped table never read its ``whoop_user_id`` column.
@@ -690,6 +702,27 @@ def get_sleep_by_id(
     return json.loads(row[0]) if row is not None else None
 
 
+def get_sleep_cycle_id(conn: sqlite3.Connection, whoop_user_id: int, sleep_id: str) -> int | None:
+    """The ``cycle_id`` carried on a locally-stored sleep record, if any.
+
+    Used by ``webhook_processor`` to resolve ``recovery.deleted`` (see that
+    module's ``_apply_event``): that event must not fetch, so the only way
+    to find out which cycle a sleep belongs to is a sleep record already
+    synced into this store by an earlier ``sleep.updated`` event or a
+    historical backfill (#15).
+    """
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        "SELECT raw_json FROM sleeps WHERE whoop_user_id = ? AND resource_id = ?",
+        (whoop_user_id, sleep_id),
+    ).fetchone()
+    if row is None:
+        return None
+    cycle_id = json.loads(row[0]).get("cycle_id")
+    return int(cycle_id) if cycle_id is not None else None
+
+
 def get_latest_sleep(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str, Any] | None:
     """The most recently started sleep held for ``whoop_user_id`` (by
     ``start``), excluding soft-deleted rows -- ``None`` if none are held.
@@ -1038,6 +1071,65 @@ def get_workout_by_id(
         (whoop_user_id, resource_id, include_deleted),
     ).fetchone()
     return json.loads(row[0]) if row is not None else None
+
+
+# -- webhook-driven cross-entity accessors (#18/#19) --------------------------
+#
+# Back webhook_processor.py's own event-processing logic. #67 moved their SQL
+# here (it was previously issued as raw conn.execute calls in that module)
+# so it, too, runs through _execute_scoped: a read for a stored record's own
+# updated_at, and the one writer of deleted_at in the codebase. (The third
+# relocated read, a sleep's cycle_id, lives above as get_sleep_cycle_id,
+# alongside this module's other sleep accessors.)
+
+
+def get_resource_updated_at(
+    conn: sqlite3.Connection, resource: str, whoop_user_id: int, resource_id: str
+) -> str | None:
+    """The stored record's own ``updated_at`` (from its ``raw_json``), if any
+    row for ``(whoop_user_id, resource_id)`` exists in ``resource``'s table.
+
+    This is WHOOP's own ``updated_at`` on the resource, not this store's
+    bookkeeping column of the same name (see ``get_profile_updated_at``/
+    ``get_body_measurement_updated_at`` below, which *are* readers of that
+    bookkeeping column) -- the two are unrelated, and only WHOOP's tells
+    ``webhook_processor`` whether an incoming record is actually newer than
+    what is already stored.
+    """
+    table = _TABLE_BY_RESOURCE[resource]
+    _require_user_id(whoop_user_id)
+    row = _execute_scoped(
+        conn,
+        f"SELECT raw_json FROM {table} WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- table is one of three fixed, internal literals, never user input
+        (whoop_user_id, resource_id),
+    ).fetchone()
+    if row is None:
+        return None
+    updated_at = json.loads(row[0]).get("updated_at")
+    return str(updated_at) if updated_at is not None else None
+
+
+def set_deleted_at(
+    conn: sqlite3.Connection, resource: str, whoop_user_id: int, resource_id: str
+) -> None:
+    """Soft-delete one row: set its ``deleted_at`` to now.
+
+    Public (no leading underscore, unlike most helpers in this module)
+    because #19's ``reconciliation.py`` reuses this exact mechanism for a
+    detected-deletion hole rather than inventing a second one -- every other
+    cross-module primitive this codebase reuses (``upsert_sleep``,
+    ``get_sleeps``, ``mark_webhook_event_success``, ...) is public too. #67
+    additionally re-exports this through ``webhook_processor.set_deleted_at``,
+    which is how the ``*.deleted`` webhook path -- this function's original
+    caller, before the relocation -- still reaches it.
+    """
+    table = _TABLE_BY_RESOURCE[resource]
+    _execute_scoped(
+        conn,
+        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- table is one of three fixed, internal literals, never user input
+        (_now(), whoop_user_id, resource_id),
+    )
+    conn.commit()
 
 
 # -- body measurements & profile ---------------------------------------------
@@ -1597,8 +1689,8 @@ def erase_member_data(conn: sqlite3.Connection, whoop_user_id: int) -> None:
     every table in ``_ERASURE_TABLES`` -- the data-subject *erasure* half of
     #32. A real removal, verified at the database level by this module's own
     tests: it never sets a soft-delete marker the way the ``*.deleted``
-    webhook path does (see ``webhook_processor``'s own soft-delete helper for
-    that entirely separate, unrelated code path) -- there is no column write
+    webhook path does (see this module's own soft-delete helper above -- an
+    entirely separate, unrelated code path) -- there is no column write
     here at all, only ``DELETE FROM ... WHERE whoop_user_id = ?``, run
     through the same ``_execute_scoped`` enforcement every other write in
     this module goes through.

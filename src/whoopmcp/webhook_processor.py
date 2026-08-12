@@ -13,7 +13,11 @@ The one WHOOP-specific trap this module exists to get right: ``recovery.updated`
 and ``recovery.deleted`` carry the UUID of the associated *sleep* in their
 ``id`` field, not a recovery id (recoveries have none) and not a cycle id.
 Every other event's ``id`` is exactly what it looks like. See ``_apply_event``
-and ``_sleep_cycle_id`` below.
+below and ``store.get_sleep_cycle_id``.
+
+#67: every entity read/write this module needs goes through a store.py
+accessor built on ``_execute_scoped`` -- this module itself issues no SQL of
+its own and knows no entity table's name or column layout.
 """
 
 from __future__ import annotations
@@ -26,11 +30,12 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 from whoopmcp.client import WhoopAPIError, WhoopClient
 from whoopmcp.store import (
+    get_resource_updated_at,
+    get_sleep_cycle_id,
     get_webhook_event,
     insert_webhook_event,
     mark_webhook_event_dead_letter,
@@ -38,6 +43,7 @@ from whoopmcp.store import (
     mark_webhook_event_success,
     principal_is_linked_to_member,
     record_webhook_delivery,
+    set_deleted_at,
     upsert_recovery,
     upsert_sleep,
     upsert_workout,
@@ -45,15 +51,13 @@ from whoopmcp.store import (
 
 logger = logging.getLogger("whoopmcp")
 
-#: Resource half of an event_type ("recovery"/"sleep"/"workout") -> the
-#: table it is stored in. Recoveries key on cycle_id (store.py's own
-#: convention, unrelated to this module), sleeps and workouts on their own
-#: UUID -- see `_TABLE_BY_RESOURCE`'s docstring-adjacent callers below.
-_TABLE_BY_RESOURCE: dict[str, str] = {
-    "recovery": "recoveries",
-    "sleep": "sleeps",
-    "workout": "workouts",
-}
+#: The resource vocabulary a webhook event_type's first half
+#: ("recovery"/"sleep"/"workout") must belong to -- just the keys of
+#: store.py's own resource->table mapping (`store._TABLE_BY_RESOURCE`),
+#: since this module has no more business knowing a table name than it does
+#: issuing SQL against one (#67): every entity read/write it needs goes
+#: through a store.py accessor instead.
+_WEBHOOK_RESOURCES: frozenset[str] = frozenset({"recovery", "sleep", "workout"})
 
 #: How many times `process_webhook_event` retries a transient failure before
 #: giving up and dead-lettering the event. Matches client.py's own
@@ -162,7 +166,7 @@ def _parse_event(raw_body: bytes) -> WebhookEvent:
     if not isinstance(event_type, str) or "." not in event_type:
         raise UnresolvableEventError(f"webhook body has no usable event_type: {event_type!r}")
     resource, _, action = event_type.partition(".")
-    if resource not in _TABLE_BY_RESOURCE or action not in ("updated", "deleted"):
+    if resource not in _WEBHOOK_RESOURCES or action not in ("updated", "deleted"):
         raise UnresolvableEventError(f"unrecognised webhook event_type: {event_type!r}")
 
     try:
@@ -184,50 +188,6 @@ def _parse_event(raw_body: bytes) -> WebhookEvent:
     )
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-def _stored_updated_at(
-    conn: sqlite3.Connection, resource: str, whoop_user_id: int, resource_id: str
-) -> str | None:
-    """The stored record's own `updated_at` (from its `raw_json`), if any row
-    for `(whoop_user_id, resource_id)` exists in `resource`'s table.
-
-    This is WHOOP's own `updated_at` on the resource, not this store's
-    bookkeeping column of the same name (see store.py's module docstring) --
-    the two are unrelated, and only WHOOP's tells us whether an incoming
-    record is actually newer than what is already stored.
-    """
-    table = _TABLE_BY_RESOURCE[resource]
-    row = conn.execute(
-        f"SELECT raw_json FROM {table} WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- table is one of three fixed, internal literals, never user input
-        (whoop_user_id, resource_id),
-    ).fetchone()
-    if row is None:
-        return None
-    updated_at = json.loads(row[0]).get("updated_at")
-    return str(updated_at) if updated_at is not None else None
-
-
-def _sleep_cycle_id(conn: sqlite3.Connection, whoop_user_id: int, sleep_id: str) -> int | None:
-    """The `cycle_id` carried on a locally-stored sleep record, if any.
-
-    Used only to resolve `recovery.deleted` (see `_apply_event`): that event
-    must not fetch, so the only way to find out which cycle a sleep belongs
-    to is a sleep record already synced into this store by an earlier
-    `sleep.updated` event or a historical backfill (#15, not yet built).
-    """
-    row = conn.execute(
-        "SELECT raw_json FROM sleeps WHERE whoop_user_id = ? AND resource_id = ?",
-        (whoop_user_id, sleep_id),
-    ).fetchone()
-    if row is None:
-        return None
-    cycle_id = json.loads(row[0]).get("cycle_id")
-    return int(cycle_id) if cycle_id is not None else None
-
-
 def _upsert_if_not_older(
     conn: sqlite3.Connection,
     resource: str,
@@ -246,7 +206,7 @@ def _upsert_if_not_older(
     there is nothing to compare and last-write-wins is this store's existing
     behaviour everywhere else.
     """
-    stored = _stored_updated_at(conn, resource, whoop_user_id, resource_id)
+    stored = get_resource_updated_at(conn, resource, whoop_user_id, resource_id)
     incoming = record.get("updated_at")
     if stored is not None and incoming is not None and str(incoming) < stored:
         logger.info(
@@ -264,25 +224,6 @@ def _upsert_if_not_older(
         upsert_workout(conn, whoop_user_id, record)
     elif resource == "recovery":
         upsert_recovery(conn, whoop_user_id, record)
-
-
-def set_deleted_at(
-    conn: sqlite3.Connection, resource: str, whoop_user_id: int, resource_id: str
-) -> None:
-    """Soft-delete one row: set its `deleted_at` to now.
-
-    Public (no leading underscore, unlike every other helper in this
-    module) because #19's `reconciliation.py` reuses this exact mechanism
-    for a detected-deletion hole rather than inventing a second one --
-    every other cross-module primitive this codebase reuses (`upsert_sleep`,
-    `get_sleeps`, `mark_webhook_event_success`, ...) is public too.
-    """
-    table = _TABLE_BY_RESOURCE[resource]
-    conn.execute(
-        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- see _stored_updated_at
-        (_now(), whoop_user_id, resource_id),
-    )
-    conn.commit()
 
 
 async def _apply_event(conn: sqlite3.Connection, client: WhoopClient, event: WebhookEvent) -> None:
@@ -314,7 +255,7 @@ async def _apply_event(conn: sqlite3.Connection, client: WhoopClient, event: Web
             # row to mark, and this event is skipped (not retried -- a
             # fetch wouldn't be new information the next attempt has that
             # this one doesn't).
-            cycle_id = _sleep_cycle_id(conn, event.whoop_user_id, event.resource_id)
+            cycle_id = get_sleep_cycle_id(conn, event.whoop_user_id, event.resource_id)
             if cycle_id is None:
                 logger.warning(
                     "recovery.deleted for user_id=%s sleep=%s: no locally-stored sleep to "

@@ -533,6 +533,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Issue #67: relocated `webhook_processor.py`'s three raw `conn.execute`
+  calls against entity tables (a stored record's `updated_at`, a sleep's
+  `cycle_id`, and the `deleted_at` soft-delete write) into `store.py` as
+  `get_resource_updated_at`/`get_sleep_cycle_id`/`set_deleted_at`, all
+  routed through `_execute_scoped` (#29). A pure relocation -- no behaviour
+  change -- closing the one gap `store.py`'s own structural
+  no-unwrapped-`conn.execute` test couldn't see into: it only ever parsed
+  `store.py` itself, so a sibling module's raw SQL against the same
+  tenant-scoped tables went unchecked. A new AST test now asserts
+  `webhook_processor.py` contains zero direct `conn.execute`/
+  `.executemany` calls.
 - WHOOP has confirmed the 100/minute and 10,000/day rate limits are **per
   application** (this project's `client_id`), shared across every member
   who has authorised it, not a separate budget per member (#9). No constant
