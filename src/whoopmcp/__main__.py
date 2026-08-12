@@ -535,8 +535,7 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
     """
     from whoopmcp.auth import Authenticator
     from whoopmcp.store import (
-        delete_principal_links_for_member,
-        erase_member_data,
+        erase_member_and_links_atomically,
         open_store,
         principal_is_linked_to_member,
     )
@@ -559,8 +558,7 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
         if abort_code is not None:
             return abort_code
 
-        erase_member_data(conn, whoop_user_id)
-        delete_principal_links_for_member(conn, whoop_user_id)
+        erase_member_and_links_atomically(conn, whoop_user_id)
     finally:
         conn.close()
     return 0

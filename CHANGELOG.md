@@ -602,6 +602,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #104: the `erase-member` CLI subcommand's erasure is now atomic across
+  the health-data deletion and principal-link deletion -- either both are
+  applied or neither is, ensuring a member is never half-erased. Before: the
+  two deletions ran in separate transactions, so if the second failed (raising
+  to the operator), the member's health data was already gone while their
+  principal link remained, a state with no signal distinguishing it from
+  success. The fix batches both deletes in one explicit transaction via a new
+  `erase_member_and_links_atomically` function, routed through the same
+  `_execute_scoped` enforcement as all other member-touching deletes.
 - Issue #101: `delete-member`, `export-member`, `erase-member`, and
   `enforce-retention` each opened `config.cache_path` unconditionally, so in
   default local mode -- the mode #90 made in-memory precisely so

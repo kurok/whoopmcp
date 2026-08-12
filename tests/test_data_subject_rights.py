@@ -1234,3 +1234,284 @@ def test_set_deleted_at_and_erase_member_data_are_different_functions() -> None:
     assert store.erase_member_data is not webhook_processor.set_deleted_at
     erase_source = inspect.getsource(store.erase_member_data)
     assert "set_deleted_at" not in erase_source
+
+
+# =============================================================================
+# Issue #104: atomic erasure across the CLI composition of erase_member_data
+# and delete_principal_links_for_member. Tests 1 and 7 will fail on current
+# main; the rest should pass without code changes.
+# =============================================================================
+
+
+def test_erase_member_and_links_atomic_rolls_back_on_link_deletion_failure(
+    store_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #104 headline: when deleting the principal link fails AFTER the
+    health data has been deleted within the same transaction, a composed
+    atomic erasure rolls back BOTH deletions, leaving the member fully intact.
+
+    On current main, erase_member_data commits immediately after its deletes,
+    so this test will FAIL: health data is already gone, not rolled back. After
+    the fix, both operations batch in one transaction, and either both succeed
+    or both roll back together."""
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+    _seed_principal_link(store_conn, MEMBER_A, "client-a")
+
+    original_execute_scoped = store._execute_scoped
+
+    def failing_execute_scoped(
+        conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+    ) -> sqlite3.Cursor:
+        """Fail when trying to delete from principal_members, after health
+        data has already been deleted within the same transaction."""
+        if "DELETE FROM principal_members" in sql:
+            # Rollback before raising, like _execute_scoped does
+            conn.rollback()
+            raise RuntimeError("Simulated principal link deletion failure")
+        return original_execute_scoped(conn, sql, params)
+
+    monkeypatch.setattr(store, "_execute_scoped", failing_execute_scoped)
+
+    # Try the composed erasure; the link delete will fail
+    with pytest.raises(RuntimeError, match="Simulated principal link deletion failure"):
+        store.erase_member_and_links_atomically(store_conn, MEMBER_A)
+
+    # After a rolled-back transaction, both health data and link remain
+    # (the whole transaction rolled back)
+    for table in sorted(store._ERASURE_TABLES):
+        rows = store_conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (MEMBER_A,),
+        ).fetchall()
+        assert rows != [], f"{table} should still have rows (transaction rolled back)"
+
+    link_rows = store_conn.execute(
+        "SELECT * FROM principal_members WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    assert link_rows != [], "Principal link should still be present (transaction rolled back)"
+
+
+def test_erase_member_and_links_atomic_happy_path(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """Composed atomic erasure: both health data and principal link are
+    deleted in one transaction, and conn.in_transaction is False afterward (D5)."""
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+    _seed_principal_link(store_conn, MEMBER_A, "client-a")
+
+    store.erase_member_and_links_atomically(store_conn, MEMBER_A)
+
+    # All health data is gone
+    for table in sorted(store._ERASURE_TABLES):
+        rows = store_conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (MEMBER_A,),
+        ).fetchall()
+        assert rows == [], f"erase_member_and_links_atomically left rows in {table}"
+
+    # Principal link is gone
+    link_rows = store_conn.execute(
+        "SELECT * FROM principal_members WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    assert link_rows == [], "erase_member_and_links_atomically left principal link"
+
+    # Transaction is closed (D5)
+    assert not store_conn.in_transaction
+
+
+def test_erase_member_and_links_atomic_mid_health_data_failure(
+    store_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure inside the health-data deletion phase (before the link is
+    even touched) leaves nothing persisted -- the whole transaction rolls back."""
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+    _seed_principal_link(store_conn, MEMBER_A, "client-a")
+
+    original_execute_scoped = store._execute_scoped
+
+    def failing_on_first_health_delete(
+        conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+    ) -> sqlite3.Cursor:
+        """Fail on the first DELETE (which will be a health-data table per
+        sorted(_ERASURE_TABLES))."""
+        if "DELETE FROM" in sql and "WHERE whoop_user_id = ?" in sql:
+            # This will be a health-data delete since they come first
+            # in the execution order. Rollback before raising, like _execute_scoped does.
+            conn.rollback()
+            raise RuntimeError("Health data deletion failed mid-batch")
+        return original_execute_scoped(conn, sql, params)
+
+    monkeypatch.setattr(store, "_execute_scoped", failing_on_first_health_delete)
+
+    with pytest.raises(RuntimeError, match="Health data deletion failed mid-batch"):
+        store.erase_member_and_links_atomically(store_conn, MEMBER_A)
+
+    # Nothing was persisted; everything is still there
+    for table in sorted(store._ERASURE_TABLES):
+        rows = store_conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (MEMBER_A,),
+        ).fetchall()
+        assert rows != [], f"{table} should still have rows (failed transaction rolled back)"
+
+    link_rows = store_conn.execute(
+        "SELECT * FROM principal_members WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    assert link_rows != [], "Principal link should still be present"
+
+
+def test_erase_member_and_links_atomic_no_99_regression(
+    store_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #99 regression check: an UnscopedQueryError raised mid-erasure
+    still rolls back and still propagates, since the composed function batches
+    both deletions in one transaction."""
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+    _seed_principal_link(store_conn, MEMBER_A, "client-a")
+
+    original_execute_scoped = store._execute_scoped
+
+    def raise_unscoped_error(
+        conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+    ) -> sqlite3.Cursor:
+        """Raise an UnscopedQueryError on the first DELETE to simulate a
+        tenancy violation."""
+        if "DELETE FROM" in sql:
+            # Rollback before raising, like _execute_scoped does
+            conn.rollback()
+            raise store.UnscopedQueryError(f"Simulated tenancy violation: {sql}")
+        return original_execute_scoped(conn, sql, params)
+
+    monkeypatch.setattr(store, "_execute_scoped", raise_unscoped_error)
+
+    with pytest.raises(store.UnscopedQueryError, match="Simulated tenancy violation"):
+        store.erase_member_and_links_atomically(store_conn, MEMBER_A)
+
+    # The transaction was rolled back, so nothing is persisted
+    for table in sorted(store._ERASURE_TABLES):
+        rows = store_conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (MEMBER_A,),
+        ).fetchall()
+        assert rows != [], f"{table} should still have rows (rolled back)"
+
+    link_rows = store_conn.execute(
+        "SELECT * FROM principal_members WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    assert link_rows != [], "Principal link should be present (rolled back)"
+
+
+def test_erase_member_and_links_atomic_rolls_back_on_real_sqlite_failure(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """Pins the real rollback behaviour (not a mock's own courtesy rollback):
+    a genuine sqlite error raised mid-batch, via a BEFORE DELETE trigger on
+    `workouts` that RAISE(ABORT)s, must leave nothing persisted. Unlike the
+    monkeypatch-based tests above, nothing here calls conn.rollback() itself --
+    if `erase_member_and_links_atomically` ever loses its own rollback, this
+    test fails."""
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+    _seed_principal_link(store_conn, MEMBER_A, "client-a")
+
+    store_conn.execute(
+        """
+        CREATE TEMP TRIGGER _t104_abort_workouts_delete
+        BEFORE DELETE ON workouts
+        BEGIN
+            SELECT RAISE(ABORT, 'Simulated real sqlite failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="Simulated real sqlite failure"):
+        store.erase_member_and_links_atomically(store_conn, MEMBER_A)
+
+    assert not store_conn.in_transaction
+
+    for table in sorted(store._ERASURE_TABLES):
+        rows = store_conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (MEMBER_A,),
+        ).fetchall()
+        assert rows != [], f"{table} should still have rows (transaction rolled back)"
+
+    link_rows = store_conn.execute(
+        "SELECT * FROM principal_members WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    assert link_rows != [], "Principal link should still be present (transaction rolled back)"
+
+
+def test_direct_callers_of_erase_member_data_still_commit_on_success(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """The public erase_member_data function, when called directly by a
+    caller, commits immediately after its own _execute_scoped calls (unchanged
+    behavior from before #104). Existing tests of erase_member_data must pass
+    unmodified."""
+    _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
+
+    store.erase_member_data(store_conn, MEMBER_A)
+
+    # Data is erased (committed)
+    for table in sorted(store._ERASURE_TABLES):
+        rows = store_conn.execute(
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (MEMBER_A,),
+        ).fetchall()
+        assert rows == [], f"erase_member_data should have deleted rows in {table}"
+
+
+def test_direct_callers_of_delete_principal_links_still_commit_on_success(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """The public delete_principal_links_for_member function, when called
+    directly by a caller, commits immediately after its own _execute_scoped
+    call (unchanged behavior from before #104). Existing tests must pass
+    unmodified."""
+    _seed_principal_link(store_conn, MEMBER_A, "client-a")
+
+    store.delete_principal_links_for_member(store_conn, MEMBER_A)
+
+    # Link is deleted (committed)
+    link_rows = store_conn.execute(
+        "SELECT * FROM principal_members WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    assert link_rows == [], "delete_principal_links_for_member should have deleted the link"
+
+
+def test_enforce_retention_untouched(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """Issue #104 is scoped to erasure atomicity; retention is untouched (D3).
+    This test verifies enforce_retention still works exactly as before."""
+    now = datetime(2026, 1, 15, tzinfo=UTC)
+
+    _seed_recovery(store_conn, MEMBER_A, "old-tag", cycle_id=1)
+    store_conn.execute(
+        "UPDATE recoveries SET updated_at = ? WHERE whoop_user_id = ?",
+        ("2026-01-01T00:00:00Z", MEMBER_A),  # 14 days old
+    )
+    store_conn.commit()
+
+    # Enforce a 7-day retention window
+    counts = store.enforce_retention(store_conn, max_age_days=7, now=now)
+
+    # The old recovery is deleted
+    assert counts["recoveries"] == 1
+    rows = store_conn.execute(
+        "SELECT * FROM recoveries WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchall()
+    assert rows == []
+
+
+def test_execute_scoped_docstring_false_claim_corrected() -> None:
+    """Issue #104 D4: the false claim in _execute_scoped's docstring
+    ('Every store.py write function commits immediately after its own
+    _execute_scoped call and never batches multiple writes in one
+    transaction') is corrected. Assert it is no longer in the docstring."""
+    docstring = store._execute_scoped.__doc__ or ""
+    # The specific false sentence we're correcting
+    false_claim = "never batches multiple writes in one transaction"
+    assert false_claim not in docstring, (
+        f"_execute_scoped's docstring still contains the false claim: {false_claim!r}"
+    )

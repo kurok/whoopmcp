@@ -527,10 +527,17 @@ def _execute_scoped(
     is detected, so raising alone would leave its mutation sitting as a
     pending, uncommitted change that a later, unrelated ``conn.commit()``
     could silently persist. ``conn.rollback()`` before raising undoes it.
-    Every store.py write function commits immediately after its own
-    ``_execute_scoped`` call and never batches multiple writes in one
-    transaction, so this rollback only ever undoes the offending statement
-    itself, never a caller's earlier, already-legitimate work.
+
+    Most store.py write functions commit immediately after their own
+    ``_execute_scoped`` call and do not batch multiple writes in one
+    transaction. The erasure path is a deliberate exception (#104): it batches
+    the deletes of health data and principal links in a single explicit
+    transaction inside the ``erase_member_and_links_atomically`` function,
+    so this rollback undoes all of them together, never leaving a member
+    half-erased. Retention also batches (``enforce_retention``): ten deletes
+    under one commit. In both cases, ``conn.rollback()`` is correct -- for
+    erasure because all-or-nothing is the requirement, and for retention
+    because resuming a failed sweep is harmless.
     """
     found = _execute_with_tenancy_authorizer(conn, sql, params)
 
@@ -1818,6 +1825,18 @@ def all_linked_whoop_user_ids(conn: sqlite3.Connection) -> set[int]:
     return {row[0] for row in cursor.fetchall()}
 
 
+def _delete_principal_links_for_member_impl(conn: sqlite3.Connection, whoop_user_id: int) -> None:
+    """Internal: delete principal_members rows for ``whoop_user_id`` without
+    committing. Part of #104's D2 -- extracted so it can be batched with health
+    data deletion in a single transaction by the composed ``erase_member_and_
+    links_atomically`` function."""
+    _execute_scoped(
+        conn,
+        "DELETE FROM principal_members WHERE whoop_user_id = ?",
+        (whoop_user_id,),
+    )
+
+
 def delete_principal_links_for_member(conn: sqlite3.Connection, whoop_user_id: int) -> None:
     """Remove every ``principal_members`` row linked to ``whoop_user_id``.
 
@@ -1834,11 +1853,7 @@ def delete_principal_links_for_member(conn: sqlite3.Connection, whoop_user_id: i
     #32's full erasure story, not this issue's narrower token-and-link
     scope.
     """
-    _execute_scoped(
-        conn,
-        "DELETE FROM principal_members WHERE whoop_user_id = ?",
-        (whoop_user_id,),
-    )
+    _delete_principal_links_for_member_impl(conn, whoop_user_id)
     conn.commit()
 
 
@@ -1974,6 +1989,22 @@ def export_member_data(conn: sqlite3.Connection, whoop_user_id: int) -> dict[str
     }
 
 
+def _erase_member_data_impl(conn: sqlite3.Connection, whoop_user_id: int) -> None:
+    """Internal: delete all erasure-table rows for ``whoop_user_id`` without
+    committing. Part of #104's D2 -- extracted so it can be batched with
+    principal link deletion in a single transaction by the composed
+    ``erase_member_and_links_atomically`` function."""
+    _require_user_id(whoop_user_id)
+    for table in sorted(_ERASURE_TABLES):
+        _execute_scoped(
+            conn,
+            # table is drawn from the fixed, internal _ERASURE_TABLES
+            # frozenset, never user input.
+            f"DELETE FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            (whoop_user_id,),
+        )
+
+
 def erase_member_data(conn: sqlite3.Connection, whoop_user_id: int) -> None:
     """Permanently ``DELETE`` every row belonging to ``whoop_user_id`` across
     every table in ``_ERASURE_TABLES`` -- the data-subject *erasure* half of
@@ -1990,16 +2021,37 @@ def erase_member_data(conn: sqlite3.Connection, whoop_user_id: int) -> None:
     reused as-is and composed with this function by the ``erase-member`` CLI
     subcommand, not duplicated here.
     """
-    _require_user_id(whoop_user_id)
-    for table in sorted(_ERASURE_TABLES):
-        _execute_scoped(
-            conn,
-            # table is drawn from the fixed, internal _ERASURE_TABLES
-            # frozenset, never user input.
-            f"DELETE FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
-            (whoop_user_id,),
-        )
+    _erase_member_data_impl(conn, whoop_user_id)
     conn.commit()
+
+
+def erase_member_and_links_atomically(conn: sqlite3.Connection, whoop_user_id: int) -> None:
+    """Issue #104: atomically erase both ``whoop_user_id``'s health data and
+    principal link in a single transaction. Either both are deleted or neither
+    is, ensuring a member is never half-erased.
+
+    The ``erase-member`` CLI subcommand uses this instead of calling
+    ``erase_member_data`` and ``delete_principal_links_for_member`` separately,
+    so that a failure in either step rolls back both, rather than leaving the
+    member in a state where their health data is gone but their principal link
+    remains (or vice versa, though in practice the link delete is more likely
+    to fail second).
+
+    After this function returns, ``conn.in_transaction`` is ``False`` (D5),
+    allowing a subsequent ``VACUUM`` if needed (#100). This holds on both the
+    success path and the failure path: any exception -- from either delete
+    step, or from the guard's own rejection -- is caught, the transaction is
+    rolled back (a no-op if the guard already rolled back), and then
+    re-raised, so a caller can never observe a half-erased member sitting in
+    an open transaction.
+    """
+    try:
+        _erase_member_data_impl(conn, whoop_user_id)
+        _delete_principal_links_for_member_impl(conn, whoop_user_id)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def enforce_retention(
