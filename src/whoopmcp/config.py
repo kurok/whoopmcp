@@ -127,7 +127,7 @@ class Config:
     client_secret: str
     redirect_uri: str
     scopes: tuple[str, ...] = DEFAULT_SCOPES
-    token_backend: TokenBackend = "file"
+    token_backend: TokenBackend = "file"  # noqa: S105 -- a backend name, not a credential value
     state_dir: Path = field(default_factory=_default_state_dir)
     cache_enabled: bool = False
     request_timeout: float = 30.0

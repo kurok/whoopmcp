@@ -85,11 +85,13 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF", "S"]
-# S101 (assert) is the point of a test file; the rest are noise in a scaffold.
-ignore = ["S105", "S106"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]
+# S101 (assert) is the point of a test file, and its fixtures legitimately
+# assign literal tokens/secrets (S105/S106) that are never real credentials --
+# both are noise here but stay live for src/, where a hardcoded credential
+# would be a real finding.
+"tests/*" = ["S101", "S105", "S106"]
 
 [tool.mypy]
 python_version = "3.13"

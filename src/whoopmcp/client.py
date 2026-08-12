@@ -312,7 +312,7 @@ def _backoff_seconds(attempt: int) -> float:
     doesn't tell us exactly how long to wait via Retry-After.
     """
     capped = min(_BACKOFF_MAX_SECONDS, _BACKOFF_BASE_SECONDS * (2**attempt))
-    return random.uniform(0, capped)  # noqa: S311 -- jitter, not a security use
+    return random.uniform(0, capped)  # noqa: S311 -- jitter, not a security use  # nosec B311
 
 
 class WhoopClient:

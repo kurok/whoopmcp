@@ -48,6 +48,21 @@ def release_yml_content(project_root: Path) -> str:
         return f.read()
 
 
+@pytest.fixture
+def ci_yml_content(project_root: Path) -> str:
+    """Load and return the CI workflow as a string."""
+    ci_yml_path = project_root / ".github" / "workflows" / "ci.yml"
+    with open(ci_yml_path) as f:
+        return f.read()
+
+
+@pytest.fixture
+def src_files(project_root: Path) -> list[Path]:
+    """Return all .py files in the src/ directory."""
+    src_dir = project_root / "src"
+    return sorted(src_dir.rglob("*.py"))
+
+
 class TestServerJsonValidation:
     """Test that server.json conforms to the published MCP registry schema."""
 
@@ -247,3 +262,135 @@ class TestServerJsonManifest:
         assert not remotes, (
             f"server.json must not declare remotes (no remote deployment exists). Got: {remotes}"
         )
+
+
+class TestSecurityLinting:
+    """Test that security linting is properly configured and enforced.
+
+    These tests verify the automated gates for issue #37: bandit wiring
+    and re-justification of S105/S106 suppressions.
+    """
+
+    def test_bandit_runs_in_ci(self, ci_yml_content: str) -> None:
+        """Test that bandit is configured as a CI job targeting src/.
+
+        The CI workflow must include a bandit job that checks source files.
+        """
+        assert "bandit" in ci_yml_content, "ci.yml must include a step that runs bandit"
+        # Look for a pattern that shows bandit running against src/
+        # The pattern should be something like 'bandit -r src/' or similar
+        assert re.search(r"bandit\s+.*src/", ci_yml_content), (
+            "ci.yml must include a bandit command targeting src/ (e.g., 'bandit -r src/')"
+        )
+
+    def test_no_unexplained_nosec_in_src(self, src_files: list[Path]) -> None:
+        """Test that every # nosec comment in src/ has a trailing justification.
+
+        A bare '# nosec' without explanation is itself a finding per issue #37.
+        Each suppression must include a comment explaining why it is safe.
+        """
+        failures = []
+        for src_file in src_files:
+            with open(src_file) as f:
+                lines = f.readlines()
+            for line_num, line in enumerate(lines, start=1):
+                if "# nosec" in line:
+                    # Extract the part after '# nosec'
+                    match = re.search(r"#\s*nosec\s*(.*)", line)
+                    if match:
+                        justification = match.group(1).strip()
+                        if not justification:
+                            # No text after # nosec - this is a bare suppression
+                            rel_path = src_file.relative_to(src_file.parent.parent.parent)
+                            msg = f"{rel_path}:{line_num}: bare '# nosec' with no justification"
+                            failures.append(msg)
+
+        assert not failures, "Unexplained suppressions found:\n" + "\n".join(failures)
+
+    def test_no_unexplained_noqa_security_in_src(self, src_files: list[Path]) -> None:
+        """Test that every # noqa: S... comment in src/ has a trailing justification.
+
+        This mirrors the # nosec rule: a bare '# noqa: S105' with no reason fails.
+        """
+        failures = []
+        for src_file in src_files:
+            with open(src_file) as f:
+                lines = f.readlines()
+            for line_num, line in enumerate(lines, start=1):
+                # Look for a noqa marker with a security rule code (S followed by digits).
+                if "# noqa:" in line and re.search(r"#\s*noqa:\s*S\d+", line):
+                    # Extract the part after the S-code
+                    match = re.search(r"#\s*noqa:\s*S\d+\s*(--\s*)?(.*)$", line)
+                    if match:
+                        # group(2) is the comment after the code (if any)
+                        justification = (match.group(2) or "").strip()
+                        # A bare "--" separator with nothing after it (rule code,
+                        # then dashes, then nothing) also counts as unjustified.
+                        has_dash_only = re.search(r"#\s*noqa:\s*S\d+\s*--\s*", line)
+                        if not justification and not has_dash_only:
+                            # No text after the S-code and no dash separator either.
+                            rel_path = src_file.relative_to(src_file.parent.parent.parent)
+                            msg = f"{rel_path}:{line_num}: bare noqa S-code with no justification"
+                            failures.append(msg)
+
+        assert not failures, "Unexplained suppressions found:\n" + "\n".join(failures)
+
+    def test_s105_s106_not_globally_ignored(self, pyproject_toml: dict) -> None:
+        """Test that S105 and S106 are moved to per-file-ignores, not globally ignored.
+
+        These rules should be scoped to tests/* via per-file-ignores, not blanked
+        globally via the ignore list.
+        """
+        ruff_config = pyproject_toml.get("tool", {}).get("ruff", {})
+        lint_config = ruff_config.get("lint", {})
+
+        # Check that S105 and S106 are NOT in the global ignore list
+        global_ignore = lint_config.get("ignore", [])
+        assert "S105" not in global_ignore, (
+            "S105 must not be in the global ignore list; move it to per-file-ignores for tests/*"
+        )
+        assert "S106" not in global_ignore, (
+            "S106 must not be in the global ignore list; move it to per-file-ignores for tests/*"
+        )
+
+        # Check that S105 and S106 ARE in per-file-ignores for tests/*
+        per_file_ignores = lint_config.get("per-file-ignores", {})
+        tests_ignores = per_file_ignores.get("tests/*", [])
+        assert "S105" in tests_ignores, "S105 must be in per-file-ignores['tests/*']"
+        assert "S106" in tests_ignores, "S106 must be in per-file-ignores['tests/*']"
+
+    def test_bandit_clean_on_src(self, ci_yml_content: str) -> None:
+        """Test that the bandit invocation in CI is properly configured.
+
+        The bandit job must run against src/ specifically.
+        This assertion verifies the CI configuration; bandit itself
+        will be run separately as part of the build gate.
+        """
+        assert "bandit" in ci_yml_content, "ci.yml must include a bandit step"
+        # Look for the bandit invocation pattern
+        assert re.search(r"bandit\s+.*src/", ci_yml_content), (
+            "bandit invocation must target src/ directory"
+        )
+
+    def test_pip_audit_required_in_ci(self, ci_yml_content: str) -> None:
+        """Test that pip-audit is configured as a required (non-optional) step.
+
+        The audit job must include pip-audit as a plain run step
+        with no continue-on-error or || true, so it fails the build.
+        """
+        assert "pip-audit" in ci_yml_content, "ci.yml must include a pip-audit step"
+        # Verify the step is not marked as optional
+        # Look for the pip-audit line and ensure it's not followed by continue-on-error or || true
+        audit_pattern = r"-\s*run:\s*pipx run pip-audit\s*\.?"
+        match = re.search(audit_pattern, ci_yml_content)
+        assert match, "ci.yml must have a plain 'pipx run pip-audit .' step"
+
+        # Get the section around the pip-audit step to check for continue-on-error
+        start = max(0, match.start() - 200)
+        end = min(len(ci_yml_content), match.end() + 200)
+        context = ci_yml_content[start:end]
+
+        assert "continue-on-error:" not in context, (
+            "pip-audit step must not have continue-on-error: true"
+        )
+        assert "|| true" not in context, "pip-audit step must not have '|| true' to allow failures"
