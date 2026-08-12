@@ -602,6 +602,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #99: `store._execute_scoped` required a restrictive
+  `whoop_user_id = ?` equality predicate on `SELECT` only. For a non-`SELECT`
+  statement it required merely that the column be *read at all*, so
+  `WHERE whoop_user_id != ?`, `> ?` or `IS NOT NULL` all satisfied it on the
+  mutation and deletion path -- the higher-impact half, and the opposite of
+  what the docstring claimed. The equality requirement now covers `UPDATE`
+  and `DELETE` too. `INSERT` is exempt by construction and stays that way:
+  an insert has no `WHERE` clause and supplies `whoop_user_id` as a value,
+  so every record write here (all upserts) would break under such a
+  requirement -- sqlite reports `INSERT ... ON CONFLICT ... DO UPDATE` as
+  both an insert and an update on the one table, so the new check ignores
+  tables an insert also named. Defence-in-depth: no shipped caller relied on
+  the gap, and the universal "must read `whoop_user_id`" check (the
+  authorizer-backed one that catches a `WHERE`-less write) is unchanged.
+  `enforce_retention`, the codebase's one deliberate all-members sweep, now
+  runs its tenant-scoped deletes through `_execute_all_tenant_sweep`: a
+  distinctly-named path with exactly one caller (asserted from source)
+  rather than an `allow_all_tenants=True` keyword that every call site could
+  pass. It waives the equality regex *only* -- the universal check still
+  applies through it, so a sweep that never mentions `whoop_user_id` is
+  still refused -- and what retention deletes is unchanged, row for row.
+  The statement-executing half of `_execute_scoped` moved into a shared
+  `_execute_with_tenancy_authorizer` so both paths enforce the universal
+  check from one implementation that neither can skip. The equality check
+  remains a presence regex, and now says so: it catches a missing or
+  non-restrictive comparison, but not a matching fragment `OR`-ed with a
+  wider clause, supplied by a subquery, or applying to a different table
+  than the one being written. Closing those needs real SQL parsing, which
+  would be a large change to the most safety-critical function in the
+  package for a shape no caller exhibits -- a follow-up issue, not this one.
 - Issue #98: `atomic_write_text`'s temp file was `path.with_suffix(".tmp")`
   -- a predictable name in the destination directory, created via
   `touch`/`chmod`/`write_text`/`replace`, all of which follow symlinks. An
