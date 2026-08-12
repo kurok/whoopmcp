@@ -808,6 +808,97 @@ def test_tested_entity_tables_cover_every_tenant_scoped_table() -> None:
 
 
 # =============================================================================
+# #69 test 3: the unscoped-write-rolls-back property, generalised across
+# EVERY table in store._TENANT_SCOPED_TABLES -- not just the two tables
+# (recoveries, sleeps) that test_unscoped_update_fails_closed_and_leaves_no
+# _pending_mutation and test_webhook_soft_delete_write_runs_through_the
+# _scoped_wrapper happen to hand-pick above. cycles, workouts,
+# body_measurements, profiles, sync_state and webhook_delivery_state --
+# all added to _TENANT_SCOPED_TABLES after #29's original two-table proof,
+# by #30/#32 among others -- were never exercised for this specific
+# property before this test. Driven off store._TENANT_SCOPED_TABLES itself
+# via the guard test below, not a second hand-maintained list, so a table
+# added later without a matching entry here fails loudly instead of shipping
+# silently uncovered -- mirroring test_tested_entity_tables_cover_every
+# _tenant_scoped_table's own pattern one section up.
+# =============================================================================
+
+#: table name -> (a timestamp-ish column every one of these tables has, a
+#: seeder that leaves exactly one real row under MEMBER_A for that column to
+#: be checked against). Reuses the same seed helpers/values the cross-read
+#: tests above already established for six of these tables; sync_state and
+#: webhook_delivery_state get their own seed call the way their own
+#: cross-read tests above do too.
+_UNSCOPED_WRITE_TARGETS: dict[str, tuple[str, Any]] = {
+    "recoveries": ("updated_at", lambda conn: _seed_recovery(conn, MEMBER_A, "before")),
+    "sleeps": ("updated_at", lambda conn: _seed_sleep(conn, MEMBER_A, "before")),
+    "cycles": ("updated_at", lambda conn: _seed_cycle(conn, MEMBER_A, "before")),
+    "workouts": ("updated_at", lambda conn: _seed_workout(conn, MEMBER_A, "before")),
+    "body_measurements": (
+        "updated_at",
+        lambda conn: _seed_body_measurement(conn, MEMBER_A, "before"),
+    ),
+    "profiles": ("updated_at", lambda conn: _seed_profile(conn, MEMBER_A, "before")),
+    "sync_state": (
+        "last_run_at",
+        lambda conn: store.set_sync_state(
+            conn,
+            MEMBER_A,
+            "recoveries",
+            cursor="a-cursor",
+            last_run_at="2026-01-01T00:00:00Z",
+            outcome="success",
+        ),
+    ),
+    "webhook_delivery_state": (
+        "last_delivered_at",
+        lambda conn: store.record_webhook_delivery(conn, MEMBER_A),
+    ),
+}
+
+
+def test_unscoped_write_targets_cover_every_tenant_scoped_table() -> None:
+    """Guard mirroring test_tested_entity_tables_cover_every_tenant_scoped
+    _table above: a newly added tenant-scoped table without a matching case
+    in _UNSCOPED_WRITE_TARGETS must fail loudly here, not silently skip the
+    rollback property the parametrized test below exists to pin."""
+    assert set(_UNSCOPED_WRITE_TARGETS) == store._TENANT_SCOPED_TABLES
+
+
+@pytest.mark.parametrize("table_name", sorted(_UNSCOPED_WRITE_TARGETS))
+def test_unscoped_update_fails_closed_and_rolls_back_on_every_tenant_scoped_table(
+    table_name: str,
+) -> None:
+    """#69 test 3, generalised: a hand-constructed UPDATE against `table_name`
+    that never reads `whoop_user_id` in its WHERE (here: omits WHERE
+    entirely, the sharpest form) must both raise UnscopedQueryError AND have
+    its mutation fail to survive a later, unrelated commit on the same
+    connection -- for every table store._TENANT_SCOPED_TABLES currently
+    lists, confirming the property #29 established still holds now that
+    #30/#32 have grown that set well past the two tables it was originally
+    proven against.
+    """
+    timestamp_column, seed = _UNSCOPED_WRITE_TARGETS[table_name]
+    conn = store.open_store(":memory:")
+    seed(conn)
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            f"UPDATE {table_name} SET {timestamp_column} = 'UNSCOPED-HACK'",  # noqa: S608 -- table_name/timestamp_column come only from the fixed _UNSCOPED_WRITE_TARGETS dict above, never external input
+        )
+
+    # Simulate a later, unrelated legitimate write committing the connection --
+    # the rejected statement's mutation must not ride along, on any table.
+    conn.commit()
+    hacked = conn.execute(
+        f"SELECT COUNT(*) FROM {table_name} WHERE {timestamp_column} = 'UNSCOPED-HACK'"  # noqa: S608 -- same fixed dict, test-only
+    ).fetchone()[0]
+    assert hacked == 0, f"{table_name}: unscoped UPDATE's mutation survived a later commit"
+    conn.close()
+
+
+# =============================================================================
 # store.py: audit log -- one row per call, identity only, never a payload
 # =============================================================================
 

@@ -665,6 +665,52 @@ def test_encrypted_file_store_reseals_lazily_on_load_after_rotation(tmp_path: Pa
     assert other_store.load() == token
 
 
+def test_encrypted_file_store_fails_closed_if_old_key_removed_before_rotation_completes(
+    tmp_path: Path,
+) -> None:
+    """#69 test 4's negative half. test_encrypted_file_store_reseals_lazily_on
+    _load_after_rotation above already proves the positive case (both keys
+    present, rotation completes, re-seals under N+1) end to end -- fully
+    covered, not restated here. What no existing test drives is the
+    unfinished-rotation failure mode: an operator retires the old key
+    (removes it from the env/keyring) before every v1 record has been
+    touched by a read. That must fail closed on the still-v1 record, not
+    silently lose it or fall back to plaintext.
+
+    test_unknown_key_version_raises_sealerror_not_keyerror in test_crypto.py
+    proves the underlying crypto.unseal primitive fails closed on an unknown
+    version with a hand-built envelope -- but never through
+    EncryptedFileTokenStore.load()/save(), and never with a *real* rotation
+    setup (current_version actually advanced, a real save() under the old
+    key first). This closes that gap at the layer #69 asks about, and
+    additionally confirms the on-disk file is left completely unchanged --
+    no data loss, and no partial/corrupt rewrite attempt either.
+    """
+    key_v1 = os.urandom(32)
+    key_v2 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+    before = path.read_bytes()
+    assert json.loads(before)["v"] == 1
+
+    # Rotation is "in progress": current_version is 2, but the old key (1)
+    # was removed from the environment before this record was ever read
+    # under the new configuration -- the exact unfinished-rotation window.
+    store_missing_old_key = EncryptedFileTokenStore(path, keys={2: key_v2}, current_version=2)
+
+    with pytest.raises(AuthError):
+        store_missing_old_key.load()
+
+    # Fails closed with no data loss: the file on disk is untouched, still
+    # readable under the old key, still stamped v1 -- nothing was silently
+    # dropped or rewritten mid-failure.
+    after = path.read_bytes()
+    assert after == before
+    assert EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).load() == token
+
+
 def test_encrypted_file_store_is_empty_before_first_save(tmp_path: Path) -> None:
     key = os.urandom(32)
     store = EncryptedFileTokenStore(tmp_path / "token.json", keys={1: key}, current_version=1)
