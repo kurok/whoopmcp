@@ -440,13 +440,17 @@ class UnscopedQueryError(RuntimeError):
 
 
 #: The one predicate shape that pins a statement to a single member:
-#: ``whoop_user_id`` compared for equality against a *bound parameter*.
-#: Matched anywhere in the statement text.
+#: ``whoop_user_id`` compared for equality against a *bound parameter*,
+#: sitting after the first top-level ``WHERE`` in a comment- and
+#: string-literal-stripped copy of the statement. See
+#: ``_statement_restricts_to_one_member``, which does the stripping and the
+#: position check; this regex is only the fragment it searches for.
 #:
-#: This is a presence regex, not a SQL parser, and #99 deliberately kept it
-#: that way: parsing SQL would be a large change to the most safety-critical
-#: function in this package, for shapes no caller in it exhibits. So what it
-#: does and does not catch is written down here rather than overclaimed:
+#: This is a refined presence check, not a SQL parser, and #99/#109
+#: deliberately kept it that way: parsing SQL would be a large change to the
+#: most safety-critical function in this package, for shapes no caller in it
+#: exhibits. So what it does and does not catch is written down here rather
+#: than overclaimed:
 #:
 #: * CAUGHT -- the absence of any equality on the column, which is what #99
 #:   was filed about: ``whoop_user_id != ?``, ``> ?``, ``IS NOT NULL``,
@@ -455,30 +459,117 @@ class UnscopedQueryError(RuntimeError):
 #:   42``). Requiring the ``?`` is deliberate: every legitimate caller here
 #:   binds the id, so a hand-built literal (the shape an injected id would
 #:   take) does not satisfy the guard.
-#: * NOT CAUGHT -- a statement that carries a matching fragment *and* widens
-#:   its own reach anyway: ``WHERE whoop_user_id = ? OR 1 = 1``, a second
-#:   ``OR``-ed member, or a subquery whose text supplies the fragment while
-#:   the outer statement stays unfiltered. Nothing here understands clause
-#:   structure, boolean precedence, or nesting.
+#: * CAUGHT, since #109 -- a fragment sitting somewhere other than a
+#:   predicate: a ``SET`` assignment, a ``--``/``/* */`` comment, or a
+#:   string literal. The ``SET`` case is the one to know about, because it
+#:   is a plausible statement rather than a contrived one: ``UPDATE
+#:   recoveries SET whoop_user_id = ? WHERE whoop_user_id IS NOT NULL``
+#:   used to satisfy the bare regex from its ``SET`` clause and reassign
+#:   every member's rows to one caller-chosen id -- that is #99's own ``IS
+#:   NOT NULL``-on-UPDATE shape, which the universal check does not cover
+#:   either, since the statement does read the column. Now rejected: the
+#:   ``SET``-clause fragment sits before the statement's own ``WHERE``, and
+#:   comments/string literals are stripped from the copy searched.
+#: * CAUGHT, since #109 -- a subquery in ``SET`` supplying the fragment
+#:   while the outer statement stays unfiltered, e.g. ``UPDATE recoveries
+#:   SET x = (SELECT y FROM z WHERE whoop_user_id = ?) WHERE 1 = 1``: the
+#:   fragment sits inside the subquery's parentheses, before the outer,
+#:   top-level ``WHERE``, so the position check rejects it even though the
+#:   outer ``WHERE`` itself carries no member predicate.
+#: * NOT CAUGHT -- a statement that carries a matching fragment *after* its
+#:   top-level ``WHERE`` and widens its own reach anyway: ``WHERE
+#:   whoop_user_id = ? OR 1 = 1``, or a second ``OR``-ed member. Nothing
+#:   here understands boolean precedence.
 #: * NOT CAUGHT -- *which* table the fragment applies to when a statement
 #:   names two tenant-scoped tables. The universal read check is per-table;
 #:   this one is per-statement.
-#: * NOT CAUGHT -- a fragment sitting somewhere other than a predicate: a
-#:   ``SET`` assignment, a ``--`` comment, or a string literal. The first of
-#:   those is the one to know about, because it is a plausible statement
-#:   rather than a contrived one: ``UPDATE recoveries SET whoop_user_id = ?
-#:   WHERE whoop_user_id IS NOT NULL`` satisfies this regex from its SET
-#:   clause and reassigns every member's rows to one caller-chosen id. That
-#:   is #99's own ``IS NOT NULL``-on-UPDATE shape, so the second layer does
-#:   not cover it; the universal check does not either, since the statement
-#:   does read the column. No caller in this package writes that shape, and
-#:   nothing outside it reaches these functions.
 #:
 #: The universal check remains the load-bearing control (it is backed by
 #: sqlite's own authorizer, so it cannot be talked out of by SQL text); this
-#: regex is the second layer. Closing the NOT-CAUGHT cases needs a real
-#: parser and is a follow-up issue, not part of #99.
+#: regex, via ``_statement_restricts_to_one_member``, is the second layer.
+#: Closing the remaining NOT-CAUGHT cases needs a real parser and is a
+#: follow-up issue, not part of #99 or #109.
 _MEMBER_EQUALITY_PREDICATE = re.compile(r"whoop_user_id\s*=\s*\?", re.IGNORECASE)
+
+_TOP_LEVEL_WHERE = re.compile(r"\bWHERE\b", re.IGNORECASE)
+
+
+def _statement_restricts_to_one_member(sql: str) -> bool:
+    """Return whether ``sql`` carries a ``whoop_user_id = ?`` predicate that
+    actually restricts the statement to one member -- not merely a matching
+    fragment sitting anywhere in the statement text (#109).
+
+    ``sql`` itself is never modified; a *sanitised copy* is built and
+    searched here, only for this check. ``_execute_scoped`` always passes
+    the caller's original text on to sqlite, byte-identical -- a guard that
+    rewrites the statement it guards would be a far worse bug than the one
+    this closes.
+
+    Two refinements over a bare ``_MEMBER_EQUALITY_PREDICATE.search(sql)``:
+
+    1. ``--`` line comments, ``/* */`` block comments, and single- and
+       double-quoted string literals (SQL's doubled-quote escape honoured,
+       so ``''`` inside a literal does not end it early) are stripped from
+       the copy before it is searched, so a fragment sitting in any of
+       those cannot satisfy the check.
+    2. The match must fall after the first top-level (parenthesis-depth-
+       zero) ``WHERE`` keyword. This is what rejects a ``SET``-clause
+       fragment (it sits before any ``WHERE``) and a subquery in ``SET``
+       supplying the fragment from inside parentheses while the outer
+       statement stays unfiltered (the fragment then sits before the
+       *outer*, depth-zero ``WHERE``) -- see ``_MEMBER_EQUALITY_PREDICATE``
+       for the worked examples.
+
+    Still a presence check on text, not a SQL parser -- see
+    ``_MEMBER_EQUALITY_PREDICATE`` for what this still does not catch.
+    """
+    chars: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i : i + 2] == "--":
+            newline = sql.find("\n", i)
+            i = n if newline == -1 else newline
+            continue
+        if sql[i : i + 2] == "/*":
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        ch = sql[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if sql[j] == ch:
+                    if sql[j : j + 2] == ch * 2:
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            else:
+                j = n
+            i = j
+            continue
+        chars.append(ch)
+        i += 1
+    sanitized = "".join(chars)
+
+    depth = 0
+    pos = 0
+    where_end: int | None = None
+    for match in _TOP_LEVEL_WHERE.finditer(sanitized):
+        while pos < match.start():
+            if sanitized[pos] == "(":
+                depth += 1
+            elif sanitized[pos] == ")":
+                depth -= 1
+            pos += 1
+        if depth == 0:
+            where_end = match.end()
+            break
+
+    if where_end is None:
+        return False
+    return _MEMBER_EQUALITY_PREDICATE.search(sanitized, where_end) is not None
 
 
 class _TenancyFindings(NamedTuple):
@@ -607,13 +698,14 @@ def _execute_scoped(
        there): every touched tenant-scoped table must have had its
        ``whoop_user_id`` column read. Backed by sqlite's own authorizer rather
        than by inspecting SQL text, so it is the load-bearing control.
-    2. The **member equality predicate** (``_MEMBER_EQUALITY_PREDICATE``):
-       reading the column is not the same as restricting to one member, since
-       ``whoop_user_id != ?``, ``> ?`` and ``IS NOT NULL`` all read it while
-       spanning every member in the table. Applied to ``SELECT`` (#29) and --
-       since #99 -- to ``UPDATE`` and ``DELETE``, the higher-impact half,
-       where before it was enough merely to read the column. That check is a
-       presence regex whose exact reach is documented on
+    2. The **member equality predicate** (``_statement_restricts_to_one
+       _member``, over ``_MEMBER_EQUALITY_PREDICATE``): reading the column is
+       not the same as restricting to one member, since ``whoop_user_id !=
+       ?``, ``> ?`` and ``IS NOT NULL`` all read it while spanning every
+       member in the table. Applied to ``SELECT`` (#29) and -- since #99 --
+       to ``UPDATE`` and ``DELETE``, the higher-impact half, where before it
+       was enough merely to read the column. That check is a refined
+       presence check, not a SQL parser, whose exact reach is documented on
        ``_MEMBER_EQUALITY_PREDICATE``; this docstring does not claim more.
 
     **``INSERT`` is exempt from check 2, permanently and by construction.**
@@ -651,7 +743,7 @@ def _execute_scoped(
     # Every table named here was UPDATEd or DELETEd and not INSERTed into, so
     # the statement had a WHERE clause capable of carrying the predicate (and,
     # the universal check having passed, that clause does read the column).
-    if found.needs_member_predicate and not _MEMBER_EQUALITY_PREDICATE.search(sql):
+    if found.needs_member_predicate and not _statement_restricts_to_one_member(sql):
         conn.rollback()
         raise UnscopedQueryError(
             f"statement mutates tenant-scoped table(s) "
@@ -667,7 +759,7 @@ def _execute_scoped(
     if (
         "SELECT" in sql.upper()
         and found.reads_member_column
-        and not _MEMBER_EQUALITY_PREDICATE.search(sql)
+        and not _statement_restricts_to_one_member(sql)
     ):
         conn.rollback()
         raise UnscopedQueryError(
