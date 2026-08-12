@@ -719,15 +719,24 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
         """Delete the locally stored WHOOP token.
 
         This does not revoke the grant at WHOOP; do that from the WHOOP app
-        under Settings if you want the authorisation itself withdrawn.
+        under Settings, or with the CLI-only `whoopmcp delete-member`, which
+        cannot be called as a tool.
         """
+        # This docstring is the tool description sent on every `tools/list`,
+        # so it pays context on every request and is kept to the two facts a
+        # model needs: logout is local-only, and revocation has two routes
+        # neither of which it can invoke. The fuller wording -- why the CLI
+        # command is operator-only, and that it needs --whoop-user-id -- lives
+        # in the return value below, which costs nothing until called.
         app = ctx.request_context.lifespan_context
         app.auth.logout()
         app.principal = None
         return (
             "Local WHOOP credentials removed. This does not revoke the "
             "authorization at WHOOP -- do that from the WHOOP app under "
-            "Settings if you want the grant itself withdrawn."
+            "Settings, or run `whoopmcp delete-member --whoop-user-id N` "
+            "from a terminal on this machine (a CLI-only operator command, "
+            "not a tool call), if you want the grant itself withdrawn."
         )
 
 
