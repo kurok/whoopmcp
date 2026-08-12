@@ -12,10 +12,12 @@ Docs: https://developer.whoop.com/docs/developing/oauth/
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import secrets
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -149,21 +151,32 @@ def atomic_write_text(path: Path, contents: str) -> None:
     second, duplicated implementation of it.
 
     Write-then-rename means a crash mid-write cannot truncate a good
-    record; creating the temp file 0600 means the content is never
-    world-readable even for the instant before the rename. The explicit
-    ``chmod`` after ``touch`` matters for a reason ``touch(exist_ok=True)``
-    alone does not cover: it does not change the mode of a file that
-    already exists, so a stale, world-readable temp file left behind by an
-    earlier interrupted write would otherwise be reused as-is and then
-    renamed straight over the destination, carrying its old, looser mode
-    with it.
+    record. The temp file's name must be unpredictable, not just its
+    permissions: for ``_export_member`` the parent directory is whatever
+    the operator passed to ``--out``, which may be shared or world-writable,
+    and a guessable name (e.g. one derived from ``path`` itself) lets
+    another user pre-create it -- as a symlink, before this call ever
+    runs -- and have the content delivered wherever they point it instead.
+    ``tempfile.mkstemp`` closes that: it picks a name nothing else could
+    have predicted and creates it with ``O_EXCL`` at mode 0600 in one
+    atomic step, so pre-creation can't win and no separate chmod is needed.
+    The content is written through that file descriptor directly, never by
+    reopening ``path`` or the temp name -- reopening by path would
+    reintroduce the same symlink-following race this exists to close.
+    ``os.replace`` then swaps the temp file onto ``path`` as an atomic,
+    non-dereferencing rename: if ``path`` itself is already a symlink, the
+    symlink is what gets replaced, not the file it points to.
     """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_suffix(".tmp")
-    tmp.touch(mode=0o600, exist_ok=True)
-    tmp.chmod(0o600)
-    tmp.write_text(contents, encoding="utf-8")
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(contents)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 class FileTokenStore:
