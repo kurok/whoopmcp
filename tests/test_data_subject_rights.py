@@ -38,7 +38,9 @@ negative.
 from __future__ import annotations
 
 import inspect
+import os
 import sqlite3
+import stat
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -945,6 +947,157 @@ def test_export_member_subcommand_never_attributes_the_token_to_the_wrong_member
     assert document["consent"]["token_present"] is None
     assert "access-tok" not in _walk_strings(document)
     assert "refresh-tok" not in _walk_strings(document)
+
+
+# =============================================================================
+# #68: export-member --out file permissions
+#
+# The export document is every scrap of health data this store holds for one
+# member, in plain JSON. It gets the same treatment as the token file: 0600,
+# with no window at the umask default. Mode assertions are skipped on Windows
+# and assert "no group or other access" rather than an exact 0o600, following
+# tests/test_auth.py:136-143.
+# =============================================================================
+
+_GROUP_OR_OTHER = stat.S_IRWXG | stat.S_IRWXO
+
+
+def _link_and_seed_one_member(tmp_path: Path) -> None:
+    """Minimal state for a successful ``export-member`` run: a stored token, a
+    principal linked to member 42, and one row per entity table. Mirrors
+    ``test_export_member_subcommand_writes_json_scoped_to_the_target_member``
+    above; assumes ``_set_required_env_and_state_dir`` has already run."""
+    config = Config.from_env()
+    FileTokenStore(config.token_path).save(
+        Token("access-tok", expires_at=time.time() + 3600, refresh_token="refresh-tok")
+    )
+    conn = store.open_store(config.cache_path)
+    store.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=42
+    )
+    _seed_every_entity_table(conn, 42, "export-me-tag")
+    conn.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_export_member_out_file_is_not_readable_by_other_users(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _link_and_seed_one_member(tmp_path)
+    out_path = tmp_path / "export.json"
+
+    exit_code = main(["export-member", "--whoop-user-id", "42", "--out", str(out_path)])
+
+    assert exit_code == 0
+    mode = stat.S_IMODE(out_path.stat().st_mode)
+
+    assert mode & _GROUP_OR_OTHER == 0, f"export file is mode {mode:o}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_export_member_tightens_a_pre_existing_world_readable_out_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-running an export over yesterday's world-readable file must not
+    inherit its mode -- whether the implementation chmods it or replaces it
+    with a fresh 0600 file, the end state is the same promise."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _link_and_seed_one_member(tmp_path)
+    out_path = tmp_path / "export.json"
+    out_path.write_text("stale", encoding="utf-8")
+    out_path.chmod(0o644)
+
+    exit_code = main(["export-member", "--whoop-user-id", "42", "--out", str(out_path)])
+
+    assert exit_code == 0
+    assert "export-me-tag" in out_path.read_text(encoding="utf-8"), (
+        "the stale file must be replaced"
+    )
+    mode = stat.S_IMODE(out_path.stat().st_mode)
+
+    assert mode & _GROUP_OR_OTHER == 0, f"export file is mode {mode:o}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_export_member_does_not_inherit_the_mode_of_a_stale_temp_neighbour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Path.with_suffix(".tmp")`` *replaces* the suffix, so the temp file for
+    ``export.json`` is ``export.tmp``. ``touch(mode=0o600, exist_ok=True)``
+    does not chmod a file that already exists, so a stale world-readable
+    ``export.tmp`` -- left behind by an interrupted earlier run -- would be
+    reused and then renamed straight over the destination, carrying 0644 with
+    it. The mode has to be asserted, not just requested at creation."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _link_and_seed_one_member(tmp_path)
+    out_path = tmp_path / "export.json"
+    stale_tmp = tmp_path / "export.tmp"
+    stale_tmp.write_text("interrupted", encoding="utf-8")
+    stale_tmp.chmod(0o644)
+
+    exit_code = main(["export-member", "--whoop-user-id", "42", "--out", str(out_path)])
+
+    assert exit_code == 0
+    mode = stat.S_IMODE(out_path.stat().st_mode)
+
+    assert mode & _GROUP_OR_OTHER == 0, f"export file is mode {mode:o}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_export_member_never_opens_a_world_readable_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prove the *absence of a window* structurally, not by polling.
+
+    A write-then-chmod implementation passes an end-state assertion while
+    still having published the whole health record at 0644 for as long as the
+    write took. The property that rules that out is checkable at the moment
+    content first reaches the filesystem: the file being written into must
+    already exist, and must already carry no group or other bits. This spies
+    on ``Path.write_text`` (the call ``auth``'s atomic helper uses) and
+    checks exactly that for whichever write carries the export payload.
+    """
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    _link_and_seed_one_member(tmp_path)
+    out_path = tmp_path / "export.json"
+
+    writes: list[tuple[Path, bool, int | None, str]] = []
+    real_write_text = Path.write_text
+
+    def spy(
+        self: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        existed = self.is_file()
+        mode = stat.S_IMODE(self.stat().st_mode) if existed else None
+        writes.append((self, existed, mode, data))
+        return real_write_text(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+
+    exit_code = main(["export-member", "--whoop-user-id", "42", "--out", str(out_path)])
+
+    assert exit_code == 0
+
+    payload_writes = [w for w in writes if "export-me-tag" in w[3]]
+    assert payload_writes, (
+        f"no write carried the export payload; writes seen: {[str(w[0]) for w in writes]}"
+    )
+
+    for path, existed, mode, _data in payload_writes:
+        assert existed, (
+            f"{path.name} did not exist before the payload was written to it -- it was "
+            "created by the write itself, at the umask default"
+        )
+        assert mode is not None
+        assert mode & _GROUP_OR_OTHER == 0, (
+            f"{path.name} was mode {mode:o} at the instant the health record was "
+            "written into it -- a world-readable window existed"
+        )
 
 
 # =============================================================================

@@ -91,11 +91,14 @@ URLs are the only ones in the source, in `auth.py` and `client.py`.
 | Access + refresh token (alternative) | OS keychain | Whatever your OS provides |
 
 > **Windows:** file modes are not enforced — Windows uses ACLs, and the token
-> file ends up readable by any process running as you. The server logs a
-> warning when it first writes one. Use the keychain backend instead:
+> file, the database and any data-subject export end up readable by any
+> process running as you. The server logs a warning the first time it writes
+> a token or the database. Use the keychain backend instead:
 > `pip install 'whoopmcp[keyring]'` and `WHOOPMCP_TOKEN_BACKEND=keyring`,
-> which stores the token in the Windows Credential Manager.
-| Cached responses (local mode only) | `$WHOOPMCP_STATE_DIR/cache.sqlite3` | **Off by default**; only written if you set `WHOOPMCP_CACHE=true` |
+> which stores the token in the Windows Credential Manager — it does not
+> cover the database or an export, which have no keychain equivalent.
+| Cached responses (local mode only) | `$WHOOPMCP_STATE_DIR/cache.sqlite3` | **Off by default**; only written if you set `WHOOPMCP_CACHE=true`. File mode `0600`, directory `0700` — **macOS and Linux only** — the same discipline as the token above, and the mechanism that protects sqlite's transient `-journal` sidecar (this software never enables WAL, so `-wal`/`-shm` never exist) |
+| Data-subject export (`export-member --out`) | Wherever you point `--out` | File mode `0600` — **macOS and Linux only** |
 | Logs | stderr only | Never written to a file by this software |
 
 By default in **local mode**, the only thing this software persists is your
