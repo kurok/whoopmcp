@@ -143,6 +143,32 @@ class Config:
     def cache_path(self) -> Path:
         return self.state_dir / "cache.sqlite3"
 
+    @property
+    def store_is_ephemeral(self) -> bool:
+        """Whether this configuration's store may only ever live in memory.
+
+        PRIVACY.md promises that in default local mode the only thing this
+        software persists is your token. ``server.lifespan()`` opening
+        ``cache_path`` unconditionally broke that promise by creating
+        ``cache.sqlite3`` and writing a principal link plus a tool-call audit
+        row into it (#74). PR #63 settled the direction: the document is the
+        contract and the code bends. So default local stdio -- no
+        ``WHOOPMCP_CACHE``, no webhooks -- gets an in-memory store instead.
+
+        Every other combination legitimately persists and keeps its
+        pre-#74 on-disk behaviour: hosted mode holds other members' data,
+        ``WHOOPMCP_CACHE`` is an explicit opt-in, and the webhook consumer
+        must survive a restart to be worth anything.
+
+        Lives here rather than in ``server.py`` because it is a pure question
+        about configuration, and both consumers (``server.lifespan`` and
+        ``doctor``) already depend on this module -- putting it in
+        ``server.py`` would make ``whoopmcp doctor`` import the entire MCP
+        server surface to answer it. Keys off ``transport``, not off which
+        ASGI app was constructed: configuration decides, not construction.
+        """
+        return self.transport == "stdio" and not self.cache_enabled and not self.webhooks_enabled
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
         """Build a config from environment variables.

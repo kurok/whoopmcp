@@ -179,10 +179,16 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
     token. stdio keeps InProcessRefreshLock, unchanged, since it is always
     exactly one process and this doesn't apply to it.
 
-    Always opens the persistent store (#13) -- issue #29's principal<->member
-    join and audit log need it on every request, not only when webhooks are
-    enabled, so this is no longer gated on `config.webhooks_enabled` the way
-    the webhook consumer task below still is. Also starts the webhook
+    Opens the store (#13) -- issue #29's principal<->member join and audit
+    log need it on every request, not only when webhooks are enabled, so
+    opening it is not gated on `config.webhooks_enabled` the way the webhook
+    consumer task below still is. But *where* it opens follows
+    `Config.store_is_ephemeral` (#74): in default local stdio mode -- no
+    `WHOOPMCP_CACHE`, no webhooks -- the store lives in memory only, because
+    PRIVACY.md promises that mode persists nothing but the token, and an
+    unconditionally-created `cache.sqlite3` broke that promise. Every other
+    mode (hosted, `WHOOPMCP_CACHE=true`, or webhooks enabled) still opens
+    `config.cache_path` on disk, unchanged. Also starts the webhook
     consumer (#18), when there is one to start: `build_server()` stashes the
     queue `register_webhook_routes` returns on `_server._webhook_queue` (see
     that function's own call site for why) -- an ad hoc attribute rather than
@@ -201,7 +207,31 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
         principal = await _resolve_principal(client)
         logger.info("whoopmcp ready (state dir: %s)", config.state_dir)
 
-        store_conn = open_store(config.cache_path)
+        ephemeral = config.store_is_ephemeral
+        store_conn = open_store(":memory:" if ephemeral else config.cache_path)
+        if ephemeral and principal is not None:
+            # Seed the principal<->member link the ephemeral store cannot
+            # have inherited from a previous process. `resolve_member_id`
+            # requires a real `principal_members` row and has no fallback to
+            # `app.principal` -- deliberately, since #29 depends on that
+            # contract -- so without this every data tool would raise
+            # UnresolvedPrincipalError after a restart even though the token
+            # on disk is perfectly valid. `_principal_key(None)` is exactly
+            # the key those tools will look under: there is no request at
+            # lifespan time, and this branch is stdio-only, so the local
+            # sentinel is the only principal that can ever call in here.
+            # This is a real row from the live grant, not a fallback: the
+            # profile call above already proved the token authorises this
+            # member. `principal is None` (not logged in) seeds nothing, so
+            # tools correctly say "run whoop_login".
+            client_id, issuer, subject = _principal_key(None)
+            store.link_principal_to_member(
+                store_conn,
+                client_id=client_id,
+                issuer=issuer,
+                subject=subject,
+                whoop_user_id=principal.user_id,
+            )
         queue: asyncio.Queue[bytes] | None = getattr(_server, "_webhook_queue", None)
         consumer_task: asyncio.Task[None] | None = None
         if config.webhooks_enabled and queue is not None:
