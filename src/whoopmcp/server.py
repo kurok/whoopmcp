@@ -1275,7 +1275,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             if include_raw:
                 trimmed["raw"] = raw
             records.append(trimmed)
-        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}
+        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}  # nosec B105 -- the literal None (no next page yet), not a credential value
         if has_more:
             result["next_token"] = _encode_store_cursor(offset + limit, range_start, range_end)
             result["note"] = (
@@ -1343,7 +1343,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             if include_raw:
                 trimmed["raw"] = raw
             records.append(trimmed)
-        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}
+        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}  # nosec B105 -- the literal None (no next page yet), not a credential value
         if detail == "full":
             result["units"] = {"stage_durations": "milliseconds"}
         if has_more:
@@ -1408,7 +1408,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             if include_raw:
                 trimmed["raw"] = raw
             records.append(trimmed)
-        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}
+        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}  # nosec B105 -- the literal None (no next page yet), not a credential value
         if has_more:
             result["next_token"] = _encode_store_cursor(offset + limit, range_start, range_end)
             result["note"] = (
@@ -1476,7 +1476,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             if include_raw:
                 trimmed["raw"] = raw
             records.append(trimmed)
-        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}
+        result: dict[str, Any] = {"records": records, "count": len(records), "next_token": None}  # nosec B105 -- the literal None (no next page yet), not a credential value
         if detail == "full":
             result["units"] = {"zone_durations": "milliseconds"}
         if has_more:

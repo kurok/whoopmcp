@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #37 (automated-gates half): a `bandit -r src/` CI job, wired but
+  never run before now despite being declared in the `security` extra since
+  #1. Triaged all 19 pre-existing findings (0 high) rather than blanket-
+  disabling any check: 8 `B105` "hardcoded password" false positives (a
+  URL constant, backend-name string comparisons, and paginator `None`
+  defaults) and 9 `B608` "possible SQL injection" sites in `store.py` each
+  get a `# nosec` naming what the interpolated value actually is and why
+  it's fixed, internal, and never caller-supplied -- `B608` stays enabled
+  for any new, less-careful interpolation `store.py` might grow. The 2
+  `B311` (non-cryptographic `random`) sites reuse the jitter justification
+  already carried by their `# noqa: S311`. Separately, ruff's `S105`/`S106`
+  moved from a blanket top-level `ignore` to `per-file-ignores["tests/*"]`
+  (test fixtures legitimately assign literal tokens); the 4 real `src/`
+  sites this un-ignoring surfaces (`auth.py`'s `TOKEN_URL` and two
+  `token_backend` comparisons, `config.py`'s `token_backend` default) each
+  get an inline justified `# noqa: S105` instead. `pip-audit` and CodeQL
+  were confirmed already enforcing/running, unchanged. No logic changes;
+  the nine-area manual security review remains a separate, later pass.
 - Issue #34: `server.json`, the MCP registry manifest, declaring
   `io.github.kurok/whoopmcp` and the PyPI package for local (stdio) use.
   Deliberately no `remotes` entry -- #27's streamable-HTTP transport merged,

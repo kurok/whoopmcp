@@ -32,7 +32,7 @@ from whoopmcp.config import Config
 from whoopmcp.crypto import SealError, seal, unseal
 
 AUTHORIZE_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
-TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
+TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"  # noqa: S105 -- an endpoint URL, not a credential value  # nosec B105
 #: The one non-GET endpoint WHOOP exposes to an OAuth client. Lives here,
 #: not in client.py -- see revoke_upstream's docstring for why.
 USER_ACCESS_URL = "https://api.prod.whoop.com/developer/v2/user/access"
@@ -400,9 +400,9 @@ class KeyringTokenStore:
 
 def build_store(config: Config) -> TokenStore:
     """Pick a token store based on configuration."""
-    if config.token_backend == "keyring":
+    if config.token_backend == "keyring":  # noqa: S105 -- a backend name, not a credential value  # nosec B105
         return KeyringTokenStore()
-    if config.token_backend == "encrypted-file":
+    if config.token_backend == "encrypted-file":  # noqa: S105 -- a backend name, not a credential value  # nosec B105
         if config.token_encryption_key_version is None:
             # Config.from_env() already refuses to produce a config with
             # token_backend="encrypted-file" and no key version, so this

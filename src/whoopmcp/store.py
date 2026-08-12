@@ -1490,7 +1490,7 @@ def get_metric_series(
         GROUP BY bucket
         ORDER BY bucket
         LIMIT ?
-    """  # noqa: S608 -- table/value_column/date_column come only from this
+    """  # noqa: S608 -- table/value_column/date_column come only from this  # nosec B608
     # module's own fixed allow-lists above, never from raw caller input.
     rows = _execute_scoped(conn, sql, (whoop_user_id, start, start, end, end, limit)).fetchall()
     return [(row[0], row[1]) for row in rows]
@@ -1633,7 +1633,7 @@ def get_resource_updated_at(
     _require_user_id(whoop_user_id)
     row = _execute_scoped(
         conn,
-        f"SELECT raw_json FROM {table} WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- table is one of three fixed, internal literals, never user input
+        f"SELECT raw_json FROM {table} WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- table is one of three fixed, internal literals, never user input  # nosec B608
         (whoop_user_id, resource_id),
     ).fetchone()
     if row is None:
@@ -1659,7 +1659,7 @@ def set_deleted_at(
     table = _TABLE_BY_RESOURCE[resource]
     _execute_scoped(
         conn,
-        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- table is one of three fixed, internal literals, never user input
+        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608 -- table is one of three fixed, internal literals, never user input  # nosec B608
         (_now(), whoop_user_id, resource_id),
     )
     conn.commit()
@@ -1920,7 +1920,7 @@ def get_webhook_event(conn: sqlite3.Connection, trace_id: str) -> dict[str, Any]
     # names, never user input.
     row = _execute_scoped(
         conn,
-        f"SELECT {', '.join(_WEBHOOK_EVENT_COLUMNS)} FROM webhook_events WHERE trace_id = ?",  # noqa: S608
+        f"SELECT {', '.join(_WEBHOOK_EVENT_COLUMNS)} FROM webhook_events WHERE trace_id = ?",  # noqa: S608 -- columns come only from _WEBHOOK_EVENT_COLUMNS, a fixed internal tuple, never user input  # nosec B608
         (trace_id,),
     ).fetchone()
     if row is None:
@@ -2154,7 +2154,7 @@ def get_webhook_events_for_member(
         conn,
         # _WEBHOOK_EVENT_COLUMNS is a fixed, internal tuple of literal column
         # names, never user input.
-        f"SELECT {', '.join(_WEBHOOK_EVENT_COLUMNS)} FROM webhook_events "  # noqa: S608
+        f"SELECT {', '.join(_WEBHOOK_EVENT_COLUMNS)} FROM webhook_events "  # noqa: S608 -- columns come only from _WEBHOOK_EVENT_COLUMNS, a fixed internal tuple, never user input  # nosec B608
         f"WHERE whoop_user_id = ?",
         (whoop_user_id,),
     ).fetchall()
@@ -2172,7 +2172,7 @@ def get_tool_call_audit_for_member(
     _require_user_id(whoop_user_id)
     rows = _execute_scoped(
         conn,
-        f"SELECT {', '.join(_TOOL_CALL_AUDIT_COLUMNS)} FROM tool_call_audit "  # noqa: S608
+        f"SELECT {', '.join(_TOOL_CALL_AUDIT_COLUMNS)} FROM tool_call_audit "  # noqa: S608 -- columns come only from _TOOL_CALL_AUDIT_COLUMNS, a fixed internal tuple, never user input  # nosec B608
         f"WHERE whoop_user_id = ?",
         (whoop_user_id,),
     ).fetchall()
@@ -2244,7 +2244,7 @@ def _erase_member_data_impl(conn: sqlite3.Connection, whoop_user_id: int) -> Non
             conn,
             # table is drawn from the fixed, internal _ERASURE_TABLES
             # frozenset, never user input.
-            f"DELETE FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"DELETE FROM {table} WHERE whoop_user_id = ?",  # noqa: S608 -- table is drawn from the fixed, internal _ERASURE_TABLES frozenset, never user input  # nosec B608
             (whoop_user_id,),
         )
 
@@ -2340,10 +2340,10 @@ def enforce_retention(
     for table in sorted(_ERASURE_TABLES):
         column = _RETENTION_TIMESTAMP_COLUMNS[table]
         if table in _TENANT_SCOPED_TABLES:
-            sql = f"DELETE FROM {table} WHERE whoop_user_id IS NOT NULL AND {column} < ?"  # noqa: S608
+            sql = f"DELETE FROM {table} WHERE whoop_user_id IS NOT NULL AND {column} < ?"  # noqa: S608 -- table/column are drawn from the fixed, internal _ERASURE_TABLES/_RETENTION_TIMESTAMP_COLUMNS mappings, never user input  # nosec B608
             cursor = _execute_all_tenant_sweep(conn, sql, (cutoff,))
         else:
-            sql = f"DELETE FROM {table} WHERE {column} < ?"  # noqa: S608
+            sql = f"DELETE FROM {table} WHERE {column} < ?"  # noqa: S608 -- table/column are drawn from the fixed, internal _ERASURE_TABLES/_RETENTION_TIMESTAMP_COLUMNS mappings, never user input  # nosec B608
             cursor = _execute_scoped(conn, sql, (cutoff,))
         counts[table] = cursor.rowcount
     conn.commit()

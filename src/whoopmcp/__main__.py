@@ -496,7 +496,7 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
     else:
         document["consent"] = {
             "scopes": None,
-            "token_present": None,
+            "token_present": None,  # nosec B105 -- the literal None (unknown, not a credential value)
             "note": (
                 "more than one WHOOP member has ever been linked in this store; "
                 "which one the single locally-stored token belongs to cannot be "

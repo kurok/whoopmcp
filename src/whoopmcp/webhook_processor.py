@@ -298,7 +298,7 @@ async def _apply_event(conn: sqlite3.Connection, client: WhoopClient, event: Web
 def _backoff_seconds(attempt: int) -> float:
     """Capped exponential backoff with full jitter -- see module docstring."""
     capped = min(_BACKOFF_MAX_SECONDS, _BACKOFF_BASE_SECONDS * (2**attempt))
-    return random.uniform(0, capped)  # noqa: S311 -- jitter, not a security use
+    return random.uniform(0, capped)  # noqa: S311 -- jitter, not a security use  # nosec B311
 
 
 async def _wait_seconds(clock: Callable[[], float], seconds: float) -> None:
