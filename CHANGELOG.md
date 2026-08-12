@@ -602,6 +602,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #105: `webhook_events.whoop_user_id` is now `NOT NULL` (migration 5),
+  since a NULL there made a row invisible to both `export_member_data` and
+  `erase_member_data` -- both select on `WHERE whoop_user_id = ?` -- the
+  worst combination for a data-subject rights request. The migration
+  rebuilds the table (sqlite has no `ALTER COLUMN`) inside its own
+  transaction and refuses up front, leaving the database untouched, if any
+  NULL-user rows already exist, naming the row count rather than letting a
+  bare `IntegrityError` surface from partway through the rebuild.
+  `insert_webhook_event`'s `whoop_user_id` parameter is now `int`, not
+  `int | None`, to match.
 - Issue #103: `EncryptedFileTokenStore.load`'s lazy re-seal no longer leaks a
   raw `crypto.SealError` when the current key version's key is missing --
   e.g. a half-completed key rotation, or a hand-built `Config` that skips
