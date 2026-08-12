@@ -602,6 +602,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #100: after `erase-member` deletes a member's data, the database file is
+  now compacted via `VACUUM` so the deleted rows' bytes are overwritten in freed
+  pages, rather than remaining recoverable in the file. `PRIVACY.md` promises
+  erasure is "a real removal" of the data subject's records; the promise is now
+  kept for the bytes themselves, not just the SQL table rows. The cost lands on
+  the rare operator command (`erase-member`) rather than on every `DELETE` in
+  the store (retention and webhook cleanup), per the repo owner's design
+  decision. A failed compaction (e.g., disk full, or corruption detected
+  mid-`VACUUM`) does not abort or report erasure as failed; the deletes are
+  already committed and irreversible at that point. A distinct stderr message
+  and exit code 3 -- distinct from the pre-deletion abort's 1 -- signal the
+  incomplete compaction so a caller does not mistake it for "nothing was
+  deleted" or otherwise confuse it with erasure failure.
 - Issue #104: the `erase-member` CLI subcommand's erasure is now atomic across
   the health-data deletion and principal-link deletion -- either both are
   applied or neither is, ensuring a member is never half-erased. Before: the

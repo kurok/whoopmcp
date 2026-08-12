@@ -2104,3 +2104,32 @@ def enforce_retention(
         counts[table] = cursor.rowcount
     conn.commit()
     return counts
+
+
+def compact_database(conn: sqlite3.Connection) -> None:
+    """Issue #100: compact the database file to reclaim freed pages.
+
+    After a member erasure, deleted rows' bytes remain in the file's free
+    pages (since ``PRAGMA secure_delete`` is 0 by design -- see PRIVACY.md).
+    ``VACUUM`` rewrites the entire file and overwrites those freed pages,
+    so deleted bytes are no longer recoverable.
+
+    This function cannot go through ``_execute_scoped`` or
+    ``_execute_all_tenant_sweep`` because ``VACUUM`` has no ``WHERE``
+    clause and touches every table by nature. It is therefore called only
+    from ``_erase_member`` in ``__main__.py``, after the atomic erasure
+    commits (when ``conn.in_transaction`` is ``False``), via this single-
+    purpose function (issue #100, decision D1).
+
+    ``PRAGMA secure_delete`` is not set. ``VACUUM`` is the chosen cost
+    model per the repo owner's decision: it lands on a rare operator
+    command (``erase-member``) rather than on every ``DELETE`` in the
+    store (retention and webhook cleanup). A failed ``VACUUM`` must not
+    be reported as erasure failure (the deletes are already committed and
+    irreversible); see issue #100 decision D3 for the error handling.
+
+    This function may raise ``sqlite3.OperationalError`` (e.g., ``VACUUM``
+    on a full disk). The caller in ``__main__._erase_member`` catches,
+    prints a distinct stderr message, and returns non-zero exit code.
+    """
+    conn.execute("VACUUM")

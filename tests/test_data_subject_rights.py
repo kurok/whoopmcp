@@ -37,11 +37,13 @@ negative.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import io
 import os
 import sqlite3
 import stat
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -730,6 +732,380 @@ def test_erase_member_subcommand_still_aborts_on_a_genuine_transport_failure(
         is not None
     )
     conn.close()
+
+
+# =============================================================================
+# Issue #100: erase-member also compacts the database file via VACUUM, so a
+# deleted member's bytes stop being recoverable in freed pages -- not just
+# unreachable via SQL, which a plain DELETE already gave us. Mirrors this
+# file's own "erase-member: revoke-ordering" section above -- same
+# subcommand, a different way local deletion could fall short of "real
+# removal." Relocated from tests/test_issue_100.py (this file owns erasure;
+# issue-numbered test files are a #101-flagged smell).
+# =============================================================================
+
+MEMBER_ISSUE_100 = 920001  # disjoint from this file's and test_tenancy.py's ranges
+
+
+def _marker_in_file_bytes(db_path: Path, marker: str) -> bool:
+    """Check if a marker string appears in the raw bytes of the database file."""
+    if not db_path.exists():
+        return False
+    return marker.encode("utf-8") in db_path.read_bytes()
+
+
+def test_erase_member_vacuums_freed_bytes_from_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance test via the CLI: seed a member with a sleep record whose
+    payload contains a unique marker, run erase-member, then assert the
+    marker is ABSENT from the file's raw bytes -- not merely unreachable via
+    SQL, which a plain ``DELETE`` (no ``VACUUM``) already gives today."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    db_path = Config.from_env().cache_path
+
+    marker = "marker_unique_12345_xyz_issue_100"
+
+    conn = store.open_store(db_path)
+    _seed_sleep(conn, MEMBER_ISSUE_100, marker)
+    store.link_principal_to_member(
+        conn, client_id="test_client_id", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_100
+    )
+    conn.commit()
+    conn.close()
+
+    assert _marker_in_file_bytes(db_path, marker), "marker should be in file bytes before erasure"
+
+    conn = store.open_store(db_path)
+    row_count_before = conn.execute(
+        "SELECT COUNT(*) FROM sleeps WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    assert row_count_before > 0, "sleep record should exist before erasure"
+    conn.close()
+
+    exit_code = main(["erase-member", "--whoop-user-id", str(MEMBER_ISSUE_100)])
+    assert exit_code == 0, f"erase-member should succeed, got exit code {exit_code}"
+
+    conn = store.open_store(db_path)
+    row_count_after = conn.execute(
+        "SELECT COUNT(*) FROM sleeps WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    assert row_count_after == 0, "sleep record should be deleted after erasure"
+    conn.close()
+
+    # THIS IS THE KEY ASSERTION: marker must be absent from raw file bytes.
+    # Fails without the VACUUM fix, because PRAGMA secure_delete=0 means
+    # freed pages are not overwritten by a plain DELETE.
+    assert not _marker_in_file_bytes(db_path, marker), (
+        "marker should be absent from file bytes after erasure+VACUUM"
+    )
+
+
+def test_erase_member_with_vacuum_still_deletes_rows_and_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The VACUUM addition must not break erasure itself: rows and the
+    principal link must still be gone afterwards."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    db_path = Config.from_env().cache_path
+
+    conn = store.open_store(db_path)
+    _seed_sleep(conn, MEMBER_ISSUE_100, "tag")
+    _seed_recovery(conn, MEMBER_ISSUE_100, "tag")
+    store.link_principal_to_member(
+        conn, client_id="test_client_id", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_100
+    )
+    conn.commit()
+    conn.close()
+
+    conn = store.open_store(db_path)
+    sleeps = conn.execute(
+        "SELECT COUNT(*) FROM sleeps WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    recoveries = conn.execute(
+        "SELECT COUNT(*) FROM recoveries WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    links = conn.execute(
+        "SELECT COUNT(*) FROM principal_members WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    conn.close()
+
+    assert sleeps > 0, "should have sleep data before erasure"
+    assert recoveries > 0, "should have recovery data before erasure"
+    assert links > 0, "should have principal link before erasure"
+
+    exit_code = main(["erase-member", "--whoop-user-id", str(MEMBER_ISSUE_100)])
+    assert exit_code == 0
+
+    conn = store.open_store(db_path)
+    sleeps_after = conn.execute(
+        "SELECT COUNT(*) FROM sleeps WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    recoveries_after = conn.execute(
+        "SELECT COUNT(*) FROM recoveries WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    links_after = conn.execute(
+        "SELECT COUNT(*) FROM principal_members WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    conn.close()
+
+    assert sleeps_after == 0, "sleep data should be deleted"
+    assert recoveries_after == 0, "recovery data should be deleted"
+    assert links_after == 0, "principal link should be deleted"
+
+
+def test_erase_member_and_links_atomically_leaves_no_open_transaction(
+    tmp_path: Path,
+) -> None:
+    """After ``erase_member_and_links_atomically`` returns,
+    ``conn.in_transaction`` must be False, so a subsequent ``VACUUM`` does
+    not fail with an ``OperationalError`` about running VACUUM inside a
+    transaction."""
+    db_path = tmp_path / "test.sqlite3"
+    conn = store.open_store(db_path)
+
+    _seed_sleep(conn, MEMBER_ISSUE_100, "tag")
+    store.link_principal_to_member(
+        conn, client_id="test_client", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_100
+    )
+    conn.commit()
+
+    store.erase_member_and_links_atomically(conn, MEMBER_ISSUE_100)
+
+    assert not conn.in_transaction, (
+        "conn.in_transaction should be False after erase_member_and_links_atomically"
+    )
+
+    try:
+        conn.execute("VACUUM")
+    except sqlite3.OperationalError as e:
+        pytest.fail(f"VACUUM should work after erasure, but got: {e}")
+
+    conn.close()
+
+
+def _compact_database_call_sites() -> list[tuple[str, str, int]]:
+    """Every call to ``compact_database`` anywhere under ``src/whoopmcp``, as
+    ``(filename, enclosing function, line)`` triples. Matches both the bare
+    ``compact_database(...)`` (``ast.Name``) and ``store.compact_database(...)``
+    (``ast.Attribute``) call forms, and scans every module -- not just
+    store.py, since compact_database's one legitimate caller
+    (``_erase_member``, D2) lives in ``__main__.py``, outside the module that
+    owns the transaction.
+    """
+    src_dir = Path(store.__file__).resolve().parent
+    sites: list[tuple[str, str, int]] = []
+
+    for path in sorted(src_dir.glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call):
+                    continue
+                is_name_call = (
+                    isinstance(inner.func, ast.Name) and inner.func.id == "compact_database"
+                )
+                is_attr_call = (
+                    isinstance(inner.func, ast.Attribute) and inner.func.attr == "compact_database"
+                )
+                if is_name_call or is_attr_call:
+                    sites.append((path.name, node.name, inner.lineno))
+    return sites
+
+
+def _compact_database_bare_references() -> list[str]:
+    """Any reference to ``compact_database`` that is not itself a call --
+    e.g. an alias, ``getattr``, or bare attribute access -- anywhere under
+    ``src/whoopmcp``, except its own definition in store.py. No file,
+    including ``__main__.py``, is exempted: a node is only skipped when it is
+    the ``.func`` of some ``ast.Call`` in that same file (i.e. already
+    counted by ``_compact_database_call_sites``), so a second, non-call
+    reference in ``__main__.py`` would still be caught here.
+    """
+    src_dir = Path(store.__file__).resolve().parent
+    refs: list[str] = []
+    for path in sorted(src_dir.glob("*.py")):
+        if path.name == "store.py":
+            continue  # its own definition lives here
+        tree = ast.parse(path.read_text(), filename=str(path))
+        call_func_ids = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        for node in ast.walk(tree):
+            if id(node) in call_func_ids:
+                continue
+            if (isinstance(node, ast.Name) and node.id == "compact_database") or (
+                isinstance(node, ast.Attribute) and node.attr == "compact_database"
+            ):
+                refs.append(f"{path.name}:{node.lineno}")
+    return refs
+
+
+def test_compact_database_function_has_exactly_one_caller() -> None:
+    """Single-caller pin, AST-based, mirroring #99's own test 6.
+
+    ``compact_database`` must be called from exactly one place anywhere
+    under ``src/whoopmcp`` -- ``__main__._erase_member``, per D2 -- in
+    either call form (bare name or attribute access), and referenced by no
+    other file beyond its own definition in store.py and that one call
+    site. Pins the narrowly-scoped nature of the VACUUM function per D1 and
+    prevents silent widening, including via a second call added in a
+    *different* function of ``__main__.py`` itself.
+    """
+    assert callable(getattr(store, "compact_database", None)), (
+        "store.compact_database does not exist; check the function name in D1"
+    )
+
+    sites = _compact_database_call_sites()
+    assert [(fname, fn) for fname, fn, _ in sites] == [("__main__.py", "_erase_member")], (
+        f"compact_database must be called exactly once, from __main__._erase_member; found {sites}"
+    )
+
+    refs = _compact_database_bare_references()
+    assert refs == [], (
+        f"only __main__._erase_member may reach compact_database; also referenced in {refs}"
+    )
+
+
+def test_erase_member_commits_deletes_even_when_vacuum_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed VACUUM must not hide erasure success: the rows must still be
+    deleted, stderr must say so distinctly from a failure, the exit code
+    must be non-zero, and no traceback may escape."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    db_path = Config.from_env().cache_path
+
+    conn = store.open_store(db_path)
+    _seed_sleep(conn, MEMBER_ISSUE_100, "tag")
+    store.link_principal_to_member(
+        conn, client_id="test_client_id", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_100
+    )
+    conn.commit()
+    conn.close()
+
+    conn = store.open_store(db_path)
+    rows_before = conn.execute(
+        "SELECT COUNT(*) FROM sleeps WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    assert rows_before > 0
+    conn.close()
+
+    # __main__._erase_member imports compact_database fresh from the store
+    # module on every call, so patching the attribute on `store` is enough.
+    def failing_compact(conn: sqlite3.Connection) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "compact_database", failing_compact)
+
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        exit_code = main(["erase-member", "--whoop-user-id", str(MEMBER_ISSUE_100)])
+        assert exit_code != 0, "exit code should be non-zero when VACUUM fails"
+
+        stderr_output = sys.stderr.getvalue()
+        assert "deleted" in stderr_output and "not compacted" in stderr_output, (
+            f"stderr should say the rows are deleted but the file was not compacted; "
+            f"got: {stderr_output!r}"
+        )
+        assert "failed" not in stderr_output.lower(), (
+            f"stderr must not read as a failed erasure; got: {stderr_output!r}"
+        )
+        assert "Traceback" not in stderr_output, "traceback should not escape to stderr"
+    finally:
+        sys.stderr = old_stderr
+
+    conn = store.open_store(db_path)
+    rows_after = conn.execute(
+        "SELECT COUNT(*) FROM sleeps WHERE whoop_user_id = ?", (MEMBER_ISSUE_100,)
+    ).fetchone()[0]
+    conn.close()
+    assert rows_after == 0, "rows should still be deleted despite VACUUM failure"
+
+
+def test_enforce_retention_does_not_vacuum() -> None:
+    """D4: the decision names ``erase-member`` for the VACUUM call, not
+    ``enforce-retention``. Retention's deleted bytes also linger, but that
+    is a follow-up, not this issue -- structural AST check that
+    ``enforce_retention`` never calls ``compact_database``."""
+    source = inspect.getsource(store.enforce_retention)
+    tree = ast.parse(source)
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "compact_database"
+        ):
+            pytest.fail(
+                "enforce_retention must not call compact_database (D4); "
+                "vacuuming after retention is a follow-up, not this issue"
+            )
+
+
+def test_erase_member_refuses_ephemeral_before_file_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ephemeral guard (#101) still works unchanged: when the store is
+    in-memory and the file does not exist, erase-member refuses before
+    opening anything, before attempting any VACUUM."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    # WHOOPMCP_CACHE is not set (and transport defaults to stdio, no
+    # webhooks), so store_is_ephemeral is True, and -- unlike the other
+    # tests in this section -- nothing opens the store to seed it first.
+    db_path = Config.from_env().cache_path
+
+    assert not db_path.exists()
+
+    exit_code = main(["erase-member", "--whoop-user-id", str(MEMBER_ISSUE_100)])
+    assert exit_code == 2, "should refuse with exit code 2 for ephemeral/nonexistent store"
+
+    assert not db_path.exists(), "file should never be created for ephemeral refusal"
+
+
+def test_pin_test_still_catches_new_unwrapped_execute_in_store() -> None:
+    """After adding ``compact_database`` to the allowlist,
+    ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper``
+    (tests/test_tenancy.py) must still catch a genuinely unwrapped
+    ``conn.execute`` elsewhere in store.py -- demonstrating the allowlist
+    widening did not defang the test."""
+    source = inspect.getsource(store)
+
+    # The allowlist from test_tenancy.py's pin test, now with
+    # compact_database as the fourth entry (alongside
+    # _execute_with_tenancy_authorizer, _migrate, open_store).
+    allowed = {
+        "_execute_with_tenancy_authorizer",
+        "_migrate",
+        "open_store",
+        "compact_database",
+    }
+
+    fake_source = f"""
+{source}
+
+def fake_unwrapped_function(conn):
+    return conn.execute("SELECT 1")
+"""
+
+    tree = ast.parse(fake_source)
+    violations: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) or node.name in allowed:
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr in ("execute", "executemany")
+            ):
+                violations.append(f"{node.name} (line {inner.lineno})")
+
+    assert any("fake_unwrapped_function" in v for v in violations), (
+        f"the test must still catch a new unwrapped conn.execute; violations found: {violations}"
+    )
 
 
 # =============================================================================
