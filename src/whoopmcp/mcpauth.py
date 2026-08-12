@@ -142,8 +142,58 @@ def _names_this_resource(access_token: AccessToken, config: MCPAuthConfig) -> bo
     return access_token.resource == str(config.resource_url)
 
 
+def _issued_by_trusted_as(access_token: AccessToken, config: MCPAuthConfig) -> bool:
+    """True only when `access_token`'s issuer is one of `config.authorization_servers`.
+
+    The SDK's `AccessToken` has no `iss` field of its own -- the issuer, if
+    present at all, lives in `access_token.claims["iss"]`, and `claims`
+    defaults to `None`. A missing `claims` dict, a missing `iss` key, a
+    non-`str` `iss` (an `int`, a `list`, `None` -- anything a hostile or
+    buggy resolver might hand back), and an empty `iss` are all rejected the
+    same way a wrong `iss` is: a token with no provable issuer is not safer
+    than one from an untrusted issuer, exactly the precedent
+    `_names_this_resource` already sets for a missing resource claim.
+
+    Comparison tolerates exactly one difference: a trailing slash, since
+    `AnyHttpUrl` rewrites an operator-configured `https://x` to `https://x/`
+    while RFC 8414 issuer identifiers are conventionally written without
+    one. Nothing else is normalised -- not case, not port, not path -- so a
+    near-miss like `https://good-as.example.com.evil.com`,
+    `https://good-as.example.com:8443`, or `https://good-as.example.com/x`
+    is rejected, not treated as equivalent to `https://good-as.example.com`.
+    """
+    claims = access_token.claims
+    # `AccessToken` types `claims` as `dict[str, Any] | None`, so pydantic
+    # rejects anything else at construction -- but `model_construct` bypasses
+    # validation, and a future non-pydantic resolver need not honour the type
+    # at all. Checking the shape here means a malformed `claims` is rejected
+    # rather than raising `AttributeError` out of a token verifier.
+    if not isinstance(claims, dict):
+        return False
+    iss = claims.get("iss")
+    if not isinstance(iss, str) or not iss:
+        return False
+    return any(
+        _without_one_trailing_slash(str(as_url)) == _without_one_trailing_slash(iss)
+        for as_url in config.authorization_servers
+    )
+
+
+def _without_one_trailing_slash(url: str) -> str:
+    """`url` with a single trailing slash removed, if it has one.
+
+    Deliberately not `rstrip("/")`, which strips *every* trailing slash and so
+    would treat `https://x//` as `https://x`. That is not a bypass -- it can
+    only ever collapse empty trailing segments on a host that is already
+    trusted -- but the one slash this tolerates is tolerated for one specific
+    reason (`AnyHttpUrl` appends exactly one), and nothing here has a reason
+    to accept a second.
+    """
+    return url[:-1] if url.endswith("/") else url
+
+
 class MCPTokenVerifier(TokenVerifier):
-    """Validates an inbound bearer token's audience for this MCP server.
+    """Validates an inbound bearer token's audience and issuer for this MCP server.
 
     Deliberately fail-closed and, today, unconditionally so: resolving an
     opaque bearer string into its claims means either verifying a JWT against
@@ -155,9 +205,10 @@ class MCPTokenVerifier(TokenVerifier):
     either now would mean guessing an unresolved external integration rather
     than reading it off the SDK's structure or the issue's own text, so
     `_resolve` is left a stub that resolves nothing, and every token is
-    rejected. `_names_this_resource` is nonetheless implemented as real,
-    independently callable RFC 8707 logic: the moment a future issue plugs
-    a real resolver into `_resolve`, `verify_token` already applies it.
+    rejected. `_names_this_resource` and `_issued_by_trusted_as` are
+    nonetheless implemented as real, independently callable RFC 8707 and RFC
+    9728 logic respectively: the moment a future issue plugs a real resolver
+    into `_resolve`, `verify_token` already applies both.
     """
 
     def __init__(self, config: MCPAuthConfig | None = None) -> None:
@@ -167,9 +218,14 @@ class MCPTokenVerifier(TokenVerifier):
         """Verify `token` and return its claims, or `None` if it must be rejected.
 
         Rejects unconditionally if `self.config` was never set (nothing to
-        validate an audience against), if the token cannot be resolved at all
-        (see `_resolve`), or if the resolved token's resource claim does not
-        name this server (RFC 8707).
+        validate an audience or issuer against), if the token cannot be
+        resolved at all (see `_resolve`), if the resolved token's resource
+        claim does not name this server (RFC 8707, `_names_this_resource`),
+        or if its issuer is not one of `self.config.authorization_servers`
+        (`_issued_by_trusted_as`). Both checks run unconditionally, in this
+        order, and neither passing lets the other be skipped -- an
+        audience-correct token from an untrusted issuer is exactly the
+        substitution this second check exists to close.
         """
         if self.config is None:
             return None
@@ -177,6 +233,8 @@ class MCPTokenVerifier(TokenVerifier):
         if access_token is None:
             return None
         if not _names_this_resource(access_token, self.config):
+            return None
+        if not _issued_by_trusted_as(access_token, self.config):
             return None
         return access_token
 
@@ -186,7 +244,9 @@ class MCPTokenVerifier(TokenVerifier):
         Stub pending a real external-AS integration -- see the class
         docstring for why that choice is not this issue's to make. `token`
         is unused for now; the parameter stays so a real resolver's signature
-        doesn't need to change to plug in here.
+        doesn't need to change to plug in here. A future real resolver does
+        not need to re-check `claims["iss"]` itself: `verify_token` already
+        applies `_issued_by_trusted_as` to whatever this returns.
         """
         del token
         return None
