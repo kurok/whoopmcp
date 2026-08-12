@@ -259,8 +259,26 @@ class EncryptedFileTokenStore:
         self._keys = keys
         self._current_version = current_version
         self._warned = False
+        #: Separate from `_warned` above on purpose -- that flag belongs to
+        #: `save`'s Windows-mode warning. Sharing it would let either
+        #: warning suppress the other the first time either condition
+        #: fires.
+        self._reseal_warned = False
 
     def load(self) -> Token | None:
+        """Return the stored token, or ``None`` if nothing is stored.
+
+        A record sealed under an older key version is normally re-sealed
+        under ``current_version`` before being returned (see the lazy
+        rotation note below). If that re-seal itself fails -- most likely
+        because the operator has not yet supplied the current version's key
+        -- the record is still perfectly decryptable, so it is returned
+        unrotated rather than turning a half-configured key set into an
+        outage. That failure is logged (once per instance) naming the
+        missing version so it is diagnosable; it never raises out of
+        `load`, and never touches the file, unlike a direct `save` call
+        (see `save`'s own docstring note).
+        """
         try:
             raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -290,11 +308,37 @@ class EncryptedFileTokenStore:
             # re-encrypt pass, no downtime; the old key just needs to
             # remain in `keys` until every such record has been touched
             # once.
-            self.save(token)
+            try:
+                self.save(token)
+            except SealError:
+                # The current key is missing (e.g. a half-completed key
+                # rotation, or a misconfigured environment). The token we
+                # just decrypted is still valid -- availability wins here:
+                # serve it unrotated rather than raise, and try again on
+                # the next load. Contrast with `save` itself, which must
+                # keep raising for a direct caller (see its docstring).
+                if not self._reseal_warned:
+                    self._reseal_warned = True
+                    logger.warning(
+                        "could not re-seal token at %s under key version %s: the current "
+                        "key is not available. Serving the existing token unrotated; "
+                        "supply the missing key to complete rotation.",
+                        self._path,
+                        self._current_version,
+                    )
 
         return token
 
     def save(self, token: Token) -> None:
+        """Seal ``token`` and write it to disk.
+
+        Unlike the lazy re-seal inside `load` above, a `SealError` here --
+        e.g. the current key version is missing -- is never swallowed: it
+        propagates. A direct `save` (as `Authenticator.exchange_code` makes
+        right after a successful token exchange) is the only copy of a
+        freshly obtained token there is; degrading that to a warning would
+        silently lose it instead of merely deferring a rotation.
+        """
         if not self._MODES_ENFORCED and not self._warned:
             self._warned = True
             logger.warning(

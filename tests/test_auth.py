@@ -1040,3 +1040,305 @@ def test_write_keeps_its_existing_guarantees(tmp_path: Path) -> None:
     mode = stat.S_IMODE(path.stat().st_mode)
     assert mode & (stat.S_IRWXG | stat.S_IRWXO) == 0, f"file is mode {mode:o}"
     assert path.read_text(encoding="utf-8") == "second"
+
+
+# -- lazy re-seal with missing current key (issue #103) -----------------------
+#
+# EncryptedFileTokenStore.load() currently leaks a raw SealError when the
+# current_version key is missing. The fix: catch SealError from the lazy
+# re-seal, log a warning, and return the token anyway. This test suite
+# ensures the behavior, assertions about logging (no secrets), and that the
+# happy path (both keys present) still rotates as expected.
+
+
+def test_lazy_reseal_missing_current_key_returns_unrotated_token(tmp_path: Path) -> None:
+    """Test 1: headline case. Seal under v1, load with current_version=2 and
+    no v2 key → returns valid Token (the original stored value), raises nothing.
+
+    This test MUST FAIL against current main with the raw SealError; the fix
+    wraps the lazy re-seal in its own try/except to handle it gracefully.
+    """
+    key_v1 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("access-token-test", expires_at=1234.0, refresh_token="refresh-token-test")
+
+    # Seal under v1
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+
+    # Load with current_version=2, but only v1 key is present (no v2).
+    # Before the fix: raw SealError escapes.
+    # After the fix: load returns the unrotated token without raising.
+    store_missing_v2 = EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=2)
+    loaded = store_missing_v2.load()
+
+    assert loaded is not None
+    assert loaded == token
+    assert loaded.access_token == "access-token-test"
+    assert loaded.refresh_token == "refresh-token-test"
+
+
+def test_lazy_reseal_missing_key_emits_warning_naming_version(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test 2: a warning is emitted at WARNING level on the whoopmcp.auth
+    logger, naming the missing version."""
+    key_v1 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+
+    caplog.set_level(logging.WARNING, logger="whoopmcp.auth")
+    store = EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=2)
+    store.load()
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) >= 1, "at least one warning must be emitted"
+
+    # The warning must name the missing version (2 in this case)
+    warning_texts = [r.getMessage() for r in warnings]
+    assert any("2" in text for text in warning_texts), (
+        f"warning must name the missing version 2, got: {warning_texts}"
+    )
+
+
+def test_lazy_reseal_missing_key_log_contains_no_secrets(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test 3: no secret in the log. The access token, refresh token, and key
+    bytes must not appear anywhere in the captured log text (message + exc_text).
+
+    This is the most critical test: a store that logs a secret while
+    "fixing availability" is a far worse bug than the one being fixed.
+    """
+    key_v1 = os.urandom(32)
+    path = tmp_path / "token.json"
+    sentinel_access = "SENTINEL-ACCESS-TOKEN-test-abc123"
+    sentinel_refresh = "SENTINEL-REFRESH-TOKEN-test-xyz789"
+    token = Token(sentinel_access, expires_at=1234.0, refresh_token=sentinel_refresh)
+
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+
+    caplog.set_level(logging.DEBUG)
+    store = EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=2)
+    store.load()
+
+    # caplog.text is every captured record's message + formatted exc_text
+    assert sentinel_access not in caplog.text, "access token leaked in logs"
+    assert sentinel_refresh not in caplog.text, "refresh token leaked in logs"
+    assert base64.b64encode(key_v1).decode("ascii") not in caplog.text, "key leaked in logs (b64)"
+    assert key_v1.hex() not in caplog.text, "key leaked in logs (hex)"
+
+    # Also check individual records
+    for record in caplog.records:
+        message = record.getMessage()
+        assert sentinel_access not in message
+        assert sentinel_refresh not in message
+        if record.exc_text:
+            assert sentinel_access not in record.exc_text
+            assert sentinel_refresh not in record.exc_text
+
+
+def test_lazy_reseal_missing_key_leaves_file_unchanged(tmp_path: Path) -> None:
+    """Test 4: the file is left unchanged. Still sealed at v=1, byte-identical,
+    no partial write."""
+    key_v1 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+    before = path.read_bytes()
+    before_dict = json.loads(before)
+    assert before_dict["v"] == 1
+
+    # Load with missing v2 key
+    store = EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=2)
+    store.load()
+
+    # File must be byte-identical, not touched
+    after = path.read_bytes()
+    assert after == before
+    after_dict = json.loads(after)
+    assert after_dict["v"] == 1
+
+
+def test_lazy_reseal_with_both_keys_present_still_rotates(tmp_path: Path) -> None:
+    """Test 5: happy rotation still re-seals (fact #2 from brief). When both
+    the old and new keys are present, load() rotates the record under the new
+    key, and the envelope becomes v=2 on disk."""
+    key_v1 = os.urandom(32)
+    key_v2 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    # Seal under v1
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+    assert json.loads(path.read_text(encoding="utf-8"))["v"] == 1
+
+    # Load with both keys present; current is v2
+    store = EncryptedFileTokenStore(path, keys={1: key_v1, 2: key_v2}, current_version=2)
+    loaded = store.load()
+
+    # Token returned intact
+    assert loaded == token
+    # File re-sealed under v2
+    assert json.loads(path.read_text(encoding="utf-8"))["v"] == 2
+
+
+def test_lazy_reseal_missing_key_is_not_suppressed_by_direct_save_call(
+    tmp_path: Path,
+) -> None:
+    """Test 6: save() itself must still raise when the current key is missing
+    (D4). Only the *lazy re-seal inside load()* degrades to a warning. A
+    direct save() call must keep raising because silently failing to persist
+    a freshly obtained token would lose it.
+
+    The exception raised by a direct save() call is SealError (from the crypto
+    layer), not AuthError -- AuthError wrapping is only in the load() path for
+    the initial unseal. This test verifies save() raises (does not degrade to
+    a warning), without prescribing the exact exception type."""
+    from whoopmcp.crypto import SealError
+
+    key_v1 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    store = EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=2)
+
+    # Direct save() call must raise (SealError from the crypto layer),
+    # not degrade to a warning
+    with pytest.raises(SealError):
+        store.save(token)
+
+
+def test_lazy_reseal_missing_key_warns_once_with_independent_flag(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test 7: warn-once (D3). Three consecutive load() calls emit exactly one
+    warning. And the Windows mode warning (which uses self._warned) is not
+    suppressed by the missing-key warning (which uses a distinct flag),
+    proving the two flags are independent."""
+    key_v1 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+
+    caplog.set_level(logging.WARNING, logger="whoopmcp.auth")
+    store = EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=2)
+
+    # Three consecutive load() calls
+    store.load()
+    store.load()
+    store.load()
+
+    # Count warnings about missing re-seal key (the new one from this fix).
+    # Before the fix, they would be bare SealErrors, not warnings.
+    # After the fix, they should warn once per store instance, not three times.
+    # Match on "key version 2", not a bare "2": on Windows `_MODES_ENFORCED`
+    # is False, so `save`'s file-permissions warning also fires and embeds the
+    # tmp path -- a path containing the digit 2 would be miscounted here.
+    reseal_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "key version 2" in r.getMessage()
+    ]
+
+    # Only one warning should be emitted (warn-once), not three
+    assert len(reseal_warnings) == 1, (
+        f"expected exactly 1 re-seal warning (warn-once), got {len(reseal_warnings)}: "
+        f"{[r.getMessage() for r in reseal_warnings]}"
+    )
+
+
+def test_lazy_reseal_windows_and_missing_key_warnings_are_independent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test 7 (continued): the Windows mode warning flag (self._warned) and the
+    missing-key re-seal warning flag must be distinct. This test proves it by:
+    1. Mocking the Windows check to enable the Windows warning
+    2. Triggering both conditions
+    3. Asserting both warnings appear (proving one doesn't suppress the other)
+    """
+    if os.name == "nt":
+        pytest.skip("This test is only meaningful on non-Windows (testing the mock)")
+
+    from whoopmcp.crypto import SealError
+
+    key_v1 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+
+    # Mock the Windows detection so save() emits its Windows warning
+    caplog.set_level(logging.WARNING, logger="whoopmcp.auth")
+
+    class MockedStore(EncryptedFileTokenStore):
+        _MODES_ENFORCED = False  # Pretend Windows to trigger that warning
+
+    store = MockedStore(path, keys={1: key_v1}, current_version=2)
+
+    # First save() triggers the Windows warning (and sets _warned=True) --
+    # but per D4, save() must still raise on a missing current key rather
+    # than degrade to a warning, so it also raises SealError here. The
+    # Windows warning fires before that raise (save() logs it before
+    # calling seal()), so the raise doesn't stop us observing it below.
+    with pytest.raises(SealError):
+        store.save(token)
+
+    # Now load() would normally trigger the missing-key re-seal warning
+    store.load()
+
+    # Both warnings should appear (not suppressed by the shared flag)
+    all_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    # We should see:
+    # - One Windows warning (from save)
+    # - One missing-key warning (from load's lazy re-seal attempt)
+    # Matched on substrings specific to each warning's own wording, not a
+    # bare "2" -- tmp_path's own generated name can itself contain a "2"
+    # (e.g. a `pytest-123` numbering), which would make a bare-digit filter
+    # miscount the Windows warning as a reseal warning too.
+    windows_warnings = [r for r in all_warnings if "keyring" in r.getMessage()]
+    reseal_warnings = [r for r in all_warnings if "key version 2" in r.getMessage()]
+
+    assert len(windows_warnings) == 1, (
+        f"expected 1 Windows warning, got {len(windows_warnings)}: "
+        f"{[r.getMessage() for r in windows_warnings]}"
+    )
+    assert len(reseal_warnings) == 1, (
+        f"expected 1 re-seal warning, got {len(reseal_warnings)}: "
+        f"{[r.getMessage() for r in reseal_warnings]}"
+    )
+
+
+def test_genuine_decrypt_failure_still_raises_autherror(tmp_path: Path) -> None:
+    """Test 8: no regression on a genuine decrypt failure. A record whose own
+    version's key is wrong (or the ciphertext is tampered with) still raises
+    AuthError, not SealError and not a silent success.
+
+    This is different from the missing current_version case: here, we're trying
+    to decrypt a record sealed under v1, we have the v1 key, but the ciphertext
+    is tampered with. This is NOT the missing-key-during-re-seal case; it's a
+    genuine decrypt failure and must still raise."""
+    key_v1 = os.urandom(32)
+    path = tmp_path / "token.json"
+    token = Token("a", expires_at=1234.0, refresh_token="r")
+
+    # Save under v1
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(token)
+
+    # Tamper with ciphertext on disk
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    ct = bytearray(base64.b64decode(on_disk["ct"]))
+    ct[0] ^= 0xFF
+    on_disk["ct"] = base64.b64encode(bytes(ct)).decode("ascii")
+    path.write_text(json.dumps(on_disk), encoding="utf-8")
+
+    # Load with v1 key present (not missing) -- but the ciphertext is corrupt
+    store = EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1)
+
+    # Must raise AuthError (decrypt failure), not SealError
+    with pytest.raises(AuthError, match="failed to decrypt"):
+        store.load()

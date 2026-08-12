@@ -602,6 +602,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #103: `EncryptedFileTokenStore.load`'s lazy re-seal no longer leaks a
+  raw `crypto.SealError` when the current key version's key is missing --
+  e.g. a half-completed key rotation, or a hand-built `Config` that skips
+  `Config.from_env`'s guard. The record still decrypted fine under its own
+  (older) key, so `load` now serves it unrotated and logs a warning naming
+  the missing version, once per store instance, rather than turning a
+  misconfigured key set into an outage; the repo owner chose availability
+  here deliberately. The warning uses its own flag, distinct from `save`'s
+  existing Windows-file-permissions warning, so neither can suppress the
+  other. A direct `save()` call -- as `exchange_code` makes right after a
+  token exchange -- still raises on the same failure, since silently
+  failing to persist a freshly obtained token would lose it.
 - Issue #100: after `erase-member` deletes a member's data, the database file is
   now compacted via `VACUUM` so the deleted rows' bytes are overwritten in freed
   pages, rather than remaining recoverable in the file. `PRIVACY.md` promises
