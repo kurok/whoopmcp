@@ -19,6 +19,7 @@ import pytest
 
 from whoopmcp.store import (
     CURRENT_SCHEMA_VERSION,
+    _is_special_sqlite_path,
     export_member_data,
     get_body_measurement,
     get_body_measurement_updated_at,
@@ -1351,7 +1352,33 @@ def test_an_unchmoddable_directory_does_not_prevent_the_store_opening(
     assert refused, "no chmod was even attempted -- the D3 tolerance path is untested"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    [
+        (":memory:", True),
+        ("file::memory:?cache=shared", True),
+        ("file:cache.sqlite3", True),
+        ("cache.sqlite3", False),
+        ("/var/lib/whoopmcp/cache.sqlite3", False),
+        # '?' is a legal POSIX filename character, so a state directory
+        # carrying one must NOT be mistaken for a URI and skipped.
+        ("/var/lib/whoop?v=1/cache.sqlite3", False),
+    ],
+)
+def test_special_sqlite_path_classification(candidate: str, expected: bool) -> None:
+    """The classification itself, with no filesystem or sqlite involved.
+
+    Kept separate from the end-to-end test below so the URI case is still
+    covered on Windows, where that string cannot be opened at all (':' and
+    '?' are illegal in Windows filenames) and the end-to-end test is skipped.
+    """
+    assert _is_special_sqlite_path(candidate) is expected
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows uses ACLs, not POSIX modes -- and '?' is an illegal filename char there",
+)
 def test_a_str_path_containing_a_question_mark_is_still_secured() -> None:
     """``?`` is a legal POSIX filename character, so a state directory
     containing one must not be mistaken for a sqlite URI and skipped.
@@ -1377,7 +1404,24 @@ def test_a_str_path_containing_a_question_mark_is_still_secured() -> None:
     assert dir_mode & (stat.S_IRWXG | stat.S_IRWXO) == 0, f"dir is mode {dir_mode:o}"
 
 
-@pytest.mark.parametrize("special_path", [":memory:", "file::memory:?cache=shared"])
+@pytest.mark.parametrize(
+    "special_path",
+    [
+        ":memory:",
+        pytest.param(
+            "file::memory:?cache=shared",
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason=(
+                    "sqlite3.connect is called without uri=True, so this string is a "
+                    "literal filename -- and ':' and '?' are illegal in Windows "
+                    "filenames, so the connect itself fails there before anything "
+                    "this test is about can be observed"
+                ),
+            ),
+        ),
+    ],
+)
 def test_special_sqlite_paths_are_left_entirely_alone(
     special_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
