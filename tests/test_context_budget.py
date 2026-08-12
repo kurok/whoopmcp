@@ -713,6 +713,20 @@ async def test_summarize_period_within_ceiling(
     assert estimate_tokens(result) <= TOOL_CEILINGS["summarize_period"]
 
 
+#: #54: metric_trend's ceiling has to be *protective*, not merely honest.
+#: Before #54 its rolling_7d/30d/90d series returned one point per calendar
+#: day with no cap, so the entry below was 32000 -- the measured worst case
+#: of an unusable payload. #54 downsamples those series (daily/weekly/monthly
+#: buckets, decimated, resolution declared in the response), which bounds the
+#: worst case for *any* range at roughly 3,400 tokens, so the ceiling now has
+#: to sit in the same order of magnitude as the other analysis tools
+#: (summarize_period 850, correlate_metrics 700, compare_periods 1300,
+#: whoop_timeseries 4500). This bound is asserted separately from the
+#: measurement below: a future regression that re-inflated the response
+#: *and* raised the ceiling to match would otherwise still pass.
+_METRIC_TREND_PROTECTIVE_CEILING = 5000
+
+
 async def test_metric_trend_within_ceiling(
     app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
@@ -730,6 +744,12 @@ async def test_metric_trend_within_ceiling(
         app_context,
     )
 
+    # #54: this >2-year worst case is well past the point where the rolling
+    # series have to be bucketed, so the response must say which resolution
+    # it is at -- see tests/test_metric_trend_rolling.py for the scheme
+    # itself.
+    assert result["rolling_resolution"] in {"weekly", "monthly"}
+    assert TOOL_CEILINGS["metric_trend"] <= _METRIC_TREND_PROTECTIVE_CEILING
     assert estimate_tokens(result) <= TOOL_CEILINGS["metric_trend"]
 
 

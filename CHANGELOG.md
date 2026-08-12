@@ -544,6 +544,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Issue #54: `metric_trend`'s `rolling_7d`/`rolling_30d`/`rolling_90d` are now
+  downsampled -- decimated, never averaged -- to whichever of `daily`
+  (step 1 calendar day), `weekly` (7), or `monthly` (30) resolution keeps
+  every series within a shared 120-point cap, chosen once from the longest
+  of the three series and applied to all of them. Every returned point is
+  still a real rolling mean `analysis.trend()` actually computed for that
+  real date; the most recent point is always kept. The response gains
+  `rolling_resolution` (always present) and, only if even monthly overflows
+  the cap, `rolling_truncated` plus an explanatory `rolling_note` --
+  distinguishable from the pre-existing record-count `truncated`/`note`
+  pair, which is unrelated and unchanged. A short range is unaffected:
+  `rolling_resolution` is `"daily"` and the response is otherwise identical
+  to before. `TOOL_CEILINGS["metric_trend"]` drops from an honestly-measured
+  but unprotective 32000 to a measured 5000, now comparable in order of
+  magnitude to the other analysis tools' ceilings.
 - Issue #67: relocated `webhook_processor.py`'s three raw `conn.execute`
   calls against entity tables (a stored record's `updated_at`, a sleep's
   `cycle_id`, and the `deleted_at` soft-delete write) into `store.py` as
