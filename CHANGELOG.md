@@ -602,6 +602,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #109: `_execute_scoped`'s member-equality check now sits behind a
+  new `_statement_restricts_to_one_member` helper instead of a bare
+  `_MEMBER_EQUALITY_PREDICATE.search(sql)`, closing three ways a
+  `whoop_user_id = ?` fragment could satisfy the requirement without
+  actually restricting the statement to one member: sitting in a `SET`
+  assignment (`UPDATE recoveries SET whoop_user_id = ? WHERE whoop_user_id
+  IS NOT NULL` reassigned every member's rows to one caller-chosen id), a
+  `--`/`/* */` comment, or a string literal -- plus a subquery in `SET`
+  supplying the fragment while the outer statement stays unfiltered. The
+  helper searches a sanitised copy (comments and string literals stripped)
+  and requires the match to fall after the first top-level `WHERE`; the SQL
+  executed against sqlite is never altered. No statement kind gains or
+  loses an exemption -- the `INSERT` exemption and the retention sweep's
+  waiver are unchanged -- and the residual this does not close (a fragment
+  `OR`-ed with a wider clause after the `WHERE`, and per-statement ambiguity
+  when two tenant-scoped tables are named) stays documented, not papered
+  over, on `_MEMBER_EQUALITY_PREDICATE`.
 - Issue #102: `MCPTokenVerifier.verify_token` now rejects a token whose
   issuer is not one of `MCPAuthConfig.authorization_servers`, closing an
   audience-is-right-but-issuer-is-untrusted substitution -- previously the

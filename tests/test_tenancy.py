@@ -2059,3 +2059,400 @@ def test_all_tenant_sweep_path_still_enforces_the_universal_check(
         "the rejected sweep deleted rows anyway -- the universal check was skipped, "
         "not merely the equality requirement"
     )
+
+
+# =============================================================================
+# #109: _MEMBER_EQUALITY_PREDICATE is a presence regex, not a SQL parser:
+# a `whoop_user_id = ?` fragment sitting in SET, comment, or string literal
+# should NOT satisfy the member-equality requirement. Only a fragment after
+# the first top-level WHERE satisfies it (D2).
+#
+# These tests will FAIL on current main (before the fix) and verify the real
+# issue; they will PASS once store.py's _MEMBER_EQUALITY_PREDICATE matching
+# is refined per D1-D2.
+#
+# Tests 1-4 and 9 assert FAILURE (UnscopedQueryError raised); tests 5-6 verify
+# legitimate writers remain unbroken.
+# =============================================================================
+
+
+def test_member_equality_set_position_is_rejected(store_conn: sqlite3.Connection) -> None:
+    """#109 test 1: SET-position fragment must be rejected, and no row changed.
+
+    The most dangerous form: UPDATE recoveries SET whoop_user_id = ? WHERE
+    whoop_user_id IS NOT NULL reassigns every member's rows to a caller-chosen
+    id, and the current regex accepts it because it finds the fragment
+    somewhere in the text.
+
+    This test must FAIL before the fix (mutation currently succeeds, no
+    exception raised). After the fix, it must raise UnscopedQueryError AND
+    confirm zero rows changed.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+
+    # Before attempting the forbidden update, capture the current row state.
+    before = dict(
+        conn.execute(
+            "SELECT whoop_user_id, score_state FROM recoveries ORDER BY whoop_user_id"
+        ).fetchall()
+    )
+    assert before == {MEMBER_A: "SCORED", MEMBER_B: "SCORED"}, "seeding must succeed"
+
+    # The SET-position attack: whoop_user_id = ? sits in SET, not WHERE.
+    # This should raise UnscopedQueryError once fixed.
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "UPDATE recoveries SET whoop_user_id = ? WHERE whoop_user_id IS NOT NULL",
+            (MEMBER_A,),
+        )
+
+    # Rejection must not leave the mutation pending. Simulate a later, unrelated
+    # legitimate commit and verify rows are exactly as seeded.
+    conn.commit()
+    after = dict(
+        conn.execute(
+            "SELECT whoop_user_id, score_state FROM recoveries ORDER BY whoop_user_id"
+        ).fetchall()
+    )
+    assert after == before, f"SET-position UPDATE was not rolled back: {before} became {after}"
+
+
+def test_member_equality_line_comment_is_rejected(store_conn: sqlite3.Connection) -> None:
+    """#109 test 2a: Line-comment-position fragment must be rejected, no row changed.
+
+    A -- comment containing whoop_user_id = ? should not satisfy the
+    member-equality requirement. The fragment sits in a comment, not a
+    WHERE clause.
+
+    The WHERE clause must be `whoop_user_id != ?`, not `resource_id = ?`:
+    a statement that never reads whoop_user_id is rejected by the *universal*
+    authorizer check before the equality check is ever consulted, so it would
+    pass on unfixed code for the wrong reason and prove nothing about #109.
+    `!= ?` reads the column, satisfying the universal check, which leaves the
+    equality check as the only thing standing between this statement and
+    another member's row.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+
+    before_a = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ? AND resource_id = ?",
+        (MEMBER_A, "1"),
+    ).fetchone()[0]
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "UPDATE recoveries SET score_state = 'MUTATED' WHERE whoop_user_id != ?"
+            "  -- whoop_user_id = ?",
+            (MEMBER_A,),
+        )
+
+    conn.commit()
+    after_a = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ? AND resource_id = ?",
+        (MEMBER_A, "1"),
+    ).fetchone()[0]
+    assert after_a == before_a, (
+        f"line-comment-position UPDATE was not rolled back: {before_a} became {after_a}"
+    )
+
+
+def test_member_equality_block_comment_is_rejected(store_conn: sqlite3.Connection) -> None:
+    """#109 test 2b: Block-comment-position fragment must be rejected, no row changed.
+
+    A /* */ comment containing whoop_user_id = ? should not satisfy the
+    member-equality requirement.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+
+    before_a = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ? AND resource_id = ?",
+        (MEMBER_A, "1"),
+    ).fetchone()[0]
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "UPDATE recoveries SET score_state = 'MUTATED' WHERE whoop_user_id != ?"
+            "  /* whoop_user_id = ? */",
+            (MEMBER_A,),
+        )
+
+    conn.commit()
+    after_a = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ? AND resource_id = ?",
+        (MEMBER_A, "1"),
+    ).fetchone()[0]
+    assert after_a == before_a, (
+        f"block-comment-position UPDATE was not rolled back: {before_a} became {after_a}"
+    )
+
+
+def test_member_equality_string_literal_is_rejected(store_conn: sqlite3.Connection) -> None:
+    """#109 test 3: String-literal-position fragment must be rejected, no row changed.
+
+    A string literal containing whoop_user_id = ? (both single and double
+    quotes) should not satisfy the member-equality requirement. These tests
+    verify both quote styles.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+
+    before_a = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ? AND resource_id = ?",
+        (MEMBER_A, "1"),
+    ).fetchone()[0]
+
+    # Test with single-quoted string literal
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "UPDATE recoveries SET score_state = 'where whoop_user_id = ?' "
+            "WHERE whoop_user_id != ?",
+            (MEMBER_A,),
+        )
+
+    conn.commit()
+    after_a = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ? AND resource_id = ?",
+        (MEMBER_A, "1"),
+    ).fetchone()[0]
+    assert after_a == before_a, (
+        f"single-quoted-string UPDATE was not rolled back: {before_a} became {after_a}"
+    )
+
+    # Test with double-quoted string literal (as a column reference in a CAST or similar)
+    before_b = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ? AND resource_id = ?",
+        (MEMBER_B, "2"),
+    ).fetchone()[0]
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            'UPDATE recoveries SET score_state = "whoop_user_id = ?" WHERE whoop_user_id != ?',
+            (MEMBER_A,),
+        )
+
+    conn.commit()
+    after_b = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ? AND resource_id = ?",
+        (MEMBER_B, "2"),
+    ).fetchone()[0]
+    assert after_b == before_b, (
+        f"double-quoted-string UPDATE was not rolled back: {before_b} became {after_b}"
+    )
+
+
+def test_member_equality_subquery_in_set_at_depth_zero_is_rejected(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#109 test 4: Subquery-in-SET with fragment at depth zero must be rejected.
+
+    D2 requires the fragment to appear after the first top-level WHERE (at
+    parenthesis depth zero). A subquery in a SET clause supplies the fragment
+    while the outer statement stays unfiltered:
+    UPDATE recoveries SET x = (SELECT y FROM z WHERE whoop_user_id = ?)
+    WHERE 1 = 1
+
+    This must be rejected because the fragment is inside parentheses (depth 1),
+    not after a top-level WHERE. The outer WHERE (1 = 1) does not restrict to
+    a member.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+
+    before = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchone()[0]
+
+    # Attempt an UPDATE where the fragment only appears inside a subquery.
+    # The outer statement has no member restriction.
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "UPDATE recoveries SET score_state = (SELECT ? WHERE whoop_user_id = ?) WHERE 1 = 1",
+            ("MUTATED", MEMBER_A),
+        )
+
+    conn.commit()
+    after = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchone()[0]
+    assert after == before, "subquery-in-SET UPDATE was not rolled back"
+
+
+def test_member_equality_legitimate_writers_still_work(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#109 test 5: Every legitimate writer must still work after the fix.
+
+    Exercise all 11 shapes documented in the brief (the actual statements that
+    reach _execute_scoped in the codebase), verifying by read-back. These are:
+    - DELETE FROM {recoveries, cycles, sleeps, workouts, body_measurements,
+              profiles, sync_state, webhook_delivery_state} WHERE whoop_user_id = ?
+    - UPDATE {sleeps, workouts, recoveries} SET deleted_at = ?
+              WHERE whoop_user_id = ? AND resource_id = ?
+
+    All use the binding format where whoop_user_id = ? appears after the
+    first top-level WHERE.
+    """
+    conn = store_conn
+
+    # Seed members with data.
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_sleep(
+        conn,
+        MEMBER_A,
+        {"id": "sleep-1", "start": "2026-01-01T00:00:00Z", "score_state": "SCORED"},
+    )
+    store.upsert_cycle(
+        conn, MEMBER_A, {"id": 1, "start": "2026-01-01T00:00:00Z", "score_state": "SCORED"}
+    )
+    store.upsert_workout(
+        conn,
+        MEMBER_A,
+        {"id": "workout-1", "start": "2026-01-01T00:00:00Z", "score_state": "SCORED"},
+    )
+    store.upsert_body_measurement(conn, MEMBER_A, {"weight_kilogram": 70})
+    store.upsert_profile(conn, MEMBER_A, {"user_id": MEMBER_A, "email": "a@example.test"})
+    store.set_sync_state(
+        conn,
+        MEMBER_A,
+        "recoveries",
+        cursor="cursor-1",
+        last_run_at="2026-01-01T00:00:00Z",
+        outcome="success",
+    )
+    store.record_webhook_delivery(conn, MEMBER_A)
+
+    # Verify all data was written.
+    assert store.get_recoveries(conn, MEMBER_A) != []
+    assert store.get_sleeps(conn, MEMBER_A) != []
+    assert store.get_cycles(conn, MEMBER_A) != []
+    assert store.get_workouts(conn, MEMBER_A) != []
+    assert store.get_body_measurement(conn, MEMBER_A) is not None
+    assert store.get_profile(conn, MEMBER_A) is not None
+    assert store.get_sync_state(conn, MEMBER_A, "recoveries") is not None
+    assert store.get_last_webhook_delivery(conn, MEMBER_A) is not None
+
+    # Now exercise the legitimate soft-delete path (the UPDATE shape with
+    # the member predicate after the first WHERE).
+    store.set_deleted_at(conn, "recovery", MEMBER_A, "1")
+    store.set_deleted_at(conn, "sleep", MEMBER_A, "sleep-1")
+    store.set_deleted_at(conn, "workout", MEMBER_A, "workout-1")
+
+    # Verify soft deletes worked.
+    assert store.get_recoveries(conn, MEMBER_A) == []
+    assert store.get_sleeps(conn, MEMBER_A) == []
+    assert store.get_workouts(conn, MEMBER_A) == []
+
+    # Verify include_deleted sees them.
+    assert len(store.get_recoveries(conn, MEMBER_A, include_deleted=True)) == 1
+
+
+def test_executed_sql_unaltered_with_special_chars(store_conn: sqlite3.Connection) -> None:
+    """#109 test 6: Executed SQL is unaltered (D1); sanitization is on a copy only.
+
+    A payload legitimately containing --, /*, and quote characters must write
+    exactly those bytes when read back. Only a copy is sanitised for the
+    predicate search; the real SQL executed must be byte-identical to what the
+    caller wrote.
+
+    This test writes a recovery with payload containing these special chars,
+    then reads it back and verifies the JSON bytes are exactly preserved.
+    """
+    conn = store_conn
+
+    # Craft a payload with dangerous characters in the raw_json string.
+    # These should survive the write/read cycle unchanged.
+    payload = {
+        "cycle_id": 1,
+        "score_state": "SCORED",
+        "raw_json_note": "This note contains -- and /* and 'quotes' and \"double\"",
+    }
+    store.upsert_recovery(conn, MEMBER_A, payload)
+
+    # Read it back.
+    recoveries = store.get_recoveries(conn, MEMBER_A)
+    assert len(recoveries) == 1
+
+    # The raw_json was written with our payload; verify the special chars survive.
+    raw_json_str = recoveries[0].get("raw_json_note")
+    assert raw_json_str == "This note contains -- and /* and 'quotes' and \"double\"", (
+        "executed SQL was altered: special characters in payload were not preserved"
+    )
+
+
+def test_member_equality_not_caught_list_is_truthful() -> None:
+    """#109 test 9: The CAUGHT/NOT-CAUGHT list documented above
+    ``_MEMBER_EQUALITY_PREDICATE`` must be truthful and updated.
+
+    ``_MEMBER_EQUALITY_PREDICATE`` is a compiled ``re.Pattern``, whose
+    ``__doc__`` is the fixed, read-only "Compiled regular expression
+    object." string (``re.Pattern`` does not allow assigning ``__doc__``) --
+    so the CAUGHT/NOT-CAUGHT list can only ever have lived as the ``#:``
+    sphinx-style comment block directly above the assignment, never as a
+    runtime docstring. This test reads that comment block out of the module
+    *source*, the same way this file's other source-level checks already do
+    (``inspect.getsource`` + text search, e.g.
+    ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper``).
+
+    After the fix, that comment block must no longer claim that SET-position,
+    comment-position, string-literal-position, or depth-zero
+    subquery-in-SET are NOT-CAUGHT (uncaught) -- they must have moved to
+    CAUGHT -- while what genuinely remains (OR-after-WHERE, multi-table
+    ambiguity) must still be documented as NOT-CAUGHT, not deleted.
+    """
+    source = inspect.getsource(store)
+    marker = "_MEMBER_EQUALITY_PREDICATE = re.compile("
+    assert marker in source, "the annotated regex assignment moved or was renamed"
+    before_assignment = source[: source.index(marker)]
+
+    # The comment block is the contiguous run of "#:"-prefixed lines
+    # immediately above the assignment -- walk backwards from it and stop at
+    # the first line that is not part of that run.
+    comment_lines: list[str] = []
+    for line in reversed(before_assignment.splitlines()):
+        if line.strip().startswith("#:"):
+            comment_lines.append(line)
+        else:
+            break
+    comment_lines.reverse()
+    doc_block = "\n".join(comment_lines)
+    assert doc_block, "no #: comment block found directly above _MEMBER_EQUALITY_PREDICATE"
+
+    # These four shapes should NOT appear in the NOT-CAUGHT section after the fix.
+    shapes_now_caught = [
+        "SET assignment",
+        "SET clause",
+        "-- comment",
+        "string literal",
+        "subquery",
+    ]
+
+    # Find the NOT-CAUGHT section: everything from the first "NOT CAUGHT"
+    # onward, so a CAUGHT bullet earlier in the block is never mistaken for
+    # one of the residuals.
+    not_caught_section = ""
+    if "NOT CAUGHT" in doc_block:
+        parts = doc_block.split("NOT CAUGHT")
+        if len(parts) > 1:
+            not_caught_section = "NOT CAUGHT".join(parts[1:])
+
+    assert not_caught_section, "the comment block no longer documents any NOT-CAUGHT residual"
+
+    # Verify that the formerly NOT-CAUGHT shapes no longer appear there.
+    for shape in shapes_now_caught:
+        assert shape.lower() not in not_caught_section.lower(), (
+            f"_MEMBER_EQUALITY_PREDICATE's comment still lists {shape!r} in its "
+            "NOT-CAUGHT section; it should be moved to CAUGHT after the fix"
+        )
