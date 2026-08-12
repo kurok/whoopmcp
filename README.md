@@ -65,9 +65,11 @@ Requires **Python 3.13 or 3.14** — the two newest stable releases, which are
 the two CI tests.
 
 ```bash
-uvx whoopmcp          # run without installing
-# or
-pip install whoopmcp
+git clone https://github.com/kurok/whoopmcp
+cd whoopmcp
+uv venv --python 3.14
+source .venv/bin/activate
+uv pip install -e .
 ```
 
 ## Setup
@@ -113,8 +115,9 @@ via `whoop_complete_login`.
 | `WHOOP_CLIENT_SECRET` | yes | — | OAuth client secret |
 | `WHOOP_REDIRECT_URI` | yes | — | Must match a registered redirect URL exactly |
 | `WHOOPMCP_SCOPES` | no | all read scopes + `offline` | Space-separated scope list |
-| `WHOOPMCP_TOKEN_BACKEND` | no | `file` | `file` or `keyring` |
+| `WHOOPMCP_TOKEN_BACKEND` | no | `file` | `file`, `keyring`, or `encrypted-file` |
 | `WHOOPMCP_STATE_DIR` | no | `~/.local/state/whoopmcp` | Token and cache location |
+| `WHOOPMCP_TRANSPORT` | no | `stdio` | `stdio` or `streamable-http` — local vs. hosted mode (#27) |
 | `WHOOPMCP_CACHE` | no | `false` | Cache responses on disk |
 | `WHOOPMCP_BACKFILL_FLOOR_DATE` | no | — | ISO 8601 lower bound for `whoopmcp backfill`; unset walks until history is exhausted |
 | `WHOOPMCP_TIMEOUT` | no | `30` | Per-request timeout, seconds |
