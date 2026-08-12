@@ -62,6 +62,7 @@ import json
 import sqlite3
 import time
 from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -450,16 +451,31 @@ def test_completely_unfiltered_update_with_no_where_clause_fails_closed() -> Non
 
 def test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper() -> None:
     """Structural half of the DB-level guarantee: every ``conn.execute``/
-    ``.executemany`` call in store.py must live inside ``_execute_scoped``
-    itself, ``_migrate``, or ``open_store`` (migration/PRAGMA bootstrap code,
-    which never touches an entity table) -- otherwise a future store.py
-    function could quietly route around the authorizer-backed check entirely.
-    AST-based, not a text grep, so it can't be fooled by a comment or a
-    string literal containing "conn.execute(".
+    ``.executemany`` call in store.py must live inside
+    ``_execute_with_tenancy_authorizer`` itself, ``_migrate``, or
+    ``open_store`` (migration/PRAGMA bootstrap code, which never touches an
+    entity table) -- otherwise a future store.py function could quietly route
+    around the authorizer-backed check entirely. AST-based, not a text grep,
+    so it can't be fooled by a comment or a string literal containing
+    "conn.execute(".
+
+    #99 moved the executing statement out of ``_execute_scoped`` and into
+    ``_execute_with_tenancy_authorizer``, which ``_execute_scoped`` and the
+    all-tenant sweep path both call. The allowlist names that function instead
+    of ``_execute_scoped``, and is deliberately no longer than it was: the
+    invariant tightened rather than loosened, since the *only* function in
+    store.py permitted to execute a statement is now the one that installs the
+    authorizer and applies the universal tenancy check. Neither entry point
+    can skip it -- ``_execute_scoped`` included -- and #99's sweep path is
+    therefore structurally incapable of being the "opt-out that skipped the
+    authorizer" its own test (``test_all_tenant_sweep_path_still_enforces_the
+    _universal_check``) checks for behaviourally. Which functions may *call*
+    the executor is pinned separately, by
+    ``test_only_the_two_named_guard_entry_points_execute_sql``.
     """
     source = inspect.getsource(store)
     tree = ast.parse(source)
-    allowed = {"_execute_scoped", "_migrate", "open_store"}
+    allowed = {"_execute_with_tenancy_authorizer", "_migrate", "open_store"}
     violations: list[str] = []
 
     for node in ast.walk(tree):
@@ -474,8 +490,8 @@ def test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper() -> None:
                 violations.append(f"{node.name} (line {inner.lineno})")
 
     assert violations == [], (
-        "store.py calls .execute()/.executemany() outside _execute_scoped, "
-        f"_migrate, or open_store: {violations}"
+        "store.py calls .execute()/.executemany() outside "
+        f"_execute_with_tenancy_authorizer, _migrate, or open_store: {violations}"
     )
 
 
@@ -1466,3 +1482,576 @@ async def test_marker_detector_flags_a_deliberately_unprotected_tool(config: Con
             "the marker-detection check itself is broken: it should have "
             "caught this deliberately unprotected tool"
         )
+
+
+# =============================================================================
+# #99: _execute_scoped's restrictive-equality requirement must also cover
+# UPDATE and DELETE -- not only SELECT.
+#
+# The pre-#99 guard required, for a non-SELECT statement, only that a touched
+# tenant-scoped table's `whoop_user_id` column be *read at all*. So
+# `WHERE whoop_user_id != ?`, `> ?` or `IS NOT NULL` satisfied it on the
+# mutation/deletion path, while the same predicate on a SELECT was refused --
+# the docstring's "as a restrictive equality predicate" claim held for reads
+# only, on the lower-impact half.
+#
+# Scope of what is pinned here, deliberately narrow (see the issue's own
+# decisions):
+#
+# - INSERT is exempt, permanently. An INSERT has no WHERE clause at all; it
+#   supplies `whoop_user_id` as a *value*. Requiring an equality predicate
+#   there is not merely wrong but structurally impossible, and would break
+#   every upsert in store.py. `test_every_store_writer_still_works` below is
+#   the regression guard for exactly that: it exercises every writer, so a
+#   fix that "completes the job" by extending the requirement to INSERT
+#   fails loudly rather than at a user's first sync.
+# - `enforce_retention` is the codebase's one deliberate all-tenant sweep and
+#   keeps needing to sweep all tenants, so it gets a single, distinctly-named
+#   internal path past the *equality* requirement. Two tests pin that path
+#   honest: it has exactly one caller (asserted from source, the idiom
+#   `test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper` and
+#   tests/test_module_map.py already use), and it still enforces the
+#   universal "must read whoop_user_id" check -- an opt-out that skipped the
+#   authorizer check entirely would remove the real tenancy control while
+#   appearing to add one.
+# =============================================================================
+
+#: Name of the singular all-tenant sweep path (#99's D2). Pinned in one place
+#: so the two tests below that reference it by name -- the source-level
+#: single-caller assertion and the "still enforces the universal check" one --
+#: move together if it is ever renamed. Deliberately NOT a boolean parameter
+#: on ``_execute_scoped``: a keyword like ``allow_all_tenants=True`` would
+#: make bypassing a fail-closed control a one-word change available at every
+#: call site.
+_SWEEP_PATH_NAME = "_execute_all_tenant_sweep"
+
+#: ``whoop_user_id`` predicates that *read* the column -- so they satisfy the
+#: universal authorizer check -- while restricting the statement to no single
+#: member. Each is the (id, SQL fragment, params) triple the two parametrized
+#: tests below substitute into an UPDATE and a DELETE respectively.
+_NON_RESTRICTIVE_PREDICATES: list[tuple[str, str, tuple[Any, ...]]] = [
+    ("not_equal", "whoop_user_id != ?", (MEMBER_B,)),
+    ("greater_than", "whoop_user_id > ?", (0,)),
+    ("is_not_null", "whoop_user_id IS NOT NULL", ()),
+]
+_PREDICATE_IDS = [case[0] for case in _NON_RESTRICTIVE_PREDICATES]
+
+_HACK_MARKER = "NON-RESTRICTIVE-HACK"
+
+
+def _scoped_table_column(table_name: str) -> str:
+    """A writable, non-key column on ``table_name``, derived from store.py's
+    own ``_RETENTION_TIMESTAMP_COLUMNS`` rather than hand-listed here -- every
+    ``_TENANT_SCOPED_TABLES`` member has an entry there (``enforce_retention``
+    would raise ``KeyError`` otherwise), so a ninth tenant-scoped table needs
+    no edit in this file."""
+    return store._RETENTION_TIMESTAMP_COLUMNS[table_name]
+
+
+@pytest.mark.parametrize(
+    ("predicate_id", "predicate", "predicate_params"),
+    _NON_RESTRICTIVE_PREDICATES,
+    ids=_PREDICATE_IDS,
+)
+@pytest.mark.parametrize("table_name", sorted(store._TENANT_SCOPED_TABLES))
+def test_update_with_a_non_restrictive_whoop_user_id_predicate_is_rejected(
+    store_conn: sqlite3.Connection,
+    table_name: str,
+    predicate_id: str,
+    predicate: str,
+    predicate_params: tuple[Any, ...],
+) -> None:
+    """#99 test 1: an ``UPDATE`` whose ``whoop_user_id`` predicate is not a
+    restrictive equality must be refused, for every tenant-scoped table.
+
+    Each of these statements *reads* ``whoop_user_id`` (so the universal
+    check is satisfied and cannot be what rejects them), yet none of them
+    pins the statement to one member -- ``!= ?`` and ``> ?`` and
+    ``IS NOT NULL`` all span the whole table. Before #99 they were accepted
+    on the write path and the mutation stood.
+
+    Parametrized off ``store._TENANT_SCOPED_TABLES`` directly, not a
+    hand-written table list, so a table added to that frozenset later is
+    covered here automatically (its seeder is looked up in
+    ``_UNSCOPED_WRITE_TARGETS`` above, whose own guard test already pins that
+    dict's keys to the same frozenset, so a missing entry fails loudly).
+    """
+    del predicate_id
+    column = _scoped_table_column(table_name)
+    _, seed = _UNSCOPED_WRITE_TARGETS[table_name]
+    conn = store_conn
+    seed(conn)
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            f"UPDATE {table_name} SET {column} = '{_HACK_MARKER}' WHERE {predicate}",  # noqa: S608 -- table_name comes from store._TENANT_SCOPED_TABLES, column from store._RETENTION_TIMESTAMP_COLUMNS, predicate from the fixed list above; never external input
+            predicate_params,
+        )
+
+    # Rejection must also not leave the mutation pending for a later,
+    # unrelated commit to persist (#69's rollback property, on this path too).
+    conn.commit()
+    hacked = conn.execute(
+        f"SELECT COUNT(*) FROM {table_name} WHERE {column} = ?",  # noqa: S608 -- same fixed sources, test-only
+        (_HACK_MARKER,),
+    ).fetchone()[0]
+    assert hacked == 0, (
+        f"{table_name}: a non-restrictive UPDATE predicate ({predicate}) mutated rows"
+    )
+
+
+@pytest.mark.parametrize(
+    ("predicate_id", "predicate", "predicate_params"),
+    _NON_RESTRICTIVE_PREDICATES,
+    ids=_PREDICATE_IDS,
+)
+@pytest.mark.parametrize("table_name", sorted(store._TENANT_SCOPED_TABLES))
+def test_delete_with_a_non_restrictive_whoop_user_id_predicate_is_rejected(
+    store_conn: sqlite3.Connection,
+    table_name: str,
+    predicate_id: str,
+    predicate: str,
+    predicate_params: tuple[Any, ...],
+) -> None:
+    """#99 test 2: the same for ``DELETE`` -- the highest-impact form of the
+    gap, since a swept row is gone rather than merely overwritten.
+
+    Note this is the shape ``enforce_retention`` legitimately needs
+    (``whoop_user_id IS NOT NULL AND <age column> < ?``), which is why #99
+    gives that one function its own named path instead of leaving the check
+    loose for everybody. Reaching a scoped table through plain
+    ``_execute_scoped`` with such a predicate -- as any other caller would --
+    must fail.
+    """
+    del predicate_id
+    _, seed = _UNSCOPED_WRITE_TARGETS[table_name]
+    conn = store_conn
+    seed(conn)
+    before = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]  # noqa: S608 -- table_name from store._TENANT_SCOPED_TABLES
+    assert before == 1, f"{table_name}: seeder must leave exactly one row to be deleted"
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            f"DELETE FROM {table_name} WHERE {predicate}",  # noqa: S608 -- table_name from store._TENANT_SCOPED_TABLES, predicate from the fixed list above
+            predicate_params,
+        )
+
+    conn.commit()
+    after = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]  # noqa: S608 -- same fixed source, test-only
+    assert after == 1, (
+        f"{table_name}: a non-restrictive DELETE predicate ({predicate}) removed rows"
+    )
+
+
+def test_rejected_write_rolls_back_instead_of_leaving_a_partial_write(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#99 test 3: the rollback property #69 established must survive #99's
+    tightening, for a rejected statement that would have touched *several
+    members'* rows.
+
+    Unlike the two tests above this one already passes before #99 (the
+    WHERE-less UPDATE is caught by the universal check, which #99 must leave
+    exactly as it is) -- it is here as the non-regression half: a fix that
+    tightened the predicate rules but disturbed the rollback would show up
+    here rather than only in the two new-behaviour tests.
+
+    A non-SELECT statement is already fully executed by the time the
+    authorizer's findings are inspected (sqlite3 steps it to completion
+    inside one ``execute()``), so raising alone would leave a pending change
+    that a later, unrelated ``conn.commit()`` silently persists. Both
+    members' rows must read exactly as seeded after that later commit --
+    "no partial write", not merely "an exception was raised".
+    """
+    conn = store_conn
+    _seed_recovery(conn, MEMBER_A, "member-a-tag")
+    _seed_recovery(conn, MEMBER_B, "member-b-tag")
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(conn, "UPDATE recoveries SET score_state = 'PENDING_SCORE'")
+
+    # A later, unrelated legitimate write commits the connection.
+    store.upsert_profile(conn, MEMBER_A, {"user_id": MEMBER_A, "email": "a@example.test"})
+    conn.commit()
+
+    states = conn.execute("SELECT whoop_user_id, score_state FROM recoveries ORDER BY 1").fetchall()
+    assert states == [(MEMBER_A, "SCORED"), (MEMBER_B, "SCORED")], (
+        "the rejected cross-member UPDATE left a partial write behind"
+    )
+
+
+def test_every_store_writer_still_works(store_conn: sqlite3.Connection) -> None:
+    """#99 test 4: the regression guard for the INSERT exemption.
+
+    Every write path in store.py, exercised end to end and checked by its
+    read-back -- the upserts (whose ``INSERT ... ON CONFLICT`` statements
+    have no WHERE clause and can never carry an equality predicate), the
+    identity/audit writers, the webhook-event state transitions, the
+    soft-delete UPDATE for all three resources it supports, and both
+    erasure paths. Not a sample: if #99's tightening reaches INSERT, or
+    catches a legitimate equality-predicated UPDATE/DELETE, this test fails
+    rather than the failure surfacing at a user's first sync.
+    """
+    conn = store_conn
+
+    # -- upserts (INSERT ... ON CONFLICT: no WHERE clause exists to scope) --
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_sleep(conn, MEMBER_A, {"id": "s1", "start": "2026-01-01T00:00:00Z"})
+    store.upsert_cycle(conn, MEMBER_A, {"id": 1, "start": "2026-01-01T00:00:00Z"})
+    store.upsert_workout(conn, MEMBER_A, {"id": "w1", "start": "2026-01-01T00:00:00Z"})
+    store.upsert_body_measurement(conn, MEMBER_A, {"weight_kilogram": 70})
+    store.upsert_profile(conn, MEMBER_A, {"user_id": MEMBER_A, "email": "a@example.test"})
+    assert len(store.get_recoveries(conn, MEMBER_A)) == 1
+    assert len(store.get_sleeps(conn, MEMBER_A)) == 1
+    assert len(store.get_cycles(conn, MEMBER_A)) == 1
+    assert len(store.get_workouts(conn, MEMBER_A)) == 1
+    assert store.get_body_measurement(conn, MEMBER_A) == {"weight_kilogram": 70}
+    assert store.get_profile(conn, MEMBER_A) is not None
+
+    # The conflict branch of each upsert, too: a second write of the same key
+    # must update in place rather than raise or duplicate.
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "PENDING_SCORE"})
+    store.upsert_sleep(conn, MEMBER_A, {"id": "s1", "start": "2026-01-02T00:00:00Z"})
+    store.upsert_cycle(conn, MEMBER_A, {"id": 1, "start": "2026-01-02T00:00:00Z"})
+    store.upsert_workout(conn, MEMBER_A, {"id": "w1", "start": "2026-01-02T00:00:00Z"})
+    store.upsert_body_measurement(conn, MEMBER_A, {"weight_kilogram": 71})
+    store.upsert_profile(conn, MEMBER_A, {"user_id": MEMBER_A, "email": "a2@example.test"})
+    assert len(store.get_recoveries(conn, MEMBER_A)) == 1
+    assert store.get_recoveries(conn, MEMBER_A)[0]["score_state"] == "PENDING_SCORE"
+    assert store.get_body_measurement(conn, MEMBER_A) == {"weight_kilogram": 71}
+
+    # -- sync_state, webhook_delivery_state: upserts on their own keys ------
+    store.set_sync_state(
+        conn,
+        MEMBER_A,
+        "recoveries",
+        cursor="cur-1",
+        last_run_at="2026-01-01T00:00:00Z",
+        outcome="success",
+    )
+    store.set_sync_state(
+        conn,
+        MEMBER_A,
+        "recoveries",
+        cursor="cur-2",
+        last_run_at="2026-01-02T00:00:00Z",
+        outcome="success",
+    )
+    state = store.get_sync_state(conn, MEMBER_A, "recoveries")
+    assert state is not None and state["cursor"] == "cur-2"
+
+    store.record_webhook_delivery(conn, MEMBER_A)
+    store.record_webhook_delivery(conn, MEMBER_A)
+    assert store.get_last_webhook_delivery(conn, MEMBER_A) is not None
+
+    # -- identity/audit writers -------------------------------------------
+    store.link_principal_to_member(
+        conn, client_id="client-a", issuer=None, subject=None, whoop_user_id=MEMBER_A
+    )
+    store.link_principal_to_member(
+        conn, client_id="client-a", issuer=None, subject=None, whoop_user_id=MEMBER_A
+    )
+    assert (
+        store.get_member_for_principal(conn, client_id="client-a", issuer=None, subject=None)
+        == MEMBER_A
+    )
+    store.record_tool_call(conn, MEMBER_A, "list_recoveries")
+    assert len(store.get_tool_call_audit_for_member(conn, MEMBER_A)) == 1
+
+    # -- webhook_events: insert then each terminal/retry transition --------
+    for trace_id in ("trace-success", "trace-retry", "trace-dead"):
+        store.insert_webhook_event(conn, trace_id, MEMBER_A, "sleep.updated", "{}")
+    store.mark_webhook_event_success(conn, "trace-success")
+    store.mark_webhook_event_retry(conn, "trace-retry", 1)
+    store.mark_webhook_event_dead_letter(conn, "trace-dead", 5)
+    statuses = {
+        trace_id: (store.get_webhook_event(conn, trace_id) or {}).get("status")
+        for trace_id in ("trace-success", "trace-retry", "trace-dead")
+    }
+    assert statuses == {
+        "trace-success": "success",
+        "trace-retry": "pending",
+        "trace-dead": "dead_letter",
+    }
+
+    # -- soft delete: the one equality-predicated UPDATE, all resources ----
+    for resource, resource_id in (("recovery", "1"), ("sleep", "s1"), ("workout", "w1")):
+        store.set_deleted_at(conn, resource, MEMBER_A, resource_id)
+    assert store.get_recoveries(conn, MEMBER_A) == []
+    assert store.get_sleeps(conn, MEMBER_A) == []
+    assert store.get_workouts(conn, MEMBER_A) == []
+    assert len(store.get_recoveries(conn, MEMBER_A, include_deleted=True)) == 1
+
+    # -- erasure: equality-predicated DELETE across every erasure table ----
+    store.erase_member_data(conn, MEMBER_A)
+    for table in sorted(store._ERASURE_TABLES):
+        rows = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE whoop_user_id = ?",  # noqa: S608 -- table from store._ERASURE_TABLES
+            (MEMBER_A,),
+        ).fetchone()[0]
+        assert rows == 0, f"erase_member_data left rows behind in {table}"
+    store.delete_principal_links_for_member(conn, MEMBER_A)
+    assert (
+        store.get_member_for_principal(conn, client_id="client-a", issuer=None, subject=None)
+        is None
+    )
+
+
+# -- #99 test 5: enforce_retention's sweep must delete exactly what it did ----
+
+_RETENTION_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+_RETENTION_MAX_AGE_DAYS = 30
+
+#: Rows removed per table by ``enforce_retention`` against the fixture built
+#: by ``_seed_retention_fixture`` below. MEASURED against store.py as of
+#: #99's parent commit (2bccd9a, before the sweep path existed) rather than
+#: reasoned about: the point of this test is that #99 changes *nothing* about
+#: what retention deletes, so the expectation is the pre-change behaviour
+#: itself. Two stale ``recoveries`` rows and one of everything else, so a
+#: sweep that silently degraded to "delete one row per table" or "delete the
+#: whole table" is distinguishable from the real result.
+_EXPECTED_RETENTION_COUNTS: dict[str, int] = {
+    "body_measurements": 1,
+    "cycles": 1,
+    "profiles": 1,
+    "recoveries": 2,
+    "sleeps": 1,
+    "sync_state": 1,
+    "tool_call_audit": 1,
+    "webhook_delivery_state": 1,
+    "webhook_events": 1,
+    "workouts": 1,
+}
+
+
+def _seed_retention_fixture(conn: sqlite3.Connection) -> None:
+    """One stale row (past the window) for MEMBER_A and one fresh row (inside
+    it) for MEMBER_B in every ``_ERASURE_TABLES`` table, plus a second stale
+    ``recoveries`` row so the expected counts are not uniformly 1. Ages are
+    set by writing each table's own ``_RETENTION_TIMESTAMP_COLUMNS`` column
+    directly -- the fixture must not depend on wall-clock time, and
+    ``filterwarnings = ["error"]`` leaves no room for drift."""
+    stale = (_RETENTION_NOW - timedelta(days=_RETENTION_MAX_AGE_DAYS, seconds=1)).isoformat()
+    fresh = (_RETENTION_NOW - timedelta(days=1)).isoformat()
+
+    for member, tag in ((MEMBER_A, "stale"), (MEMBER_B, "fresh")):
+        _seed_recovery(conn, member, tag)
+        store.upsert_sleep(conn, member, {"id": f"sleep-{member}", "start": "2026-01-01T00:00:00Z"})
+        store.upsert_cycle(conn, member, {"id": member, "start": "2026-01-01T00:00:00Z"})
+        store.upsert_workout(
+            conn, member, {"id": f"workout-{member}", "start": "2026-01-01T00:00:00Z"}
+        )
+        _seed_body_measurement(conn, member, tag)
+        _seed_profile(conn, member, tag)
+        store.set_sync_state(
+            conn,
+            member,
+            "recoveries",
+            cursor=tag,
+            last_run_at="2026-01-01T00:00:00Z",
+            outcome="success",
+        )
+        store.record_webhook_delivery(conn, member)
+        store.insert_webhook_event(conn, f"trace-{member}", member, "sleep.updated", "{}")
+        store.record_tool_call(conn, member, f"tool-{tag}")
+
+    # A second stale recoveries row for MEMBER_A, so recoveries' expected
+    # count differs from every other table's.
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 2, "score_state": "SCORED"})
+
+    for table in sorted(store._ERASURE_TABLES):
+        column = store._RETENTION_TIMESTAMP_COLUMNS[table]
+        conn.execute(
+            f"UPDATE {table} SET {column} = ? WHERE whoop_user_id = ?",  # noqa: S608 -- table/column from store._ERASURE_TABLES and store._RETENTION_TIMESTAMP_COLUMNS
+            (stale, MEMBER_A),
+        )
+        conn.execute(
+            f"UPDATE {table} SET {column} = ? WHERE whoop_user_id = ?",  # noqa: S608 -- same fixed sources
+            (fresh, MEMBER_B),
+        )
+    conn.commit()
+
+
+def test_enforce_retention_deletes_exactly_what_it_deleted_before(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#99 test 5: routing ``enforce_retention`` through the new sweep path
+    must not change one row of its outcome.
+
+    Compared against the measured pre-change behaviour on both sides -- the
+    per-table counts it returns AND which rows are actually gone from the
+    database afterwards -- not merely "it did not raise". A sweep that
+    stopped deleting from the tenant-scoped tables entirely would still not
+    raise; it would just quietly stop enforcing retention.
+    """
+    conn = store_conn
+    _seed_retention_fixture(conn)
+
+    counts = store.enforce_retention(conn, max_age_days=_RETENTION_MAX_AGE_DAYS, now=_RETENTION_NOW)
+
+    assert counts == _EXPECTED_RETENTION_COUNTS
+    survivors = {
+        table: conn.execute(
+            f"SELECT whoop_user_id FROM {table} ORDER BY 1"  # noqa: S608 -- table from store._ERASURE_TABLES
+        ).fetchall()
+        for table in sorted(store._ERASURE_TABLES)
+    }
+    assert survivors == {table: [(MEMBER_B,)] for table in sorted(store._ERASURE_TABLES)}, (
+        "retention must remove exactly the past-window rows and leave the "
+        "within-window ones, on every table"
+    )
+
+
+def _store_call_sites(function_name: str) -> list[tuple[str, int]]:
+    """Every call to ``function_name`` in store.py's own source, as
+    ``(enclosing function, line)`` pairs. AST-based, like
+    ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper``, so
+    a comment or a docstring naming the function cannot produce a false
+    positive."""
+    tree = ast.parse(inspect.getsource(store))
+    sites: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == function_name
+            ):
+                sites.append((node.name, inner.lineno))
+    return sites
+
+
+def _sweep_call_sites() -> list[tuple[str, int]]:
+    """Every call to the sweep path, as ``(enclosing function, line)`` pairs."""
+    return _store_call_sites(_SWEEP_PATH_NAME)
+
+
+def test_all_tenant_sweep_path_has_exactly_one_caller() -> None:
+    """#99 test 6: the opt-out is singular, and pinned so from source.
+
+    A relaxation of a fail-closed control is only acceptable while it is
+    reachable from exactly one place. This asserts that structurally rather
+    than by convention: the sweep path is called once, from
+    ``enforce_retention``, and by nothing anywhere else in the package. A
+    second caller -- however well-intentioned -- fails here, which is the
+    review signal the issue asks for (see D2: this is why the opt-out is a
+    named internal function and not an ``allow_all_tenants=True`` keyword
+    that every call site could pass).
+    """
+    assert callable(getattr(store, _SWEEP_PATH_NAME, None)), (
+        f"store.{_SWEEP_PATH_NAME} does not exist: #99's singular all-tenant "
+        "sweep path has not been added (or was renamed -- update "
+        "_SWEEP_PATH_NAME in this file if so)"
+    )
+
+    sites = _sweep_call_sites()
+    assert [name for name, _ in sites] == ["enforce_retention"], (
+        f"store.{_SWEEP_PATH_NAME} must be called exactly once, from "
+        f"enforce_retention; found {sites}"
+    )
+
+    src_dir = Path(store.__file__).resolve().parent
+    elsewhere: list[str] = []
+    for path in sorted(src_dir.glob("*.py")):
+        if path.name == "store.py":
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Name) and node.id == _SWEEP_PATH_NAME) or (
+                isinstance(node, ast.Attribute) and node.attr == _SWEEP_PATH_NAME
+            ):
+                elsewhere.append(f"{path.name}:{node.lineno}")
+    assert elsewhere == [], (
+        f"only store.enforce_retention may reach {_SWEEP_PATH_NAME}; also referenced in {elsewhere}"
+    )
+
+
+#: The executor #99 factored the statement-running half of ``_execute_scoped``
+#: into, and the two -- exactly two -- functions allowed to call it. Pinned
+#: here for the same reason ``_SWEEP_PATH_NAME`` is: one place to update on a
+#: rename, and a loud failure rather than a silent gap if the shape changes.
+_GUARD_EXECUTOR_NAME = "_execute_with_tenancy_authorizer"
+_GUARD_ENTRY_POINTS = {"_execute_scoped", _SWEEP_PATH_NAME}
+
+
+def test_only_the_two_named_guard_entry_points_execute_sql() -> None:
+    """Companion to test 6, closing the gap #99's refactor would otherwise
+    open in ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped
+    _wrapper``.
+
+    That test allows ``conn.execute`` inside the shared executor, which is
+    what makes the universal check impossible to skip -- but on its own it
+    would let a *future* store.py function call that executor directly and get
+    the sweep's relaxed treatment (universal check only, no equality
+    predicate) without being the sweep, and so without tripping test 6's
+    single-caller assertion. The relaxation must stay reachable only through
+    the one distinctly-named path (D2), so the executor's callers are pinned
+    to the two named entry points: the strict one everything uses, and the
+    sweep, itself pinned to a single caller.
+    """
+    assert callable(getattr(store, _GUARD_EXECUTOR_NAME, None)), (
+        f"store.{_GUARD_EXECUTOR_NAME} does not exist -- if #99's shared "
+        "executor was renamed, update _GUARD_EXECUTOR_NAME in this file"
+    )
+
+    callers = {name for name, _ in _store_call_sites(_GUARD_EXECUTOR_NAME)}
+    assert callers == _GUARD_ENTRY_POINTS, (
+        f"only {sorted(_GUARD_ENTRY_POINTS)} may call {_GUARD_EXECUTOR_NAME}; "
+        f"found {sorted(callers)}. A new caller gets the all-tenant "
+        "relaxation without going through the sweep path or its single-caller test."
+    )
+
+
+def test_all_tenant_sweep_path_still_enforces_the_universal_check(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#99 test 7: the opt-out relaxes the *equality* requirement only.
+
+    This is the test that catches a sloppy opt-out. ``enforce_retention``'s
+    scoped-table DELETEs read ``whoop_user_id`` (``IS NOT NULL``), so they
+    already satisfy the universal "any touched tenant-scoped table must have
+    its ``whoop_user_id`` read" check and must keep satisfying it. A sweep
+    path implemented by skipping the authorizer check altogether -- rather
+    than by waiving the equality regex alone -- would look like a tightening
+    while actually deleting the only real tenancy control: a statement that
+    never mentions ``whoop_user_id`` at all would sail through it.
+
+    So: a statement routed through the sweep path that touches a
+    tenant-scoped table without reading ``whoop_user_id`` must still be
+    rejected, and must still roll back.
+    """
+    sweep = getattr(store, _SWEEP_PATH_NAME, None)
+    assert callable(sweep), (
+        f"store.{_SWEEP_PATH_NAME} does not exist: #99's singular all-tenant "
+        "sweep path has not been added (or was renamed -- update "
+        "_SWEEP_PATH_NAME in this file if so)"
+    )
+
+    conn = store_conn
+    _seed_recovery(conn, MEMBER_A, "member-a-tag")
+
+    # The shape enforce_retention legitimately uses -- reads whoop_user_id --
+    # is accepted through this path: the positive control, so the assertion
+    # below cannot pass merely because the path rejects everything.
+    sweep(
+        conn,
+        "DELETE FROM recoveries WHERE whoop_user_id IS NOT NULL AND updated_at < ?",
+        ("1970-01-01T00:00:00+00:00",),
+    )
+    assert conn.execute("SELECT COUNT(*) FROM recoveries").fetchone()[0] == 1, (
+        "positive control: that sweep should delete nothing (nothing is that old)"
+    )
+
+    # The same sweep with no reference to whoop_user_id at all must still fail.
+    with pytest.raises(store.UnscopedQueryError):
+        sweep(conn, "DELETE FROM recoveries WHERE updated_at < ?", ("2999-01-01T00:00:00+00:00",))
+
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM recoveries").fetchone()[0] == 1, (
+        "the rejected sweep deleted rows anyway -- the universal check was skipped, "
+        "not merely the equality requirement"
+    )

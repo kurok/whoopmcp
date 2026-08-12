@@ -21,11 +21,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -333,32 +334,193 @@ class UnscopedQueryError(RuntimeError):
     """
 
 
-def _execute_scoped(
-    conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
-) -> sqlite3.Cursor:
-    """Run ``sql`` against ``conn``, failing closed if it touches a
-    tenant-scoped table (``_TENANT_SCOPED_TABLES``) without reading that
-    table's own ``whoop_user_id`` column as a restrictive equality predicate.
+#: The one predicate shape that pins a statement to a single member:
+#: ``whoop_user_id`` compared for equality against a *bound parameter*.
+#: Matched anywhere in the statement text.
+#:
+#: This is a presence regex, not a SQL parser, and #99 deliberately kept it
+#: that way: parsing SQL would be a large change to the most safety-critical
+#: function in this package, for shapes no caller in it exhibits. So what it
+#: does and does not catch is written down here rather than overclaimed:
+#:
+#: * CAUGHT -- the absence of any equality on the column, which is what #99
+#:   was filed about: ``whoop_user_id != ?``, ``> ?``, ``IS NOT NULL``,
+#:   ``IN (?, ?)``, or the column merely appearing in a select list.
+#: * CAUGHT -- equality against an interpolated literal (``whoop_user_id =
+#:   42``). Requiring the ``?`` is deliberate: every legitimate caller here
+#:   binds the id, so a hand-built literal (the shape an injected id would
+#:   take) does not satisfy the guard.
+#: * NOT CAUGHT -- a statement that carries a matching fragment *and* widens
+#:   its own reach anyway: ``WHERE whoop_user_id = ? OR 1 = 1``, a second
+#:   ``OR``-ed member, or a subquery whose text supplies the fragment while
+#:   the outer statement stays unfiltered. Nothing here understands clause
+#:   structure, boolean precedence, or nesting.
+#: * NOT CAUGHT -- *which* table the fragment applies to when a statement
+#:   names two tenant-scoped tables. The universal read check is per-table;
+#:   this one is per-statement.
+#: * NOT CAUGHT -- a fragment sitting somewhere other than a predicate: a
+#:   ``SET`` assignment, a ``--`` comment, or a string literal. The first of
+#:   those is the one to know about, because it is a plausible statement
+#:   rather than a contrived one: ``UPDATE recoveries SET whoop_user_id = ?
+#:   WHERE whoop_user_id IS NOT NULL`` satisfies this regex from its SET
+#:   clause and reassigns every member's rows to one caller-chosen id. That
+#:   is #99's own ``IS NOT NULL``-on-UPDATE shape, so the second layer does
+#:   not cover it; the universal check does not either, since the statement
+#:   does read the column. No caller in this package writes that shape, and
+#:   nothing outside it reaches these functions.
+#:
+#: The universal check remains the load-bearing control (it is backed by
+#: sqlite's own authorizer, so it cannot be talked out of by SQL text); this
+#: regex is the second layer. Closing the NOT-CAUGHT cases needs a real
+#: parser and is a follow-up issue, not part of #99.
+_MEMBER_EQUALITY_PREDICATE = re.compile(r"whoop_user_id\s*=\s*\?", re.IGNORECASE)
 
-    This is the ONLY way any function in this module touches ``conn`` for an
-    entity read/write -- ``test_store_has_no_unwrapped_sqlite_execute_outside
-    _scoped_wrapper`` enforces that structurally, so a future store.py
-    function cannot quietly route around this check.
+
+class _TenancyFindings(NamedTuple):
+    """What sqlite's authorizer saw while compiling one statement, after the
+    universal "must read ``whoop_user_id``" check has already passed.
+
+    Returned by ``_execute_with_tenancy_authorizer`` so its two callers can
+    decide independently what *else* to require of the statement -- see
+    ``_execute_scoped`` (requires a member equality predicate) and
+    ``_execute_all_tenant_sweep`` (deliberately does not).
+    """
+
+    #: The executed statement's cursor.
+    cursor: sqlite3.Cursor
+    #: Whether any tenant-scoped table had its ``whoop_user_id`` column read.
+    reads_member_column: bool
+    #: Tenant-scoped tables this statement UPDATEd or DELETEd *without* also
+    #: INSERTing into them -- the set that, per #99's D1, must be pinned to a
+    #: single member by an equality predicate. Excluding the tables an INSERT
+    #: also named is what exempts an upsert: sqlite reports ``INSERT ... ON
+    #: CONFLICT ... DO UPDATE`` as both SQLITE_INSERT *and* SQLITE_UPDATE on
+    #: the same table (measured, both on the insert and the conflict branch),
+    #: and such a statement has no ``WHERE`` clause to carry a predicate --
+    #: it supplies ``whoop_user_id`` as a value. ``REPLACE INTO`` (INSERT +
+    #: DELETE on one table) would be exempted by the same rule, for the same
+    #: reason; store.py uses none today.
+    needs_member_predicate: frozenset[str]
+
+
+def _execute_with_tenancy_authorizer(
+    conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]
+) -> _TenancyFindings:
+    """Execute one statement under sqlite's authorizer and apply the
+    **universal** tenancy check: any tenant-scoped table this statement
+    touched (read OR written) must have had its own ``whoop_user_id`` column
+    read, or ``UnscopedQueryError`` is raised after rolling back.
+
+    Not an entry point. This is the shared machinery behind the module's two
+    named execution paths -- ``_execute_scoped`` (what everything uses) and
+    ``_execute_all_tenant_sweep`` (``enforce_retention`` only) -- and it lives
+    in one function so that the check every statement must pass exists exactly
+    once and cannot drift between them. Both facts are pinned from source:
+    ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper``
+    allows ``conn.execute`` here and in migration/bootstrap code but nowhere
+    else, so neither entry point can skip the authorizer, and
+    ``test_only_the_two_named_guard_entry_points_execute_sql`` pins this
+    function's own callers to those two.
 
     Mechanism: installs a ``sqlite3.Connection.set_authorizer`` callback for
     the duration of this one statement's compilation, recording every
     ``SQLITE_READ`` (table, column) pair and every table named by a
     ``SQLITE_INSERT``/``SQLITE_UPDATE``/``SQLITE_DELETE`` action. Any
-    tenant-scoped table that was touched (read OR written) but never had its
-    ``whoop_user_id`` column read is unscoped -- this also catches a bare
-    ``UPDATE t SET col = val`` with no ``WHERE`` at all, which triggers no
-    ``SQLITE_READ`` whatsoever (there is nothing to read to pick rows), only
-    the write action naming the table.
+    tenant-scoped table that was touched but never had its ``whoop_user_id``
+    column read is unscoped -- this also catches a bare ``UPDATE t SET col =
+    val`` with no ``WHERE`` at all, which triggers no ``SQLITE_READ``
+    whatsoever (there is nothing to read to pick rows), only the write action
+    naming the table.
 
-    For SELECT statements, an additional check ensures ``whoop_user_id`` is
-    used with a restrictive equality predicate (``whoop_user_id = ?``), not
-    just mentioned. This catches cases like ``WHERE whoop_user_id > 0`` or
-    ``SELECT whoop_user_id FROM table`` without a WHERE clause.
+    Rejection rolls back before raising, since a non-``SELECT`` statement has
+    already run by the time the authorizer's findings can be inspected. The
+    reasoning, and why undoing it is safe, is written out once on
+    ``_execute_scoped`` and not restated here.
+    """
+    reads: dict[str, set[str]] = {}
+    inserted: set[str] = set()
+    mutated: set[str] = set()
+
+    def authorizer(
+        action: int, arg1: str | None, arg2: str | None, arg3: str | None, arg4: str | None
+    ) -> int:
+        del arg3, arg4
+        if action == sqlite3.SQLITE_READ and arg1 in _TENANT_SCOPED_TABLES:
+            reads.setdefault(arg1, set()).add(arg2 or "")
+        elif action == sqlite3.SQLITE_INSERT and arg1 in _TENANT_SCOPED_TABLES:
+            inserted.add(arg1)
+        elif (
+            action in (sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE)
+            and arg1 in _TENANT_SCOPED_TABLES
+        ):
+            mutated.add(arg1)
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(authorizer)
+    try:
+        cursor = conn.execute(sql, params)
+    finally:
+        conn.set_authorizer(None)
+
+    touched = inserted | mutated | set(reads)
+    unscoped = {table for table in touched if "whoop_user_id" not in reads.get(table, set())}
+    if unscoped:
+        conn.rollback()
+        raise UnscopedQueryError(
+            f"query touches tenant-scoped table(s) {sorted(unscoped)} without "
+            f"reading whoop_user_id: {sql!r}"
+        )
+
+    return _TenancyFindings(
+        cursor=cursor,
+        reads_member_column=any("whoop_user_id" in columns for columns in reads.values()),
+        needs_member_predicate=frozenset(mutated - inserted),
+    )
+
+
+def _execute_scoped(
+    conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+) -> sqlite3.Cursor:
+    """Run ``sql`` against ``conn``, failing closed if it touches a
+    tenant-scoped table (``_TENANT_SCOPED_TABLES``) without reading that
+    table's own ``whoop_user_id`` column -- and, for a ``SELECT``, an
+    ``UPDATE`` or a ``DELETE``, without pinning it to one member with a
+    ``whoop_user_id = ?`` equality predicate.
+
+    This is the way every function in this module touches ``conn`` for an
+    entity read/write. The one exception is deliberate, named, and used once:
+    ``_execute_all_tenant_sweep``, for ``enforce_retention``'s all-members
+    retention sweep. Both this function and that one execute through
+    ``_execute_with_tenancy_authorizer``, so neither can skip the universal
+    check; ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped
+    _wrapper`` enforces that structurally, so a future store.py function
+    cannot quietly route around it.
+
+    Two checks apply, in order:
+
+    1. The **universal** one, in ``_execute_with_tenancy_authorizer`` (see
+       there): every touched tenant-scoped table must have had its
+       ``whoop_user_id`` column read. Backed by sqlite's own authorizer rather
+       than by inspecting SQL text, so it is the load-bearing control.
+    2. The **member equality predicate** (``_MEMBER_EQUALITY_PREDICATE``):
+       reading the column is not the same as restricting to one member, since
+       ``whoop_user_id != ?``, ``> ?`` and ``IS NOT NULL`` all read it while
+       spanning every member in the table. Applied to ``SELECT`` (#29) and --
+       since #99 -- to ``UPDATE`` and ``DELETE``, the higher-impact half,
+       where before it was enough merely to read the column. That check is a
+       presence regex whose exact reach is documented on
+       ``_MEMBER_EQUALITY_PREDICATE``; this docstring does not claim more.
+
+    **``INSERT`` is exempt from check 2, permanently and by construction.**
+    An ``INSERT`` has no ``WHERE`` clause to carry a predicate: it supplies
+    ``whoop_user_id`` as a *value*, and every record write in this module is
+    an ``INSERT ... ON CONFLICT ... DO UPDATE`` upsert (sqlite reports those
+    as both ``SQLITE_INSERT`` and ``SQLITE_UPDATE`` on the one table, which is
+    why ``needs_member_predicate`` subtracts the inserted tables). Requiring
+    an equality predicate there is not merely wrong but impossible, and would
+    break every upsert in the codebase -- so do not "finish the job" by
+    extending check 2 to ``INSERT``. Check 1 still applies to inserts, and is
+    what keeps an insert honest about naming the column at all.
 
     A non-``SELECT`` statement is already fully executed (sqlite3 steps it to
     completion inside a single ``execute()`` call) by the time the violation
@@ -370,37 +532,19 @@ def _execute_scoped(
     transaction, so this rollback only ever undoes the offending statement
     itself, never a caller's earlier, already-legitimate work.
     """
-    import re
+    found = _execute_with_tenancy_authorizer(conn, sql, params)
 
-    reads: dict[str, set[str]] = {}
-    writes: set[str] = set()
-
-    def authorizer(
-        action: int, arg1: str | None, arg2: str | None, arg3: str | None, arg4: str | None
-    ) -> int:
-        del arg3, arg4
-        if action == sqlite3.SQLITE_READ and arg1 in _TENANT_SCOPED_TABLES:
-            reads.setdefault(arg1, set()).add(arg2 or "")
-        elif (
-            action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE)
-            and arg1 in _TENANT_SCOPED_TABLES
-        ):
-            writes.add(arg1)
-        return sqlite3.SQLITE_OK
-
-    conn.set_authorizer(authorizer)
-    try:
-        cursor = conn.execute(sql, params)
-    finally:
-        conn.set_authorizer(None)
-
-    touched = writes | set(reads)
-    unscoped = {table for table in touched if "whoop_user_id" not in reads.get(table, set())}
-    if unscoped:
+    # #99: an UPDATE or DELETE that reads whoop_user_id has satisfied the
+    # universal check without necessarily restricting itself to one member.
+    # Every table named here was UPDATEd or DELETEd and not INSERTed into, so
+    # the statement had a WHERE clause capable of carrying the predicate (and,
+    # the universal check having passed, that clause does read the column).
+    if found.needs_member_predicate and not _MEMBER_EQUALITY_PREDICATE.search(sql):
         conn.rollback()
         raise UnscopedQueryError(
-            f"query touches tenant-scoped table(s) {sorted(unscoped)} without "
-            f"reading whoop_user_id: {sql!r}"
+            f"statement mutates tenant-scoped table(s) "
+            f"{sorted(found.needs_member_predicate)} but does not restrict itself to one "
+            f"member with whoop_user_id = ?: {sql!r}"
         )
 
     # For SELECT statements that reference whoop_user_id, ensure it is used
@@ -408,11 +552,10 @@ def _execute_scoped(
     # just mentioned or used non-restrictively. This catches cases like
     # "WHERE whoop_user_id > 0" or "SELECT whoop_user_id FROM ..." without
     # a restrictive WHERE clause.
-    references_whoop_user_id = any("whoop_user_id" in reads.get(table, set()) for table in reads)
     if (
         "SELECT" in sql.upper()
-        and references_whoop_user_id
-        and not re.search(r"whoop_user_id\s*=\s*\?", sql, re.IGNORECASE)
+        and found.reads_member_column
+        and not _MEMBER_EQUALITY_PREDICATE.search(sql)
     ):
         conn.rollback()
         raise UnscopedQueryError(
@@ -420,7 +563,40 @@ def _execute_scoped(
             f"does not filter with whoop_user_id = ?: {sql!r}"
         )
 
-    return cursor
+    return found.cursor
+
+
+def _execute_all_tenant_sweep(
+    conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()
+) -> sqlite3.Cursor:
+    """Run one deliberately all-members statement: like ``_execute_scoped``,
+    but without requiring a ``whoop_user_id = ?`` equality predicate.
+
+    The universal check still applies, unchanged and by construction -- this
+    executes through ``_execute_with_tenancy_authorizer``, the same authorizer
+    machinery, and does not re-implement any of it. A statement routed here
+    that touches a tenant-scoped table *without reading* ``whoop_user_id`` is
+    still rejected and still rolled back. That distinction is the whole point:
+    waiving the equality regex leaves the real, authorizer-backed tenancy
+    control in place, whereas skipping the authorizer would delete the control
+    while looking like a tightening. ``test_all_tenant_sweep_path_still
+    _enforces_the_universal_check`` pins it.
+
+    **Exactly one caller: ``enforce_retention``**, whose per-table
+    ``DELETE ... WHERE whoop_user_id IS NOT NULL AND <age column> < ?`` is
+    honestly all-members -- there is no single member to scope a retention
+    sweep to, and the ``IS NOT NULL`` reads the column truthfully rather than
+    dressing up a forgotten filter. ``test_all_tenant_sweep_path_has_exactly
+    _one_caller`` asserts that from source, in this package as a whole.
+
+    This is a named function rather than an ``_execute_scoped(...,
+    allow_all_tenants=True)`` keyword on purpose (#99's D2): a fail-closed
+    control whose bypass is a keyword is one word away at every call site,
+    while a bypass that is a distinct name has to be reached for, is greppable,
+    and can be -- is -- pinned to a single caller by a test. A second caller
+    should be treated as a design question, not a merge conflict to resolve.
+    """
+    return _execute_with_tenancy_authorizer(conn, sql, params).cursor
 
 
 def _is_special_sqlite_path(path: str | Path) -> bool:
@@ -1842,13 +2018,24 @@ def enforce_retention(
     even available here -- discovering *which* ids have stale data would
     itself require reading a tenant-scoped table's ``whoop_user_id`` column
     with no equality predicate, which ``_execute_scoped``'s own SELECT check
-    refuses). ``_execute_scoped``'s enforcement (see its own docstring) only
-    requires that a touched tenant-scoped table's ``whoop_user_id`` column is
-    actually read by the statement -- it does not require a specific id -- so
-    ``whoop_user_id IS NOT NULL`` (always true: every ``_TENANT_SCOPED_TABLES``
-    table declares that column ``NOT NULL``) satisfies that requirement
-    honestly, for what is a genuinely deliberate, all-members-at-once
-    statement rather than a missed member filter.
+    refuses).
+
+    This is therefore the codebase's one legitimate all-members sweep, and
+    since #99 it is the **only** caller of ``_execute_all_tenant_sweep``, the
+    named path that waives the ``whoop_user_id = ?`` equality requirement
+    ``_execute_scoped`` applies to every other ``UPDATE``/``DELETE``. Nothing
+    else is waived: the universal check still holds, and
+    ``whoop_user_id IS NOT NULL`` (always true -- every
+    ``_TENANT_SCOPED_TABLES`` table declares that column ``NOT NULL``)
+    satisfies it honestly, for what is a genuinely deliberate,
+    all-members-at-once statement rather than a missed member filter. The two
+    tables outside ``_TENANT_SCOPED_TABLES`` (``webhook_events``,
+    ``tool_call_audit``) carry no tenancy check at all and keep going through
+    ``_execute_scoped`` unchanged.
+
+    What this deletes is exactly what it deleted before #99 -- the sweep path
+    changed which check the statements face, not which rows they match (pinned
+    by ``test_enforce_retention_deletes_exactly_what_it_deleted_before``).
     """
     as_of = now if now is not None else datetime.now(UTC)
     cutoff = (as_of - timedelta(days=max_age_days)).isoformat()
@@ -1858,9 +2045,10 @@ def enforce_retention(
         column = _RETENTION_TIMESTAMP_COLUMNS[table]
         if table in _TENANT_SCOPED_TABLES:
             sql = f"DELETE FROM {table} WHERE whoop_user_id IS NOT NULL AND {column} < ?"  # noqa: S608
+            cursor = _execute_all_tenant_sweep(conn, sql, (cutoff,))
         else:
             sql = f"DELETE FROM {table} WHERE {column} < ?"  # noqa: S608
-        cursor = _execute_scoped(conn, sql, (cutoff,))
+            cursor = _execute_scoped(conn, sql, (cutoff,))
         counts[table] = cursor.rowcount
     conn.commit()
     return counts
