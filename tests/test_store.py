@@ -8,7 +8,10 @@ file persistence is required for the test itself.
 from __future__ import annotations
 
 import inspect
+import os
 import sqlite3
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -1194,3 +1197,237 @@ def test_get_sleeps_offset_skips_the_first_n() -> None:
 
     assert [r["id"] for r in results] == ["sleep-3"]
     conn.close()
+
+
+# -- #68: file modes on the database, its parent directory and its sidecars --
+#
+# All mode assertions below follow tests/test_auth.py:136-143 exactly: they are
+# skipped on Windows (POSIX modes are advisory there at best) and they assert
+# the security property -- "no group or other access" -- rather than an exact
+# 0o600, which would be brittle against a legitimately stricter mode.
+
+_GROUP_OR_OTHER = stat.S_IRWXG | stat.S_IRWXO
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_fresh_store_file_is_not_readable_by_other_users(tmp_path: Path) -> None:
+    """A database created by open_store holds every member's profile, body
+    measurements and raw payloads -- the same class of data the token file
+    goes out of its way to protect. It must not land at the umask default."""
+    db_path = tmp_path / "state" / "cache.sqlite3"
+
+    conn = open_store(db_path)
+    conn.close()
+
+    mode = stat.S_IMODE(db_path.stat().st_mode)
+
+    assert mode & _GROUP_OR_OTHER == 0, f"database file is mode {mode:o}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_fresh_store_creates_its_parent_directory_without_group_or_other_access(
+    tmp_path: Path,
+) -> None:
+    """open_store currently does no directory creation at all: it fails
+    outright when the parent is absent. It must create the parent instead,
+    and create it 0700 -- that directory mode is what actually protects the
+    transient sidecars (see the sidecar test below)."""
+    db_path = tmp_path / "state" / "nested" / "cache.sqlite3"
+
+    conn = open_store(db_path)
+    conn.close()
+
+    assert db_path.parent.is_dir()
+    mode = stat.S_IMODE(db_path.parent.stat().st_mode)
+
+    assert mode & _GROUP_OR_OTHER == 0, f"state directory is mode {mode:o}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_pre_existing_world_readable_store_file_is_tightened(tmp_path: Path) -> None:
+    """Every store already on disk was created at the umask default by an
+    earlier version, so creating new files 0600 is not enough on its own: an
+    existing file has to be chmod'd on open, not left as it was found."""
+    db_path = tmp_path / "state" / "cache.sqlite3"
+    db_path.parent.mkdir(parents=True)
+    db_path.touch()
+    db_path.chmod(0o644)
+
+    conn = open_store(db_path)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+
+    assert version == CURRENT_SCHEMA_VERSION, "tightening the mode must not break migration"
+    mode = stat.S_IMODE(db_path.stat().st_mode)
+
+    assert mode & _GROUP_OR_OTHER == 0, f"pre-existing database file is mode {mode:o}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_no_file_in_the_state_directory_is_group_or_other_accessible_after_writes(
+    tmp_path: Path,
+) -> None:
+    """The sidecar case, stated honestly.
+
+    Issue #68 asks for ``-wal``/``-shm`` to be protected. Those files do not
+    exist in this codebase: ``store.py`` sets no ``PRAGMA journal_mode``, so
+    SQLite runs in its default ``delete`` mode (asserted below, so this test
+    fails loudly if that ever changes). The sidecar that *is* created is a
+    transient ``<db>-journal``, written and unlinked inside a single
+    ``execute`` -- far too short-lived to chmod without the chmod itself
+    being a race.
+
+    The real protection for any sidecar, present or future, is the 0700
+    parent directory: no other user can traverse into it to open a journal
+    regardless of that journal's own mode. So this asserts the directory
+    mode, and that nothing left in the directory after a burst of writes
+    carries group or other bits.
+    """
+    state_dir = tmp_path / "state"
+    db_path = state_dir / "cache.sqlite3"
+
+    conn = open_store(db_path)
+    journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    for i in range(25):
+        upsert_sleep(
+            conn,
+            70,
+            {
+                "id": f"sleep-{i}",
+                "start": "2026-08-01T23:00:00Z",
+                "end": "2026-08-02T07:00:00Z",
+            },
+        )
+    conn.close()
+
+    assert journal_mode == "delete", (
+        f"journal_mode is {journal_mode!r}, not 'delete' -- this test's premise "
+        "(no -wal/-shm files exist here) no longer holds"
+    )
+
+    dir_mode = stat.S_IMODE(state_dir.stat().st_mode)
+    assert dir_mode & _GROUP_OR_OTHER == 0, f"state directory is mode {dir_mode:o}"
+
+    loose = {
+        str(child.relative_to(state_dir)): f"{stat.S_IMODE(child.stat().st_mode):o}"
+        for child in sorted(state_dir.rglob("*"))
+        if stat.S_IMODE(child.stat().st_mode) & _GROUP_OR_OTHER
+    }
+    assert loose == {}, f"files in the state directory are group/other accessible: {loose}"
+
+
+def test_an_unchmoddable_directory_does_not_prevent_the_store_opening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D3: an operator who deliberately placed the state directory somewhere
+    this process cannot re-permission must not find the server refusing to
+    start. Every chmod is refused here; open_store must still return a
+    migrated, usable connection.
+
+    No mode is asserted, so this runs on Windows too.
+    """
+    refused: list[str] = []
+
+    def refuse(path: object, mode: int, *args: object, **kwargs: object) -> None:
+        refused.append(str(path))
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "chmod", refuse)
+    monkeypatch.setattr(Path, "chmod", lambda self, mode, **kwargs: refuse(self, mode))
+
+    state_dir = tmp_path / "shared"
+    state_dir.mkdir()
+    db_path = state_dir / "cache.sqlite3"
+    db_path.touch()
+
+    conn = open_store(db_path)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    upsert_profile(conn, 71, {"first_name": "A", "last_name": "B"})
+    stored = get_profile(conn, 71)
+    conn.close()
+
+    assert version == CURRENT_SCHEMA_VERSION
+    assert stored is not None
+    assert refused, "no chmod was even attempted -- the D3 tolerance path is untested"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses ACLs, not POSIX modes")
+def test_a_str_path_containing_a_question_mark_is_still_secured() -> None:
+    """``?`` is a legal POSIX filename character, so a state directory
+    containing one must not be mistaken for a sqlite URI and skipped.
+
+    This is the fail-open direction, which is the one that matters: a
+    security fix that quietly declines to apply to some real paths is worse
+    than one that tightens a path it needn't have. Only the ``file:`` prefix
+    marks a genuine URI, and this path has none.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        weird_dir = Path(raw) / "state?v=1"
+        weird_dir.mkdir(mode=0o755)
+        db_path = weird_dir / "cache.sqlite3"
+
+        conn = open_store(str(db_path))
+        upsert_profile(conn, 72, {"first_name": "A", "last_name": "B"})
+        conn.close()
+
+        file_mode = stat.S_IMODE(db_path.stat().st_mode)
+        dir_mode = stat.S_IMODE(weird_dir.stat().st_mode)
+
+    assert file_mode & (stat.S_IRWXG | stat.S_IRWXO) == 0, f"db is mode {file_mode:o}"
+    assert dir_mode & (stat.S_IRWXG | stat.S_IRWXO) == 0, f"dir is mode {dir_mode:o}"
+
+
+@pytest.mark.parametrize("special_path", [":memory:", "file::memory:?cache=shared"])
+def test_special_sqlite_paths_are_left_entirely_alone(
+    special_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D4: ``":memory:"`` and URI forms are not filesystem paths. They must
+    reach ``sqlite3.connect`` with no mkdir, touch or chmod performed on
+    them, and ``":memory:"`` must leave no file behind at all.
+
+    (Only the ``":memory:"`` case can assert an empty directory: a URI string
+    passed to ``sqlite3.connect`` without ``uri=True`` is treated as a
+    literal filename by sqlite itself, which is sqlite's business and not
+    open_store's.)
+    """
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+    calls: list[str] = []
+    real_chmod = os.chmod
+    real_touch = Path.touch
+    real_mkdir = Path.mkdir
+
+    def record_chmod(path: object, mode: int, *args: object, **kwargs: object) -> None:
+        calls.append(f"os.chmod({path!s})")
+        real_chmod(path, mode, *args, **kwargs)  # type: ignore[arg-type]
+
+    def record_path_chmod(self: Path, mode: int, **kwargs: object) -> None:
+        calls.append(f"Path.chmod({self!s})")
+        real_chmod(self, mode)
+
+    def record_touch(self: Path, mode: int = 0o666, exist_ok: bool = True) -> None:
+        calls.append(f"Path.touch({self!s})")
+        real_touch(self, mode=mode, exist_ok=exist_ok)
+
+    def record_mkdir(
+        self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        calls.append(f"Path.mkdir({self!s})")
+        real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(os, "chmod", record_chmod)
+    monkeypatch.setattr(Path, "chmod", record_path_chmod)
+    monkeypatch.setattr(Path, "touch", record_touch)
+    monkeypatch.setattr(Path, "mkdir", record_mkdir)
+
+    conn = open_store(special_path)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+
+    assert version == CURRENT_SCHEMA_VERSION
+    assert calls == [], f"a special path touched the filesystem: {calls}"
+
+    if special_path == ":memory:":
+        assert list(cwd.iterdir()) == [], "an in-memory store created a file on disk"

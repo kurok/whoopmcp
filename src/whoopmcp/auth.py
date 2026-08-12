@@ -136,19 +136,32 @@ class TokenStore(Protocol):
         pass
 
 
-def _atomic_write_text(path: Path, contents: str) -> None:
+def atomic_write_text(path: Path, contents: str) -> None:
     """Write ``contents`` to ``path`` atomically, mode 0600.
 
-    Shared by ``FileTokenStore`` and ``EncryptedFileTokenStore`` so the
-    write-then-rename atomicity -- and the 0600 permissions that are the
-    whole point of both classes' promise -- exist in exactly one place.
+    Not auth-specific despite living here: ``FileTokenStore`` and
+    ``EncryptedFileTokenStore`` share it below so the write-then-rename
+    atomicity -- and the 0600 permissions that are the whole point of both
+    classes' promise -- exist in exactly one place, and ``__main__.py``'s
+    ``_export_member`` (#68) reuses it too, for the same reason: a
+    data-subject export is the same category of sensitive text as a token,
+    and deserves the same no-world-readable-window guarantee rather than a
+    second, duplicated implementation of it.
+
     Write-then-rename means a crash mid-write cannot truncate a good
-    record; creating the temp file 0600 means the secret is never
-    world-readable even for the instant before the rename.
+    record; creating the temp file 0600 means the content is never
+    world-readable even for the instant before the rename. The explicit
+    ``chmod`` after ``touch`` matters for a reason ``touch(exist_ok=True)``
+    alone does not cover: it does not change the mode of a file that
+    already exists, so a stale, world-readable temp file left behind by an
+    earlier interrupted write would otherwise be reused as-is and then
+    renamed straight over the destination, carrying its old, looser mode
+    with it.
     """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_suffix(".tmp")
     tmp.touch(mode=0o600, exist_ok=True)
+    tmp.chmod(0o600)
     tmp.write_text(contents, encoding="utf-8")
     tmp.replace(path)
 
@@ -194,7 +207,7 @@ class FileTokenStore:
                 self._path,
             )
 
-        _atomic_write_text(self._path, token.to_json())
+        atomic_write_text(self._path, token.to_json())
 
     def clear(self) -> None:
         self._path.unlink(missing_ok=True)
@@ -285,7 +298,7 @@ class EncryptedFileTokenStore:
             current_version=self._current_version,
             associated_data=self._ASSOCIATED_DATA,
         )
-        _atomic_write_text(self._path, json.dumps(envelope))
+        atomic_write_text(self._path, json.dumps(envelope))
 
     def clear(self) -> None:
         self._path.unlink(missing_ok=True)

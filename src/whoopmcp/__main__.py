@@ -94,7 +94,11 @@ def main(argv: list[str] | None = None) -> int:
         "--out",
         type=Path,
         default=None,
-        help="Write the export document to this path. Defaults to stdout.",
+        help=(
+            "Write the export document to this path. Defaults to stdout. The file "
+            "contains the member's full health record and is written mode 0600 "
+            "(POSIX only; see PRIVACY.md for the Windows caveat)."
+        ),
     )
 
     erase_member_parser = subparsers.add_parser(
@@ -402,7 +406,7 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
     another member's consent. In that case ``consent.scopes`` is reported as
     ``None`` with an explanatory note instead of guessing.
     """
-    from whoopmcp.auth import build_store
+    from whoopmcp.auth import atomic_write_text, build_store
     from whoopmcp.store import (
         all_linked_whoop_user_ids,
         export_member_data,
@@ -442,7 +446,9 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
 
     payload = json.dumps(document, indent=2)
     if out is not None:
-        out.write_text(payload, encoding="utf-8")
+        # #68: the same 0600, no-world-readable-window write auth.py's token
+        # stores use -- this document is the member's full health record.
+        atomic_write_text(out, payload)
     else:
         print(payload)
     return 0

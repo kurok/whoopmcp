@@ -19,10 +19,24 @@ own the decision of when to read from here versus the live API.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+#: POSIX modes are advisory at best on Windows (see ``_secure_db_path``'s own
+#: docstring) -- mirrors ``auth.FileTokenStore``'s identically-named constant.
+_MODES_ENFORCED = os.name != "nt"
+
+#: Set once ``_warn_once_about_unenforced_modes`` has logged, so a long-lived
+#: process warns about the Windows gap at most once rather than on every
+#: ``open_store`` call.
+_warned_about_unenforced_modes = False
 
 #: Bump this and append to ``_MIGRATIONS`` when the schema changes. Never
 #: edit an already-shipped migration -- append a new one instead.
@@ -409,14 +423,114 @@ def _execute_scoped(
     return cursor
 
 
+def _is_special_sqlite_path(path: str | Path) -> bool:
+    """True for a sqlite ``path`` that is not a real file on disk: the
+    ``":memory:"`` sentinel, or a URI form (``file:...``, e.g.
+    ``file::memory:?cache=shared``). Only a ``str`` can be one of these -- a
+    ``Path`` is always a literal filename as far as this module is
+    concerned, never a URI, so it is never special (#68's D4).
+
+    Deliberately keyed on the ``file:`` prefix alone, not on the presence of
+    a ``?`` query string: ``?`` is a legal character in a POSIX filename, so
+    a state directory containing one would otherwise be classed as a URI and
+    silently skipped -- a security fix that quietly declines to apply is
+    worse than one that occasionally tightens a path it needn't. Every URI
+    sqlite recognises begins ``file:`` anyway, so nothing real is missed.
+    """
+    if not isinstance(path, str):
+        return False
+    return path == ":memory:" or path.startswith("file:")
+
+
+def _warn_once_about_unenforced_modes(path: Path) -> None:
+    """Log, at most once per process, that ``path``'s permissions are not
+    actually enforced on this platform. Mirrors ``auth.FileTokenStore``'s
+    identically-shaped one-time warning."""
+    global _warned_about_unenforced_modes
+    if _warned_about_unenforced_modes:
+        return
+    _warned_about_unenforced_modes = True
+    logger.warning(
+        "%s cannot be protected by file permissions on Windows; the database "
+        "-- every linked member's profile, body measurements and raw "
+        "payloads -- is readable by any process running as you. See "
+        "PRIVACY.md.",
+        path,
+    )
+
+
+def _secure_db_path(path: Path) -> None:
+    """Best-effort: ensure ``path``'s parent directory carries no group/other
+    access and is created 0700 if absent, and that ``path`` itself is 0600 --
+    tightening either if it was already looser.
+
+    This is the mechanism that protects any sqlite sidecar, present or
+    future: the transient ``<db>-journal`` sqlite writes and unlinks inside
+    a single statement (too short-lived to chmod without the chmod itself
+    racing the write) is unreachable by another user simply because they
+    cannot traverse into a 0700 directory, regardless of that sidecar's own
+    mode. ``-wal``/``-shm`` never appear here at all -- this module sets no
+    ``PRAGMA journal_mode``, so sqlite runs in its default ``delete`` mode.
+
+    Never raises. An operator who deliberately placed the state directory
+    somewhere this process cannot re-permission (a shared directory owned by
+    someone else, say) must not find the server refusing to start over a
+    ``PermissionError`` -- every step below is wrapped so a mode it cannot
+    change is merely logged, not fatal.
+
+    **On Windows this offers no protection.** Windows uses ACLs, not POSIX
+    modes; ``os.chmod``/``Path.touch(mode=...)`` are attempted the same as
+    anywhere else, but the OS itself ignores what they ask for.
+    """
+    parent = path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        logger.debug("could not create state directory %s: %s", parent, exc)
+
+    try:
+        if parent.is_dir():
+            current = stat.S_IMODE(parent.stat().st_mode)
+            if current & 0o077:
+                os.chmod(parent, current & ~0o077)
+    except OSError as exc:
+        logger.debug("could not tighten permissions on %s: %s", parent, exc)
+
+    try:
+        if not path.exists():
+            path.touch(mode=0o600)
+        elif path.is_file():
+            current = stat.S_IMODE(path.stat().st_mode)
+            if current & 0o077:
+                os.chmod(path, current & ~0o077)
+    except OSError as exc:
+        logger.debug("could not secure permissions on %s: %s", path, exc)
+
+    if not _MODES_ENFORCED:
+        _warn_once_about_unenforced_modes(path)
+
+
 def open_store(path: str | Path) -> sqlite3.Connection:
     """Open the sqlite store at ``path``, applying any pending migrations.
 
-    ``path`` may be ``":memory:"`` for an ephemeral, in-process database.
-    The connection is not shared across threads (no ``check_same_thread``
-    override): this repo's pattern elsewhere is a single connection used
-    straightforwardly, and nothing here needs cross-thread access.
+    ``path`` may be ``":memory:"`` for an ephemeral, in-process database, or
+    any sqlite URI form -- neither is a real filesystem path, so neither is
+    touched by the permissions step below (#68's D4; see
+    ``_is_special_sqlite_path``). The connection is not shared across
+    threads (no ``check_same_thread`` override): this repo's pattern
+    elsewhere is a single connection used straightforwardly, and nothing
+    here needs cross-thread access.
+
+    For a real path, the parent directory and the database file are secured
+    to no group/other access -- 0700/0600 -- *before* ``sqlite3.connect``
+    ever touches them, so a freshly created database is never briefly
+    world-readable at the process umask default, and an existing looser file
+    is tightened rather than left as found (#68). See ``_secure_db_path``
+    for the mechanism, its sidecar reasoning, and its Windows caveat, and
+    PRIVACY.md for the operator-facing version of the same.
     """
+    if not _is_special_sqlite_path(path):
+        _secure_db_path(Path(path))
     conn = sqlite3.connect(path)
     _migrate(conn)
     return conn

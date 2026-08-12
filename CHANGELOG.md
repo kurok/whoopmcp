@@ -563,6 +563,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #68: `open_store` created the sqlite database (and `export-member
+  --out`'s data-subject export) at the process umask default -- typically
+  `0644` -- despite holding the same category of health data
+  `auth.FileTokenStore` already goes out of its way to protect at `0600`.
+  Both now get that same discipline: the state directory is created (or
+  tightened) `0700`, and the database/export file is created `0600` or
+  chmod'd to it if a looser one already existed, before it is ever opened
+  or written to, so no window at the umask default is ever observable. The
+  `0700` directory is what protects sqlite's transient `<db>-journal`
+  sidecar too -- untouched by any per-file chmod, since it exists only
+  inside a single statement's execution; this codebase never enables WAL,
+  so `-wal`/`-shm`, which the issue also named, never exist here at all.
+  `auth._atomic_write_text` is now the public `atomic_write_text`. Mode
+  enforcement is best-effort and never blocks the store from opening --
+  a directory this process cannot chmod is logged, not fatal -- and, as
+  with the token store, none of this is enforced on Windows (ACLs, not
+  POSIX modes; disclaimed in `PRIVACY.md`, not attempted).
 - Issue #65: `delete-member`/`erase-member` gated all local deletion on
   `Authenticator.revoke_and_forget()` succeeding, and revoked *the* stored
   token unconditionally. Both were wrong. (1) Once the stored grant is
