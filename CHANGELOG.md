@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Issue #34: `server.json`, the MCP registry manifest, declaring
+  `io.github.kurok/whoopmcp` and the PyPI package for local (stdio) use.
+  Deliberately no `remotes` entry -- #27's streamable-HTTP transport merged,
+  but no hosted deployment exists yet, and a registry entry pointing at
+  something unmaintained is worse than no entry. `release.yml`'s Trusted
+  Publishing wiring (no stored token, SHA-pinned publish action) and the
+  manifest's consistency with `pyproject.toml` are now pinned by
+  `tests/test_packaging.py`; CI's `build` job additionally installs the
+  built wheel into a clean venv and runs `whoopmcp --version` to prove the
+  distribution is installable standalone, not just well-formed. Nothing here
+  publishes anything -- no tag, no upload, no registry submission -- that
+  step still waits on #33.
 - Issue #76: a `whoopmcp login` terminal subcommand for the OAuth dance --
   prints the authorize URL, prompts for the pasted redirect (a full URL, or
   a bare `code=...&state=...` fragment, falling back to separate `code`/

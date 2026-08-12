@@ -1,0 +1,41 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.kurok/whoopmcp",
+  "description": "Read-only MCP server for the WHOOP API v2 -- recovery, sleep, strain, workouts",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/kurok/whoopmcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/kurok/whoopmcp",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "whoopmcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "WHOOP_CLIENT_ID",
+          "description": "OAuth client ID issued by WHOOP for your registered app.",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "WHOOP_CLIENT_SECRET",
+          "description": "OAuth client secret issued by WHOOP for your registered app.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "WHOOP_REDIRECT_URI",
+          "description": "OAuth redirect URI registered with WHOOP. Must not use http://.",
+          "isRequired": true,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

@@ -83,6 +83,17 @@ jobs:
         with:
           name: dist
           path: dist/
+      # Prove the built wheel is actually installable and runnable standalone
+      # -- a clean venv, no editable install, no project source on the path
+      # -- since `pipx run build`/`twine check` only prove the archive is
+      # well-formed, not that installing it produces a working console
+      # script. Reversible, pre-release verification only; nothing here
+      # publishes anything.
+      - name: Wheel installs and the console script runs
+        run: |
+          python -m venv /tmp/whoopmcp-wheel-venv
+          /tmp/whoopmcp-wheel-venv/bin/pip install dist/*.whl
+          /tmp/whoopmcp-wheel-venv/bin/whoopmcp --version
 
   audit:
     name: Dependency audit
