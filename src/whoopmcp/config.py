@@ -83,6 +83,15 @@ class Config:
             direction, before it's rejected even with a valid signature.
             Bounds the window a captured, correctly-signed request can be
             replayed in.
+        webhook_rate_limit_per_minute: Cap on `/webhooks/whoop` requests per
+            minute, checked before the body is read or the signature
+            verified -- independent of `rate_limit_per_minute` above, which
+            is the outbound WHOOP budget; a shared counter would let an
+            inbound flood spend that budget too (#17). `120` is roughly
+            2/sec sustained: comfortably above legitimate WHOOP volume even
+            at a ten-member cap with retries and simultaneous multi-member
+            events, while still blunting a flood. `0` or negative disables
+            inbound limiting entirely.
         token_encryption_keys: Key-version -> 32-byte AES-256-GCM key,
             parsed from `WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N>` variables.
             Only populated (and only required) when `token_backend` is
@@ -129,6 +138,7 @@ class Config:
     http_port: int = 8000
     webhooks_enabled: bool = False
     webhook_timestamp_skew_seconds: float = 300.0
+    webhook_rate_limit_per_minute: int = 120
     token_encryption_keys: Mapping[int, bytes] = field(default_factory=dict)
     token_encryption_key_version: int | None = None
     backfill_floor_date: str | None = None
@@ -255,6 +265,9 @@ class Config:
             webhooks_enabled=_as_bool(src.get("WHOOPMCP_WEBHOOKS_ENABLED", "false")),
             webhook_timestamp_skew_seconds=float(
                 src.get("WHOOPMCP_WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300")
+            ),
+            webhook_rate_limit_per_minute=int(
+                src.get("WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "120")
             ),
             token_encryption_keys=token_encryption_keys,
             token_encryption_key_version=token_encryption_key_version,

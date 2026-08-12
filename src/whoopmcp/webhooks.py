@@ -25,6 +25,9 @@ to avoid:
 - No log record on any path -- success, bad signature, bad timestamp,
   missing header -- ever contains the raw body, the signature, or the
   signing secret.
+- An inbound-only rate limit (``_InboundRateLimiter``, checked before the
+  body is read), independent of ``client.RateLimiter``'s outbound WHOOP
+  budget -- #17's own scope, closed out here.
 """
 
 from __future__ import annotations
@@ -34,7 +37,9 @@ import base64
 import hashlib
 import hmac
 import logging
+import math
 import time
+from collections.abc import Callable
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -137,6 +142,54 @@ def _rejection_reason(
     return "bad_signature"
 
 
+class _InboundRateLimiter:
+    """Fixed-window per-minute counter gating `/webhooks/whoop` itself.
+
+    Deliberately its own thing, not `client.RateLimiter`: that class tracks
+    the *outbound* budget WHOOP's own `X-RateLimit-*` headers describe, and
+    sharing a counter between the two would let an inbound flood spend
+    budget meant for outbound calls -- the coupling #17 explicitly rules
+    out. This counter never touches, imports, or is touched by that class.
+
+    A plain fixed window, not a token bucket: legitimate volume is six
+    event types across a member count capped at ten, so a coarser window is
+    adequate and adds no dependency. ``clock`` mirrors `RateLimiter`'s own
+    constructor argument and `verify_webhook_request`'s ``now=`` -- tests
+    drive it directly rather than sleeping.
+
+    Process-local state, like every other per-process counter in this
+    codebase (see `metrics.py`'s and `server.create_streamable_http_app`'s
+    own multi-worker notes): under `streamable-http` with more than one
+    uvicorn worker, each process holds its own count, so the effective
+    limit is per worker, not fleet-wide. Cross-process coordination is out
+    of scope here for the same reason it is there.
+    """
+
+    _WINDOW_SECONDS = 60.0
+
+    def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock or time.time
+        self._window_start = self._clock()
+        self._count = 0
+
+    def check(self, per_minute_limit: int) -> int | None:
+        """Return ``None`` if the caller may proceed, else whole seconds until reset.
+
+        ``per_minute_limit`` of zero or below means "no limit" (an operator
+        opt-out) -- the counter is left untouched and every call passes.
+        """
+        if per_minute_limit <= 0:
+            return None
+        now = self._clock()
+        if now - self._window_start >= self._WINDOW_SECONDS:
+            self._window_start = now
+            self._count = 0
+        if self._count >= per_minute_limit:
+            return max(1, math.ceil(self._window_start + self._WINDOW_SECONDS - now))
+        self._count += 1
+        return None
+
+
 def register_webhook_routes(server: MCPServer[Any]) -> asyncio.Queue[bytes]:
     """Register ``POST /webhooks/whoop`` on ``server``, returning the queue it feeds.
 
@@ -169,12 +222,25 @@ def register_webhook_routes(server: MCPServer[Any]) -> asyncio.Queue[bytes]:
     lifespan context either.
     """
     queue: asyncio.Queue[bytes] = asyncio.Queue()
+    inbound_rate_limiter = _InboundRateLimiter()
 
     @server.custom_route(_WEBHOOK_PATH, methods=["POST"])
     async def whoop_webhook(request: Request) -> Response:
         config = Config.from_env()
         if not config.webhooks_enabled:
             return JSONResponse({"error": "not_found"}, status_code=404)
+
+        # Checked before the body is read or anything is verified: a flood
+        # must cost neither a body read nor an HMAC, and a 429 here has not
+        # gone anywhere near signature verification, so it leaks nothing
+        # about whether a signature would have been valid.
+        retry_after = inbound_rate_limiter.check(config.webhook_rate_limit_per_minute)
+        if retry_after is not None:
+            return JSONResponse(
+                {"error": "rate_limited"},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
 
         # Raw bytes, read before anything else touches this request -- an
         # unverified body must never reach a JSON decoder, and this line is

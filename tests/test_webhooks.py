@@ -22,9 +22,12 @@ from pathlib import Path
 import httpx
 import pytest
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
 
+from whoopmcp import webhooks
+from whoopmcp.client import RateLimiter
 from whoopmcp.server import build_server
-from whoopmcp.webhooks import _timestamp_within_skew, verify_webhook_request
+from whoopmcp.webhooks import _InboundRateLimiter, _timestamp_within_skew, verify_webhook_request
 
 
 @pytest.fixture
@@ -553,3 +556,316 @@ class TestWebhookDisablement:
 
         # Endpoint should not be available (404) when disabled
         assert response.status_code == 404
+
+
+class _FakeClock:
+    """A controllable clock for driving `_InboundRateLimiter` without a real
+    sleep -- mirrors `test_client.py`'s own `FakeClock` for `RateLimiter`.
+    """
+
+    def __init__(self, start: float = 0.0) -> None:
+        self._now = start
+
+    def now(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+class TestInboundRateLimiterUnit:
+    """Unit tests for `_InboundRateLimiter` itself, driven through its
+    injected clock -- no HTTP layer, no real sleep, mirroring how
+    `_timestamp_within_skew` is tested directly via its own `now=`.
+    """
+
+    def test_requests_within_limit_are_accepted(self) -> None:
+        clock = _FakeClock()
+        limiter = _InboundRateLimiter(clock=clock.now)
+        assert limiter.check(3) is None
+        assert limiter.check(3) is None
+        assert limiter.check(3) is None
+
+    def test_request_beyond_limit_in_same_window_is_rejected(self) -> None:
+        clock = _FakeClock()
+        limiter = _InboundRateLimiter(clock=clock.now)
+        assert limiter.check(2) is None
+        assert limiter.check(2) is None
+        assert limiter.check(2) is not None
+
+    def test_retry_after_is_a_positive_whole_number_of_seconds(self) -> None:
+        clock = _FakeClock()
+        limiter = _InboundRateLimiter(clock=clock.now)
+        limiter.check(1)
+        clock.advance(10.4)
+        retry_after = limiter.check(1)
+        assert retry_after == 50
+        assert isinstance(retry_after, int)
+        assert retry_after > 0
+
+    def test_window_rollover_allows_requests_again(self) -> None:
+        clock = _FakeClock()
+        limiter = _InboundRateLimiter(clock=clock.now)
+        assert limiter.check(1) is None
+        assert limiter.check(1) is not None
+        clock.advance(60.0)
+        assert limiter.check(1) is None
+
+    def test_zero_limit_disables_limiting(self) -> None:
+        clock = _FakeClock()
+        limiter = _InboundRateLimiter(clock=clock.now)
+        for _ in range(500):
+            assert limiter.check(0) is None
+
+    def test_negative_limit_disables_limiting(self) -> None:
+        clock = _FakeClock()
+        limiter = _InboundRateLimiter(clock=clock.now)
+        for _ in range(500):
+            assert limiter.check(-5) is None
+
+    async def test_independent_of_outbound_rate_limiter(self) -> None:
+        """Exhausting the inbound limiter must leave `client.RateLimiter`'s
+        outbound budget untouched, and vice versa -- the specific coupling
+        #17 forbids, asserted directly rather than by code inspection.
+        """
+        inbound = _InboundRateLimiter()
+        outbound = RateLimiter(per_minute=1, per_day=1000)
+
+        await outbound.acquire()
+        assert outbound.budget_snapshot().minute_remaining == 0
+
+        # Outbound is fully exhausted; the inbound limiter must still have
+        # its own, entirely separate budget.
+        assert inbound.check(1) is None
+        assert inbound.check(1) is not None
+
+        # Exhausting inbound above must not have moved the outbound budget
+        # at all -- it should read exactly as the single `acquire()` left it.
+        snapshot = outbound.budget_snapshot()
+        assert snapshot.minute_remaining == 0
+        assert snapshot.day_remaining == 999
+
+
+class TestWebhookInboundRateLimit:
+    """HTTP-level tests for the `/webhooks/whoop` inbound rate limit (#17's
+    only unimplemented scope bullet): checked after the `webhooks_enabled`
+    404 and before the body is read or the signature verified.
+    """
+
+    async def test_requests_up_to_limit_accepted_then_429(
+        self,
+        http_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        valid_event_body: bytes,
+        valid_timestamp: str,
+    ) -> None:
+        monkeypatch.setenv("WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "2")
+        client_secret = "test-secret-key"
+        signature = compute_webhook_signature(valid_timestamp, valid_event_body, client_secret)
+        headers = {
+            "X-WHOOP-Signature": signature,
+            "X-WHOOP-Signature-Timestamp": valid_timestamp,
+            "Content-Type": "application/json",
+        }
+
+        app = build_server().streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            first = await client.post("/webhooks/whoop", content=valid_event_body, headers=headers)
+            second = await client.post("/webhooks/whoop", content=valid_event_body, headers=headers)
+            third = await client.post("/webhooks/whoop", content=valid_event_body, headers=headers)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert third.status_code == 429
+
+    async def test_429_carries_positive_integer_retry_after(
+        self,
+        http_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        valid_event_body: bytes,
+        valid_timestamp: str,
+    ) -> None:
+        monkeypatch.setenv("WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "1")
+        client_secret = "test-secret-key"
+        signature = compute_webhook_signature(valid_timestamp, valid_event_body, client_secret)
+        headers = {
+            "X-WHOOP-Signature": signature,
+            "X-WHOOP-Signature-Timestamp": valid_timestamp,
+            "Content-Type": "application/json",
+        }
+
+        app = build_server().streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.post("/webhooks/whoop", content=valid_event_body, headers=headers)
+            limited = await client.post(
+                "/webhooks/whoop", content=valid_event_body, headers=headers
+            )
+
+        assert limited.status_code == 429
+        retry_after = limited.headers["Retry-After"]
+        assert retry_after.isdigit()
+        assert int(retry_after) > 0
+
+    async def test_rate_limited_request_never_reaches_signature_verification(
+        self,
+        http_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        valid_event_body: bytes,
+        valid_timestamp: str,
+    ) -> None:
+        """Pins D2's ordering: once the inbound limit is exhausted, a
+        correctly-signed request must be rejected without
+        `verify_webhook_request` ever running -- proven by making that
+        function raise if called, rather than merely asserting a 400 vs 429
+        status code.
+        """
+        monkeypatch.setenv("WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "1")
+        client_secret = "test-secret-key"
+        signature = compute_webhook_signature(valid_timestamp, valid_event_body, client_secret)
+        headers = {
+            "X-WHOOP-Signature": signature,
+            "X-WHOOP-Signature-Timestamp": valid_timestamp,
+            "Content-Type": "application/json",
+        }
+
+        app = build_server().streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            first = await client.post("/webhooks/whoop", content=valid_event_body, headers=headers)
+            assert first.status_code == 200
+
+            def _must_not_be_called(*args: object, **kwargs: object) -> bool:
+                raise AssertionError(
+                    "verify_webhook_request must not run once the inbound limit is exhausted"
+                )
+
+            async def _body_must_not_be_read(*args: object, **kwargs: object) -> bytes:
+                raise AssertionError(
+                    "the request body must not be read once the inbound limit is exhausted"
+                )
+
+            monkeypatch.setattr(webhooks, "verify_webhook_request", _must_not_be_called)
+            # Both halves of D2, not just one: the spy above proves verification
+            # is skipped, but a regression that moved `await request.body()`
+            # above the limiter check would still pass that assertion while
+            # reintroducing exactly the cost the check exists to avoid -- a
+            # flood making the server read every attacker-sized body.
+            monkeypatch.setattr(Request, "body", _body_must_not_be_read)
+
+            second = await client.post("/webhooks/whoop", content=valid_event_body, headers=headers)
+
+        assert second.status_code == 429
+
+    async def test_rate_limited_malformed_body_with_valid_signature_still_429(
+        self,
+        http_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        valid_timestamp: str,
+    ) -> None:
+        """A second confirmation of D2's ordering: a malformed body signed
+        correctly over its own (malformed) bytes would pass verification --
+        so getting 429 rather than 200 here proves the limit check ran
+        first and short-circuited before verification, not just before
+        JSON parsing.
+        """
+        monkeypatch.setenv("WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "1")
+        client_secret = "test-secret-key"
+        malformed_body = b"{not valid json"
+        signature = compute_webhook_signature(valid_timestamp, malformed_body, client_secret)
+        headers = {
+            "X-WHOOP-Signature": signature,
+            "X-WHOOP-Signature-Timestamp": valid_timestamp,
+            "Content-Type": "application/json",
+        }
+
+        app = build_server().streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            first = await client.post("/webhooks/whoop", content=malformed_body, headers=headers)
+            assert first.status_code == 200
+
+            second = await client.post("/webhooks/whoop", content=malformed_body, headers=headers)
+
+        assert second.status_code == 429
+
+    async def test_zero_rate_limit_disables_limiting_over_http(
+        self,
+        http_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        valid_event_body: bytes,
+        valid_timestamp: str,
+    ) -> None:
+        monkeypatch.setenv("WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "0")
+        client_secret = "test-secret-key"
+        signature = compute_webhook_signature(valid_timestamp, valid_event_body, client_secret)
+        headers = {
+            "X-WHOOP-Signature": signature,
+            "X-WHOOP-Signature-Timestamp": valid_timestamp,
+            "Content-Type": "application/json",
+        }
+
+        app = build_server().streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            statuses = [
+                (
+                    await client.post("/webhooks/whoop", content=valid_event_body, headers=headers)
+                ).status_code
+                for _ in range(150)
+            ]
+
+        assert all(status == 200 for status in statuses)
+
+    async def test_negative_rate_limit_disables_limiting_over_http(
+        self,
+        http_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        valid_event_body: bytes,
+        valid_timestamp: str,
+    ) -> None:
+        monkeypatch.setenv("WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "-1")
+        client_secret = "test-secret-key"
+        signature = compute_webhook_signature(valid_timestamp, valid_event_body, client_secret)
+        headers = {
+            "X-WHOOP-Signature": signature,
+            "X-WHOOP-Signature-Timestamp": valid_timestamp,
+            "Content-Type": "application/json",
+        }
+
+        app = build_server().streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            statuses = [
+                (
+                    await client.post("/webhooks/whoop", content=valid_event_body, headers=headers)
+                ).status_code
+                for _ in range(150)
+            ]
+
+        assert all(status == 200 for status in statuses)
