@@ -589,6 +589,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #73: `README.md`'s status banner still called this a pre-alpha
+  scaffold whose internals raise `NotImplementedError`, and its Roadmap
+  table listed #1–#6 (all closed) as the tracked gaps; `docs/SETUP.md`
+  repeated the `NotImplementedError` claim in troubleshooting. Rewritten to
+  state what's actually true: local mode works against the real WHOOP v2
+  API, the hosted surface is implemented but unaudited (#37, #69), and a
+  shared hosted deployment is capped at 10 members until WHOOP approves the
+  app (#33). The Roadmap table now lists the genuinely open work (#33, #34,
+  #37, #69, #76, #70, #71, #75) instead.
 - Issue #74: `lifespan()` opened `cache.sqlite3` unconditionally, so a
   default local stdio session (no `WHOOPMCP_CACHE`, webhooks disabled)
   created the database, linked a principal to a member on login, and wrote a

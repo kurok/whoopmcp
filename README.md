@@ -17,10 +17,13 @@ tokens and health data server-side, which makes them a data controller, not
 a bystander. See [PRIVACY.md](PRIVACY.md)'s local-mode/hosted-mode split
 before hosting this for anyone but yourself.
 
-> **Status: pre-alpha scaffold.** The structure, tool surface, configuration
-> and test harness are in place; the network and analysis internals are
-> stubbed and raise `NotImplementedError`. See [Roadmap](#roadmap). Nothing
-> here talks to WHOOP yet.
+> **Status.** Local mode works today against the real WHOOP v2 API,
+> read-only. The hosted surface (streamable HTTP, OAuth resource server,
+> per-tenant isolation, encrypted token storage, webhooks, metrics) is
+> implemented but has **not** been through a security audit (#37, #69).
+> Running it hosted for others also needs WHOOP's app approval, not yet
+> granted, which caps a shared deployment at 10 members in the meantime
+> (#33). See [Roadmap](#roadmap).
 
 > **Not affiliated with WHOOP, Inc.** "WHOOP" is their trademark. This is an
 > independent client of their public developer API.
@@ -208,19 +211,16 @@ each can be tested without the other.
 
 ## Roadmap
 
-The scaffold is complete and CI is green; these are the tracked gaps.
-
 | Issue | Work |
 | --- | --- |
-| #1 | OAuth token exchange and refresh |
-| #2 | HTTP transport: bearer auth, 429 handling, pagination |
-| #3 | Record shaping: metric extraction, summaries, trends, correlation |
-| #4 | Auth tools |
-| #5 | Data tools |
-| #6 | Analysis tools |
-
-Each stub raises `NotImplementedError` naming its issue, and the test suite
-pins the contract each one must satisfy.
+| #33 | [human] Submit the WHOOP app for approval; lifts the 10-member cap on hosted deployments |
+| #34 | Publish to PyPI and the MCP registry |
+| #37 | Full security audit, after everything else here lands |
+| #69 | Earlier-scoped security audit of the already-merged hosted surface |
+| #76 | `whoopmcp login` terminal subcommand, instead of routing the OAuth dance through the model |
+| #70 | README: install instructions and Configuration table |
+| #71 | CONTRIBUTING.md's module map |
+| #75 | Docs claim `delete-member` isn't wired up; it is |
 
 ## Contributing
 

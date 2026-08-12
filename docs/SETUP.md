@@ -307,10 +307,6 @@ with WHOOP, #9) — not a separate budget per member. Narrow your date range;
 collections page at 25 records maximum, so a year of history is roughly 15
 requests per collection.
 
-**A tool raises `NotImplementedError`** — expected in 0.1.x. The scaffold is
-published; the internals are not implemented yet. The error names the issue
-tracking it, and the [roadmap](../README.md#roadmap) lists them.
-
 **Not sure what's actually wrong?** Run `whoopmcp doctor`. It checks your
 configuration, stored credentials, the local store, and sync state in one
 pass and reports each in a sentence, exiting non-zero if anything needs
