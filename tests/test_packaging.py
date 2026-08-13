@@ -694,3 +694,43 @@ def test_sdk_still_leaves_uvicorns_log_config_to_its_default() -> None:
         "the LOGGING_CONFIG mutation in _route_uvicorn_access_log_to_stderr -- "
         "access logs are back on stdout and PRIVACY.md's stderr-only row is false"
     )
+
+
+def test_compact_database_citation_of_privacy_md_resolves(project_root: Path) -> None:
+    """Issue #128: `compact_database`'s docstring said `PRAGMA secure_delete` is 0
+    "by design -- see PRIVACY.md", and PRIVACY.md said nothing about
+    `secure_delete` or residual bytes anywhere.
+
+    A pointer to documentation that does not exist is worse than no pointer: it
+    reads as though the trade-off is disclosed to users when it was disclosed only
+    to whoever read the source. This pins the pointer to actually resolving.
+
+    Asserted against PRIVACY.md's **retention** section specifically, not the
+    whole file. The erasure section already mentioned `VACUUM`, so a
+    file-wide substring check would have passed before the fix and proved nothing
+    -- the gap was that retention, the deletion class that runs on a schedule, said
+    nothing about bytes surviving until the next compaction.
+    """
+    import inspect
+
+    from whoopmcp.store import compact_database
+
+    docstring = inspect.getdoc(compact_database) or ""
+    assert "PRIVACY.md" in docstring, (
+        "compact_database no longer cites PRIVACY.md; if the citation was removed "
+        "on purpose, this test should go with it"
+    )
+
+    privacy = (project_root / "PRIVACY.md").read_text(encoding="utf-8")
+    assert "**Retention.**" in privacy, "PRIVACY.md's retention section moved or was renamed"
+    retention = privacy[privacy.index("**Retention.**") : privacy.index("**Backups.**")]
+
+    assert "secure_delete" in retention, (
+        "PRIVACY.md's retention section does not mention `secure_delete`, so "
+        "compact_database's citation points at text that does not exist (#128)"
+    )
+    for phrase in ("rows", "bytes"):
+        assert phrase in retention, (
+            f"PRIVACY.md's retention section does not distinguish {phrase!r}; the "
+            "row-versus-byte caveat is what #128 added"
+        )
