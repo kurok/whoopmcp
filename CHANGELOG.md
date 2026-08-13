@@ -671,6 +671,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #121 (#37 audit, P2, latent): `verify_token` enforced audience and
+  issuer but never expiry, and its docstring enumerated the rejection reasons
+  while omitting it -- which is how the gap survived review. Nothing else
+  covered it either: the SDK's `RequireAuthMiddleware` has zero `expires_at`
+  references, so an integration calling `verify_token` directly inherited no
+  expiry check at all and would honour an expired-but-otherwise-valid token.
+
+  A token whose `expires_at` is `None` is now **rejected as unbounded**, not
+  accepted. This was #121's one genuine decision and is recorded on the issue
+  rather than made silently. Every other branch in `verify_token` already treats
+  missing information as grounds for rejection, `AccessToken.expires_at`
+  *defaults* to `None` so a resolver that forgets it produces exactly this case,
+  and the asymmetry decides it: rejecting fails loudly the first time a real
+  resolver is wired up, while accepting grants a permanent credential to a year
+  of someone's physiological data, silently.
+
+  The check is deliberately not a copy of the SDK's. `BearerAuthBackend` guards
+  with `if auth_info.expires_at and ...`, so `expires_at = 0` -- the epoch,
+  comprehensively expired -- is falsy and read as "no expiry set".
+  `_is_unexpired` tests `is None` explicitly, and compares with `<=` because
+  RFC 7519 requires the current time to be strictly before `exp`. Both are
+  pinned by tests.
+
+  Also: `_resolve`'s docstring now records what a real resolver inherits (the
+  issuer, audience and expiry checks) and what it does not and cannot -- the
+  cryptographic binding. By the time `verify_token` holds an `AccessToken`, both
+  its checks read `resource` and `claims["iss"]` as data, so a resolver that
+  decodes a JWT without verifying its signature lets an attacker forge both.
+  That obligation is invisible from `verify_token`'s own code, which is exactly
+  why it is written where the resolver will be. No scope check was added, with
+  the reason stated and a test pinning it: `verify_token` takes no
+  `required_scopes`, and `RequireAuthMiddleware` already enforces them.
+
+  Every existing `AccessToken` in `test_mcpauth.py` gained an explicit expiry --
+  21 of them, none had one. That matters beyond making them pass: a token built
+  to be rejected for its *resource* or *issuer* must not start being rejected
+  for a missing expiry instead, or the check it was written to exercise stops
+  being exercised. The same trap the file's own #102 note describes for `iss`.
+
+  `_is_unexpired` also verifies the value's `int` shape, for the reason
+  `_issued_by_trusted_as` already states about `claims`: `model_construct`
+  bypasses pydantic's validation and a future non-pydantic resolver need not
+  honour the declared type. Without it a `str` or `datetime` expiry raised
+  `TypeError` out of the verifier -- a 500 rather than a 401 -- and an object
+  with a custom `__gt__` was *accepted*. Found in review; this check was the
+  only one in the module not already meeting that standard.
+
+  Still latent overall -- `_resolve` returns `None` unconditionally, so no token
+  is accepted by any path today. The value is that whoever plugs in a real
+  resolver inherits a boundary that is correct rather than one that looks it.
 - Issue #155 (found reviewing #154, P3, latent): `_execute_scoped` documents
   that it calls `conn.rollback()` before raising, because a non-`SELECT`
   statement has already run by the time a tenancy violation can be detected.
