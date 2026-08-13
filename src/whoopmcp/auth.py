@@ -666,8 +666,20 @@ class Authenticator:
             )
         _raise_for_token_error(response)
         token = Token.from_response(response.json())
-        self._store.save(token)
+        # Install before persisting (issue #134). By this point WHOOP has
+        # already minted the grant: if `save` raises -- a full disk, a
+        # read-only state directory, a `SealError` from a half-configured
+        # key set -- then persisting failed, but the grant is live upstream
+        # regardless. Assigning first means this process still holds the
+        # only copy, so the session keeps working and `revoke_and_forget`
+        # can still kill the grant. The alternative loses the sole handle on
+        # a live, refreshable credential and leaves the user retrying,
+        # minting a fresh grant each time.
+        #
+        # The exception still propagates: the caller must know the token was
+        # not written and will not survive a restart.
         self._token = token
+        self._store.save(token)
         return token
 
     async def refresh(self, token: Token) -> Token:
