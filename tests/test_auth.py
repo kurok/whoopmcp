@@ -1573,18 +1573,28 @@ async def test_logout_during_refresh_leaves_store_empty(config: Config) -> None:
 async def test_revoke_and_forget_during_refresh_leaves_store_empty(config: Config) -> None:
     """Test 2: `revoke_and_forget()` must also not be undone by an in-flight refresh.
 
-    The interleaving matters and the obvious one does not test anything.
-    `revoke_and_forget` refreshes first when the stored token is expired, so a
-    refresh started beforehand simply *coalesces* onto the same task -- the
-    save then happens before the revoke, and the test passes on unfixed code
-    while proving nothing (this is exactly how the first version of this test
-    was vacuous).
+    The interleaving matters, and two plausible ones prove nothing (#143).
 
-    So: hold the store's token LIVE (no refresh needed inside
-    `revoke_and_forget`), gate its DELETE, start a *separate* refresh while
-    that DELETE is in flight, then let the DELETE finish -- which runs
-    `logout()` and bumps the epoch -- and only then let the refresh complete.
-    The refresh must find the epoch changed and discard its result.
+    First, the obvious one: `revoke_and_forget` refreshes when the stored token
+    is expired, so a refresh started beforehand merely *coalesces* onto the same
+    task -- the save lands before the revoke and the test passes on unfixed code.
+
+    Second, and this is the one that shipped: hold the store's token live, then
+    start a refresh with some *other*, expired token. That looks like it puts a
+    refresh in flight and does not. `refresh()` re-reads the store after taking
+    the lock, finds a live token that `_supersedes` the caller's, and returns it
+    immediately -- `_do_refresh` is never entered, no task is created, nothing
+    could ever write to the store, and every assertion below is trivially true.
+    Measured: `_do_refresh` entered 0 times, `_inflight_refresh` never set.
+
+    What discriminates is refreshing with the *same* token the store holds:
+    `_supersedes` compares credential identity, so it is False, the recheck does
+    not short-circuit, and the refresh proceeds to `_do_refresh` and its save.
+    The revoke's DELETE is gated so `logout()` -- and the epoch bump -- happen
+    while that refresh is in flight.
+
+    The assertion that `_inflight_refresh` was actually set is what stops this
+    regressing to a vacuous test a third time.
     """
     store = FileTokenStore(config.token_path)
     live_token = Token("live-access", expires_at=time.time() + 3600, refresh_token="live-refresh")
@@ -1612,15 +1622,18 @@ async def test_revoke_and_forget_during_refresh_leaves_store_empty(config: Confi
         await delete_started.wait()
 
         # A refresh now in flight, started while the revoke is mid-DELETE.
-        refresh_task = asyncio.create_task(
-            auth.refresh(
-                Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
-            )
-        )
+        # `live_token` -- the same one the store holds -- specifically so the
+        # store recheck inside `refresh()` does not short-circuit; see the
+        # docstring. Any other token would make this test vacuous.
+        refresh_task = asyncio.create_task(auth.refresh(live_token))
         for _ in range(50):
             await asyncio.sleep(0)
             if auth._inflight_refresh is not None:
                 break
+        assert auth._inflight_refresh is not None, (
+            "no refresh is actually in flight, so nothing below can be discarded "
+            "by the epoch check and this test proves nothing"
+        )
 
         finish_delete.set()
         with contextlib.suppress(AuthError):

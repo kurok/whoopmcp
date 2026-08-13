@@ -671,6 +671,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #143 (follow-up to #123): `test_revoke_and_forget_during_refresh_leaves
+  _store_empty` asserted the right invariant and could not be made to fail, so it
+  documented a guarantee without guarding it. Now it discriminates. Tests only --
+  no source change; the interlock itself was already correct.
+
+  The cause was not either candidate the issue guessed. The refresh it started
+  was never *created*: it passed a different, expired token, so `refresh()`'s
+  store recheck found the live stored token `_supersedes` it, returned that
+  immediately, and `_do_refresh` was entered zero times with `_inflight_refresh`
+  never set. Nothing could write to the store, so every assertion was trivially
+  true. Refreshing with the *same* token the store holds makes `_supersedes`
+  false, the recheck does not short-circuit, and the refresh reaches the save the
+  epoch check guards.
+
+  Proven by mutation rather than asserted: with `_do_refresh`'s
+  `if epoch == self._credential_epoch:` replaced by `if True:`, the old test
+  **passes** and the new one **fails**. All four epoch-interlock tests fail under
+  that mutant, so none of them is vacuous.
+
+  The test now also asserts `_inflight_refresh is not None` before proceeding,
+  which is what stops it silently degrading to a no-op a third time -- the
+  original version was vacuous for one reason, its replacement for another.
+
 - Issue #138 (#37 audit, P3, latent): `crypto._associated_data` built the AEAD
   associated data as `f"whoopmcp.seal.v{version}".encode() + extra`, with nothing
   between the two, so `(version=1, extra=b"2whoopmcp.token")` and
