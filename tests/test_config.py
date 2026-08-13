@@ -154,3 +154,142 @@ def test_malformed_backfill_floor_date_is_rejected_at_startup() -> None:
 
     with pytest.raises(ConfigError, match="WHOOPMCP_BACKFILL_FLOOR_DATE"):
         Config.from_env(env)
+
+
+# -- repr redaction (issue #133) -----------------------------------------------
+#
+# Issue #37's audit found that repr(Token) and repr(Config) expose every secret
+# they hold. This test suite ensures that repr=False is applied to the exact
+# fields that hold secrets, without redacting non-secret fields that aid
+# diagnosis.
+
+
+def test_no_secret_in_repr_config(tmp_path: Path) -> None:
+    """Test 2: No secret in repr(Config).
+
+    Client secret, key bytes (in all forms: raw bytes, .hex(), base64),
+    metrics token, and metrics_member_salt must not appear in repr(Config).
+
+    This test MUST FAIL against current main (before repr=False is added).
+    """
+    import base64
+    import os
+
+    client_secret = "CLIENT-SECRET-abc123"
+    key_bytes = os.urandom(32)
+    metrics_token = "METRICS-SECRET-xyz789"
+    metrics_salt = "SALT-SECRET-def456"
+
+    config = Config(
+        client_id="cid",
+        client_secret=client_secret,
+        redirect_uri="https://localhost:8443/callback",
+        state_dir=tmp_path,
+        token_encryption_keys={1: key_bytes},
+        token_encryption_key_version=1,
+        metrics_token=metrics_token,
+        metrics_member_salt=metrics_salt,
+    )
+
+    config_repr = repr(config)
+
+    # Check the client secret itself
+    assert client_secret not in config_repr, f"client_secret leaked in repr: {config_repr}"
+
+    # Check the encryption key in all forms it could surface. `config_repr`
+    # is a str, so the raw `bytes` object itself can never be a substring of
+    # it (Python raises TypeError on `bytes in str`) -- what a default repr
+    # would actually emit for a bytes field is its own repr/str form (e.g.
+    # "b'\\x01...'"), which is what str(bytes) produces.
+    assert str(key_bytes) not in config_repr, (
+        f"encryption key (raw bytes) leaked in repr: {config_repr}"
+    )
+    assert key_bytes.hex() not in config_repr, (
+        f"encryption key (hex form) leaked in repr: {config_repr}"
+    )
+    assert base64.b64encode(key_bytes).decode() not in config_repr, (
+        f"encryption key (base64 form) leaked in repr: {config_repr}"
+    )
+
+    # Check metrics secrets
+    assert metrics_token not in config_repr, f"metrics_token leaked in repr: {config_repr}"
+    assert metrics_salt not in config_repr, f"metrics_member_salt leaked in repr: {config_repr}"
+
+
+def test_non_secret_fields_shown_in_repr_config(tmp_path: Path) -> None:
+    """Test 3: Non-secret fields ARE still shown (D2).
+
+    The token_backend name and token_encryption_key_version integer are not
+    secrets and must remain visible in repr(Config) so diagnostics work.
+    Redacting everything is worse for debugging than redacting nothing.
+    """
+    config = Config(
+        client_id="cid",
+        client_secret="csecret",
+        redirect_uri="https://localhost:8443/callback",
+        state_dir=tmp_path,
+        token_backend="keyring",
+        token_encryption_key_version=3,
+    )
+
+    config_repr = repr(config)
+
+    # The backend name (not a secret, just a choice between file/keyring/encrypted-file)
+    # must appear
+    assert "keyring" in config_repr, (
+        f"token_backend value must be visible in repr for diagnostics: {config_repr}"
+    )
+
+    # The key version number (not a secret, just an integer) must appear
+    assert "3" in config_repr, (
+        f"token_encryption_key_version value must be visible in repr for diagnostics: {config_repr}"
+    )
+
+
+def test_every_secret_field_has_repr_false() -> None:
+    """Test 5: Structural guard (no regression on secret field additions).
+
+    Every field whose name contains 'secret', 'key', 'token', or 'salt'
+    (and which is actually a secret) must have repr=False. This test derives
+    the field list from dataclasses.fields at runtime, so adding a new
+    secret-bearing field later will fail the test rather than silently leak.
+
+    Fields that match the naming pattern but are NOT secrets (e.g. client_id,
+    token_backend, token_encryption_key_version) are explicitly exempted.
+    """
+    import dataclasses
+
+    # Fields that match secret-like names but are NOT secrets
+    # (public identifiers, configuration names, version numbers, paths, etc.)
+    allowed_exceptions = {
+        # Token fields
+        "scopes",  # List of OAuth scope names (e.g. "read:sleep"), not secret
+        # Config fields
+        "client_id",  # OAuth client id (public)
+        "token_backend",  # Backend name (file/keyring/encrypted-file), not a secret
+        "token_encryption_key_version",  # Integer version number, not a secret
+        "token_path",  # Filesystem path, not a secret
+        "redirect_uri",  # OAuth redirect URI (public)
+        "backfill_floor_date",  # Date string, not a secret
+    }
+
+    from whoopmcp.auth import Token
+    from whoopmcp.config import Config
+
+    for klass in (Token, Config):
+        for field in dataclasses.fields(klass):
+            # Check if the field name matches a secret-like pattern
+            lower_name = field.name.lower()
+            is_secret_named = any(
+                keyword in lower_name for keyword in ("secret", "key", "token", "salt")
+            )
+
+            if is_secret_named and field.name not in allowed_exceptions:
+                # This field matches a secret pattern and is not in the allowed list
+                # It MUST have repr=False
+                assert field.repr is False, (
+                    f"{klass.__name__}.{field.name}: field name matches a secret pattern "
+                    f"('secret', 'key', 'token', or 'salt') but has repr=True. "
+                    f"It should have repr=False. If this is not actually a secret, "
+                    f"add it to allowed_exceptions in the test."
+                )

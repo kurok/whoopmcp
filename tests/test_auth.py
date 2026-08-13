@@ -2111,3 +2111,49 @@ async def test_issue_122_test_6_coalescing_intact(
     )
     assert results[0] == results[1]
     assert results[0].access_token == "new-access"
+
+
+# -- repr redaction (issue #133) -----------------------------------------------
+#
+# Issue #37's audit found that repr(Token) and repr(Config) expose every secret
+# they hold. This test suite ensures that repr=False is applied to the exact
+# fields that hold secrets, without redacting non-secret fields that aid
+# diagnosis.
+
+
+def test_no_secret_in_repr_token() -> None:
+    """Test 1: No secret in repr(Token).
+
+    Neither the access token nor the refresh token appears in repr(Token).
+
+    This test MUST FAIL against current main (before repr=False is added).
+    """
+    access_secret = "ACCESS-SECRET-abc123"
+    refresh_secret = "REFRESH-SECRET-xyz789"
+    token = Token(access_token=access_secret, expires_at=1234.0, refresh_token=refresh_secret)
+
+    token_repr = repr(token)
+
+    assert access_secret not in token_repr, f"access token leaked in repr: {token_repr}"
+    assert refresh_secret not in token_repr, f"refresh token leaked in repr: {token_repr}"
+
+
+def test_json_serialization_unaffected_by_repr_redaction() -> None:
+    """Test 4: Serialisation is unaffected (D4).
+
+    Even though repr(Token) redacts secrets, to_json() still contains them
+    intact. Redaction is display-only, not data-loss.
+    """
+    access_secret = "SECRET-ACCESS-TOKEN-xyz"
+    refresh_secret = "SECRET-REFRESH-TOKEN-abc"
+    token = Token(access_token=access_secret, expires_at=1234.0, refresh_token=refresh_secret)
+
+    json_str = token.to_json()
+
+    # The JSON must contain the values (not redacted)
+    assert access_secret in json_str, "access token must appear in JSON"
+    assert refresh_secret in json_str, "refresh token must appear in JSON"
+
+    # Round-trip must work
+    restored = Token.from_json(json_str)
+    assert restored == token

@@ -124,7 +124,7 @@ class Config:
     """
 
     client_id: str
-    client_secret: str
+    client_secret: str = field(repr=False)
     redirect_uri: str
     scopes: tuple[str, ...] = DEFAULT_SCOPES
     token_backend: TokenBackend = "file"  # noqa: S105 -- a backend name, not a credential value
@@ -139,11 +139,11 @@ class Config:
     webhooks_enabled: bool = False
     webhook_timestamp_skew_seconds: float = 300.0
     webhook_rate_limit_per_minute: int = 120
-    token_encryption_keys: Mapping[int, bytes] = field(default_factory=dict)
+    token_encryption_keys: Mapping[int, bytes] = field(default_factory=dict, repr=False)
     token_encryption_key_version: int | None = None
     backfill_floor_date: str | None = None
-    metrics_token: str | None = None
-    metrics_member_salt: str | None = None
+    metrics_token: str | None = field(default=None, repr=False)
+    metrics_member_salt: str | None = field(default=None, repr=False)
 
     @property
     def token_path(self) -> Path:
