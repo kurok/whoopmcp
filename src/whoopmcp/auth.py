@@ -20,7 +20,7 @@ import secrets
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlencode
@@ -74,9 +74,9 @@ class GrantAlreadyGoneError(AuthError):
 class Token:
     """An access token and everything needed to renew it."""
 
-    access_token: str
+    access_token: str = field(repr=False)
     expires_at: float
-    refresh_token: str | None = None
+    refresh_token: str | None = field(default=None, repr=False)
     scopes: tuple[str, ...] = ()
 
     @property

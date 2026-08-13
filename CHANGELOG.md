@@ -632,6 +632,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #133 (#37 audit, P3): `repr(Token)` and `repr(Config)` no longer print
+  the secrets they hold. `access_token` and `refresh_token` on `Token`, and
+  `client_secret`, `token_encryption_keys`, `metrics_token`, and
+  `metrics_member_salt` on `Config`, are now `field(repr=False)` -- the exact
+  six fields the audit found exposed, no more. `token_backend` and
+  `token_encryption_key_version` stay visible: they're a backend name and an
+  integer version, not credentials, and a repr that hides everything is as
+  unhelpful for diagnosis as one that hides nothing is unsafe. Nothing else
+  changes: no custom `__repr__`, `__str__`, or serialisation touched, and the
+  exposure was latent -- no current call site reprs either object -- so this
+  closes a future footgun rather than a live leak.
+
 - Issue #120 (#37 audit): the OAuth `state` is now single-use.
   `Authenticator.verify_state` used to leave `_pending_state` in place after
   a successful check, so the same value verified indefinitely instead of
