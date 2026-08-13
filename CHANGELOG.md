@@ -671,6 +671,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #163 (found reviewing #121): three tests named for the RFC 8707 audience
+  check did not detect its removal. Their tokens carried no `claims`, so
+  `_issued_by_trusted_as` rejected them first -- `claims=None` is not a dict --
+  and they would have passed identically with `_names_this_resource` stubbed to
+  accept everything. Each now carries a trusted `iss`, so the only reason left to
+  reject is the resource claim under test. Tests only; the audience check itself
+  was always correct and enforced.
+
+  Verified by mutation, which is the only thing that settles it. With
+  `_names_this_resource` stubbed to `return True`: **before, one test noticed;
+  now, four do.**
+
+  Swept the rest of the file the same way, since the same defect could hide
+  anywhere: disabling the issuer check is caught by 6 tests and disabling the
+  expiry check by 7, so every check in `verify_token` is now detected by several
+  tests named for it and no sibling has the vacuity defect.
+
+  This is the mirror of the file's own #102 note, which explains why the
+  resource-*acceptance* test needs a valid `iss`. The rejection tests needed the
+  same thing for the opposite reason, and that was missed -- the second instance
+  of this class in two iterations, after #143.
+
 - Issue #143 (follow-up to #123): `test_revoke_and_forget_during_refresh_leaves
   _store_empty` asserted the right invariant and could not be made to fail, so it
   documented a guarantee without guarding it. Now it discriminates. Tests only --
