@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #186: one record with a future-dated `updated_at` could permanently
+  poison the incremental-sync high-water mark. Nothing bounded the mark against
+  the present, so such a value became the cursor; every later run then requested
+  a window starting in the future, got nothing back, and wrote the same value
+  straight in again. `run_sync` reported `{"synced": true, "count": 0}` forever
+  -- indistinguishable, from its own return value, from a healthy caught-up
+  sync. Recovery required hand-editing `sync_state`.
+
+  A record dated more than `_MAX_CLOCK_SKEW_SECONDS` (5 minutes) ahead, or whose
+  timestamp cannot be parsed at all, no longer advances the mark. The record is
+  still stored -- only its claim on the cursor is refused -- and the count of
+  refusals is reported on `EntitySyncResult` and by the `whoop_sync` tool, so a
+  run that refused something does not read as a clean one.
+
+  A mark already poisoned in the database is discarded on read, which is what
+  lets a bitten installation heal on its next run rather than only protecting
+  those not yet bitten. It is discarded rather than clamped to the present:
+  clamping would silently skip every record that arrived while the mark was
+  wrong, whereas discarding it means "no mark", so the next run re-walks from
+  the epoch. That is lossless for the reason the module already documents for a
+  never-synced entity -- the upserts are idempotent, so a full walk costs
+  requests rather than correctness -- and it matches what the write side already
+  does with the same class of failure. The resume path's JSON cursor is cleaned
+  too, so an interrupted run does not re-persist the poison.
+
+
 - Issue #182: `extract_metric` promised to skip nulls and crashed on one.
   `_filtered_records` -- the single SCORED-and-key-present filter every analysis
   path shares -- skipped a record only when the metric key was *absent*. A

@@ -1744,7 +1744,14 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         return {
             "synced": True,
             "entities": {
-                name: {"count": result.count, "cursor": result.high_water_mark}
+                name: {
+                    "count": result.count,
+                    "cursor": result.high_water_mark,
+                    # Surfaced so a run that refused a record as a cursor
+                    # candidate does not read as a clean one (#186) -- both
+                    # otherwise show the same count and the same cursor.
+                    "skipped_implausible": result.skipped_implausible,
+                }
                 for name, result in results.items()
             },
         }

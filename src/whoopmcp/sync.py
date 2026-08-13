@@ -88,6 +88,11 @@ class EntitySyncResult:
     #: The high-water ``updated_at`` mark now on record for this entity, or
     #: ``None`` if nothing has ever been synced for it.
     high_water_mark: str | None
+    #: Records stored but refused as mark candidates -- unparseable, or dated
+    #: implausibly far ahead (#186). Reported because a run that refused
+    #: something must not read as a clean one: both otherwise show the same
+    #: ``count`` and the same unchanged cursor.
+    skipped_implausible: int = 0
 
 
 def _incremental_entity_key(name: str) -> str:
@@ -103,6 +108,74 @@ def _incremental_entity_key(name: str) -> str:
 def _now() -> str:
     """Current UTC time, the same ISO 8601 shape ``store._now``/``backfill._now`` write."""
     return datetime.now(UTC).isoformat()
+
+
+#: How far ahead of local time a record's ``updated_at`` may sit and still be
+#: trusted to advance the high-water mark.
+#:
+#: Some skew is normal -- WHOOP's clock and this host's are independent, and an
+#: NTP-synced pair is within seconds -- so the bound cannot be "not after now"
+#: without rejecting perfectly good records. Five minutes is far outside any
+#: real skew while being far inside any value that could strand the cursor: a
+#: mark five minutes ahead costs at most those few minutes of forward progress
+#: on the next run, whereas a mark set to 2099 costs everything, forever (#186).
+#:
+#: The number is a judgement, not a derivation. Raising it widens the window in
+#: which a bogus timestamp can still poison the mark; lowering it risks refusing
+#: legitimate records on a host whose clock drifts.
+_MAX_CLOCK_SKEW_SECONDS = 300
+
+
+def _is_plausible_mark(value: str, *, now: datetime) -> bool:
+    """Whether ``value`` may advance the high-water mark.
+
+    Two ways to fail. It may not parse at all -- the mark is whatever string a
+    record carried, and nothing validates that before it is stored -- and the
+    parse is guarded rather than allowed to raise, because raising here would
+    turn a malformed record into a crash mid-run, which is strictly worse than
+    the stale mark this function exists to prevent. It may also sit implausibly
+    far in the future, which is the poisoning case: once such a value becomes
+    the mark, every later run asks WHOOP for a window starting in the future,
+    gets nothing, and writes the same value back -- reporting success forever
+    while syncing nothing.
+
+    A refused record is still stored. Only its claim on the cursor is denied.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed <= now + timedelta(seconds=_MAX_CLOCK_SKEW_SECONDS)
+
+
+def _usable_resume_mark(mark: str, *, now: datetime) -> str | None:
+    """``mark`` if it is usable as a starting point, otherwise ``None``.
+
+    This is the recovery half of #186. Refusing to *write* a poisoned mark
+    protects installations that have not been bitten yet; it does nothing for a
+    database that already holds one, and such a cursor never revises itself --
+    every run starts in the future, finds nothing, and writes the same value
+    back. Discarding it on read is what lets an already-poisoned installation
+    heal on its next run.
+
+    ``None``, not the present, because a poisoned mark tells us nothing about
+    when it stopped being true, so clamping to now would silently skip every
+    record that arrived while it was wrong. ``None`` means "no mark", which
+    sends the next run through ``_EPOCH_SINCE`` and re-walks the history --
+    lossless, and safe for exactly the reason the module docstring already gives
+    for a never-synced entity: the upserts are idempotent, so a full walk costs
+    requests rather than correctness.
+
+    It is also what the *write* side already does with this class of failure --
+    a run that cannot establish a mark leaves the cursor ``None`` and the next
+    run re-walks. Returning the present here would have given one bug two
+    contradictory recovery policies, the read side being the lossy one.
+    """
+    if _is_plausible_mark(mark, now=now):
+        return mark
+    return None
 
 
 def _apply_overlap(high_water_mark: str, overlap_seconds: float) -> str:
@@ -163,6 +236,10 @@ async def _sync_entity(
     """
     key = _incremental_entity_key(spec.name)
     state = get_sync_state(conn, whoop_user_id, key)
+    # One reading of the clock for the whole run: every plausibility check below
+    # is then made against the same instant, so two records in one page cannot
+    # be judged against different `now`s.
+    now = datetime.now(UTC)
 
     if state is not None and state["outcome"] == "in_progress":
         # Resume verbatim: the same `since` bound this run started with, and
@@ -182,8 +259,22 @@ async def _sync_entity(
         next_token: str | None = resume["next_token"]
         high_water_seen: str | None = resume["high_water_seen"]
         fallback_mark: str | None = resume["previous_mark"]
+        # An `in_progress` row can carry a poisoned value just as a `complete`
+        # one can, and #186 asks for recovery on the *next* run. Clamping only
+        # the fresh branch left a resumed run requesting a future window and
+        # re-persisting the poison, so recovery took two runs instead of one.
+        if since is not None and not _is_plausible_mark(since, now=now):
+            since = _EPOCH_SINCE
+        if high_water_seen is not None and not _is_plausible_mark(high_water_seen, now=now):
+            high_water_seen = None
+        if fallback_mark is not None:
+            fallback_mark = _usable_resume_mark(fallback_mark, now=now)
     else:
         previous_mark = state["cursor"] if state is not None else None
+        if previous_mark is not None:
+            # Heal a cursor that is already poisoned on disk (#186), before it
+            # is used to build this run's window.
+            previous_mark = _usable_resume_mark(previous_mark, now=now)
         since = (
             _apply_overlap(previous_mark, overlap_seconds)
             if previous_mark is not None
@@ -198,6 +289,7 @@ async def _sync_entity(
 
     fetch = getattr(client, spec.list_method)
     count = 0
+    skipped_implausible = 0
     while True:
         page: Page = await fetch(
             start=since,
@@ -211,7 +303,18 @@ async def _sync_entity(
             updated_at = record.get("updated_at")
             if updated_at is not None:
                 updated_at = str(updated_at)
-                if high_water_seen is None or updated_at > high_water_seen:
+                # Checked after the upsert above, deliberately: the record is
+                # the member's data and is kept regardless. What is refused is
+                # only its claim on the cursor.
+                # Plausibility parses; the max below compares strings. They
+                # can pick different records when offsets or precision differ,
+                # but only ever a *chronologically earlier* one -- so the mark
+                # can lag and re-fetch, never overshoot. And since the check
+                # runs per record before the string enters the max, an
+                # implausible value cannot reach it either way.
+                if not _is_plausible_mark(updated_at, now=now):
+                    skipped_implausible += 1
+                elif high_water_seen is None or updated_at > high_water_seen:
                     high_water_seen = updated_at
         next_token = page.next_token
         if next_token is not None:
@@ -235,4 +338,6 @@ async def _sync_entity(
         set_sync_state(
             conn, whoop_user_id, key, cursor=final_mark, last_run_at=_now(), outcome="complete"
         )
-        return EntitySyncResult(count=count, high_water_mark=final_mark)
+        return EntitySyncResult(
+            count=count, high_water_mark=final_mark, skipped_implausible=skipped_implausible
+        )
