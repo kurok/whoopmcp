@@ -29,6 +29,7 @@ import httpx
 import pytest
 import respx
 
+from whoopmcp import webhook_processor
 from whoopmcp.auth import Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
@@ -845,6 +846,238 @@ class TestOutOfOrderEventHandling:
         sleeps = get_sleeps(db, user_id)
         assert len(sleeps) == 1
         assert sleeps[0]["end"] == "2026-08-10T16:00:00Z"
+
+    @respx.mock
+    async def test_finer_precision_newer_record_is_not_skipped_as_older(
+        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """#140: a genuinely newer record at finer precision must be applied.
+
+        The guard used to compare the two `updated_at` values as strings, which
+        matches chronological order only while every value has identical
+        precision. `.` (0x2E) sorts below `Z` (0x5A), so
+        `...:00.500Z` < `...:00Z` lexicographically -- and a record half a
+        second NEWER was discarded as older.
+
+        This is the direction that loses data: the guard exists to stop a stale
+        delivery clobbering a newer record, and here it dropped the newer one.
+        """
+        user_id = 456
+        sleep_id = "sleep-uuid-precision"
+        insert_principal(db, user_id)
+
+        from whoopmcp.store import get_sleeps, upsert_sleep
+
+        upsert_sleep(
+            db,
+            user_id,
+            {
+                "id": sleep_id,
+                "start": "2026-08-10T08:00:00Z",
+                "end": "2026-08-10T14:00:00Z",
+                "updated_at": "2026-08-10T16:00:00Z",
+            },
+        )
+
+        # Same second, finer precision, genuinely 0.5s newer.
+        newer_sleep = {
+            "id": sleep_id,
+            "start": "2026-08-10T08:00:00Z",
+            "end": "2026-08-10T16:30:00Z",
+            "updated_at": "2026-08-10T16:00:00.500Z",
+        }
+        respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id}").mock(
+            return_value=httpx.Response(200, json=newer_sleep)
+        )
+
+        payload = create_webhook_event_payload("sleep.updated", sleep_id, user_id)
+        await process_webhook_event(db, client, encode_webhook_body(payload))
+
+        sleeps = get_sleeps(db, user_id)
+        assert len(sleeps) == 1
+        assert sleeps[0]["end"] == "2026-08-10T16:30:00Z", (
+            "a record 0.5s newer was skipped as older -- the comparison is still lexicographic"
+        )
+
+
+class TestUpdatedAtComparisonIsChronological:
+    """#140: the out-of-order guard's comparison, exercised directly.
+
+    Driving `_upsert_if_not_older` rather than a whole webhook round-trip, so
+    each case pins one property of the comparison instead of also depending on
+    signature verification, fetching and idempotency bookkeeping.
+    """
+
+    def _stored(self, db: sqlite3.Connection, user_id: int, sleep_id: str, updated_at: str) -> None:
+        from whoopmcp.store import upsert_sleep
+
+        upsert_sleep(
+            db,
+            user_id,
+            {
+                "id": sleep_id,
+                "start": "2026-08-10T08:00:00Z",
+                "end": "2026-08-10T14:00:00Z",
+                "updated_at": updated_at,
+            },
+        )
+
+    def _apply(
+        self, db: sqlite3.Connection, user_id: int, sleep_id: str, updated_at: str | None
+    ) -> str:
+        """Offer a record with `end` moved, and report the stored `end`."""
+        from whoopmcp.store import get_sleeps
+
+        record: dict[str, object] = {
+            "id": sleep_id,
+            "start": "2026-08-10T08:00:00Z",
+            "end": "2026-08-10T16:30:00Z",
+        }
+        if updated_at is not None:
+            record["updated_at"] = updated_at
+        webhook_processor._upsert_if_not_older(db, "sleep", user_id, sleep_id, record)
+        return str(get_sleeps(db, user_id)[0]["end"])
+
+    APPLIED = "2026-08-10T16:30:00Z"
+    UNCHANGED = "2026-08-10T14:00:00Z"
+
+    def test_same_instant_spelled_with_an_offset_is_not_older(self, db: sqlite3.Connection) -> None:
+        """`+00:00` and `Z` are the same instant; `+` (0x2B) sorts below `Z`."""
+        insert_principal(db, 1)
+        self._stored(db, 1, "s1", "2026-08-10T16:00:00Z")
+        assert self._apply(db, 1, "s1", "2026-08-10T16:00:00+00:00") == self.APPLIED
+
+    def test_genuinely_older_at_finer_precision_is_still_skipped(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """The guard must still guard -- the regression that would make the fix
+        worthless.
+
+        The old comparison got this **wrong**, and this is the worse of the two
+        directions: `Z` (0x5A) sorts above `.` (0x2E), so a plain `...:00Z`
+        incoming value read as *newer* than a stored `...:00.500Z` and was
+        applied -- a genuinely older record overwriting a newer one. That is the
+        state regression this guard exists to prevent, so the guard was failing
+        at its own job, not merely dropping updates.
+        """
+        insert_principal(db, 2)
+        self._stored(db, 2, "s2", "2026-08-10T16:00:00.500Z")
+        assert self._apply(db, 2, "s2", "2026-08-10T16:00:00Z") == self.UNCHANGED
+
+    def test_equal_timestamps_are_applied(self, db: sqlite3.Connection) -> None:
+        """Only *strictly* older is skipped, unchanged from before."""
+        insert_principal(db, 3)
+        self._stored(db, 3, "s3", "2026-08-10T16:00:00Z")
+        assert self._apply(db, 3, "s3", "2026-08-10T16:00:00Z") == self.APPLIED
+
+    def test_unparseable_incoming_upserts_and_warns(
+        self, db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Not comparable is treated as absent -- upsert -- but logged, since
+        this is where the guard silently stops guarding."""
+        insert_principal(db, 4)
+        self._stored(db, 4, "s4", "2026-08-10T16:00:00Z")
+        with caplog.at_level(logging.WARNING, logger="whoopmcp"):
+            assert self._apply(db, 4, "s4", "tuesday-ish") == self.APPLIED
+        assert any("unparseable incoming updated_at" in r.getMessage() for r in caplog.records)
+
+    def test_absent_incoming_upserts_without_warning(
+        self, db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An absent `updated_at` is documented, expected, and not a warning --
+        only an unparseable one is."""
+        insert_principal(db, 5)
+        self._stored(db, 5, "s5", "2026-08-10T16:00:00Z")
+        with caplog.at_level(logging.WARNING, logger="whoopmcp"):
+            assert self._apply(db, 5, "s5", None) == self.APPLIED
+        assert not [r for r in caplog.records if "unparseable" in r.getMessage()]
+
+    def test_naive_value_is_read_as_utc_rather_than_raising(self, db: sqlite3.Connection) -> None:
+        """A value with no offset must not make the comparison raise on a
+        naive/aware mix. It is read as UTC, which is what the string comparison
+        this replaced already assumed."""
+        insert_principal(db, 6)
+        self._stored(db, 6, "s6", "2026-08-10T16:00:00Z")
+        # Naive and genuinely older -> still skipped, so it really was compared.
+        assert self._apply(db, 6, "s6", "2026-08-10T15:00:00") == self.UNCHANGED
+
+    def test_parsed_updated_at_rejects_non_strings(self) -> None:
+        """A non-string must return None rather than raise.
+
+        This matters for the *incoming* side only: `record.get("updated_at")`
+        comes straight out of a WHOOP API JSON response, where a number or an
+        object is possible. The stored side cannot reach it --
+        `get_resource_updated_at` already returns `str | None` -- so this is
+        defence at the boundary that can actually see a non-string, not both.
+        """
+        for value in (None, 12345, {"not": "a timestamp"}, ["2026-08-10T16:00:00Z"]):
+            assert webhook_processor._parsed_updated_at(value) is None
+
+    def test_sub_microsecond_difference_compares_equal_and_is_applied(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """A known, accepted cost of parsing: `fromisoformat` truncates past six
+        fractional digits, so values differing only in a 7th digit parse equal
+        and the incoming one is applied, because only *strictly* older is
+        skipped.
+
+        The string comparison this replaced ordered these correctly, so this is
+        a narrow regression against it -- pinned here rather than left to be
+        rediscovered. WHOOP sends second and millisecond precision; reading the
+        remaining digits exactly would mean hand-parsing them for an input that
+        does not occur. If WHOOP ever does emit sub-microsecond timestamps, this
+        test is the thing that should fail and force the decision again.
+        """
+        insert_principal(db, 8)
+        self._stored(db, 8, "s8", "2026-08-10T16:00:00.1234565Z")
+        # 7th digit 1 < 5, so genuinely older -- yet not distinguishable.
+        assert self._apply(db, 8, "s8", "2026-08-10T16:00:00.1234561Z") == self.APPLIED
+
+    def test_one_unparseable_value_costs_one_unprotected_write_not_the_guard(
+        self, db: sqlite3.Connection
+    ) -> None:
+        """The fail-open choice's real cost, and its limit.
+
+        `upsert_*` persists `raw_json` verbatim, so an unparseable `updated_at`
+        is stored and read back as the stored side next time -- meaning one
+        garbled value buys one unprotected write, in which a stale replay lands.
+        What it does *not* do is disable the guard permanently: the write that
+        lands supplies the new `updated_at`, so once a well-formed value is
+        stored the guard works again immediately.
+
+        Pinned because the difference between "one window" and "permanently
+        broken" is the whole basis for preferring fail-open here.
+        """
+        insert_principal(db, 9)
+        self._stored(db, 9, "s9", "2026-08-10T16:00:00Z")
+
+        # A garbled value is upserted (fail-open) and now sits in raw_json.
+        assert self._apply(db, 9, "s9", "not-a-timestamp") == self.APPLIED
+
+        # One unprotected write: a stale replay overwrites, because the stored
+        # side is no longer comparable.
+        from whoopmcp.store import get_resource_updated_at, get_sleeps
+
+        webhook_processor._upsert_if_not_older(
+            db,
+            "sleep",
+            9,
+            "s9",
+            {
+                "id": "s9",
+                "start": "2026-08-10T08:00:00Z",
+                "end": "STALE",
+                "updated_at": "2026-08-10T10:00:00Z",
+            },
+        )
+        assert get_sleeps(db, 9)[0]["end"] == "STALE"
+
+        # ...but the guard is functional again: stored is well-formed once more,
+        # so a second, older replay is now correctly skipped.
+        assert get_resource_updated_at(db, "sleep", 9, "s9") == "2026-08-10T10:00:00Z"
+        assert self._apply(db, 9, "s9", "2026-08-10T09:00:00Z") == "STALE", (
+            "the guard did not recover after a well-formed value was stored"
+        )
 
 
 class TestRetryAndDeadLetterLogic:

@@ -30,6 +30,7 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from whoopmcp.client import WhoopAPIError, WhoopClient
@@ -188,6 +189,45 @@ def _parse_event(raw_body: bytes) -> WebhookEvent:
     )
 
 
+def _parsed_updated_at(value: object) -> datetime | None:
+    """`value` as an aware `datetime`, or None if it cannot be read as one.
+
+    Returning None means "not comparable", which `_upsert_if_not_older` treats
+    the same way it treats an absent `updated_at`: upsert. See there for why.
+
+    A value that parses but carries no offset is taken as UTC. That is not a
+    guess about WHOOP's format so much as the assumption the string comparison
+    this replaces was already making -- its correctness rested on every
+    `updated_at` being uniform RFC3339 UTC. Attaching UTC keeps the intended
+    comparison working instead of making a naive/aware mix raise, which would
+    propagate into `process_webhook_event`'s retry handling and could
+    dead-letter a whole resource class if WHOOP ever sent bare local time.
+
+    Unlike the unparseable case, this one is not logged, and the distinction is
+    deliberate: a naive value is still *compared*, under a documented and
+    deterministic reading, so the guard keeps working. An unparseable value
+    disables the guard for that event, which is a different kind of event and
+    the reason only that branch warns.
+
+    **Precision limit.** `fromisoformat` truncates fractional seconds beyond
+    six digits, so two values differing only in a 7th or later digit parse
+    equal, and the guard then applies the incoming record because only
+    *strictly* older is skipped. The string comparison this replaces happened
+    to order those correctly, so this is a narrow regression against it,
+    accepted knowingly: WHOOP sends second and millisecond precision, "equal"
+    is the honest reading of two values we cannot distinguish, and reading the
+    remaining digits exactly would mean parsing them by hand for an input that
+    does not occur. Pinned by a test so it stays a known cost.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def _upsert_if_not_older(
     conn: sqlite3.Connection,
     resource: str,
@@ -205,17 +245,72 @@ def _upsert_if_not_older(
     resource necessarily carries `updated_at`) defaults to upserting, since
     there is nothing to compare and last-write-wins is this store's existing
     behaviour everywhere else.
+
+    Both sides are parsed to `datetime` before comparing (#140). This used to
+    be `str(incoming) < stored`, a lexicographic comparison, which is only
+    equivalent to a chronological one while every value is uniform RFC3339 UTC
+    at identical precision. Two spellings of the same instant already break it,
+    because `.` (0x2E) and `+` (0x2B) both sort below `Z` (0x5A):
+
+        stored=...:01Z  incoming=...:01.500Z    -> 0.5s NEWER, skipped as older
+        stored=...:01Z  incoming=...:01+00:00   -> same instant, skipped as older
+
+    Since this guard is the only thing standing between a late delivery and a
+    state regression on someone's health record, silently discarding a newer
+    record is the failure that matters. Latent rather than live: it needs
+    WHOOP's serialisation to vary, and nothing an attacker controls reaches it.
+
+    An unparseable value on either side is treated as *not comparable* and
+    therefore upserted, matching the documented behaviour for an absent one --
+    but logged at warning, because that is the case where this guard quietly
+    stops guarding and nothing else would say so.
+
+    That choice has a cost worth stating, since it is not obvious: `upsert_*`
+    persists `raw_json` verbatim, so an unparseable `updated_at` is *stored*,
+    and the next delivery reads it back as the stored side and is also not
+    comparable -- so one garbled value buys one unprotected write, in which a
+    stale replay can overwrite a newer record. It is a single window, not a
+    permanent hole: whatever that write stores becomes the new `updated_at`, so
+    if it is well-formed the guard is working again immediately after (measured,
+    not assumed).
+
+    Failing closed instead -- skipping when not comparable -- trades that
+    single window for a worse mode: if WHOOP ever emits a format this parser
+    does not handle, no webhook update would land for that resource again until
+    someone shipped a parser fix, which is silent indefinite staleness on real
+    health data. Given the guard is a comparison safety net and not the only
+    path to correctness (the API stays authoritative and #19's replay exists),
+    one bad overwrite is the better failure. The warning is what makes it
+    visible rather than silent.
     """
-    stored = get_resource_updated_at(conn, resource, whoop_user_id, resource_id)
-    incoming = record.get("updated_at")
-    if stored is not None and incoming is not None and str(incoming) < stored:
+    stored_raw = get_resource_updated_at(conn, resource, whoop_user_id, resource_id)
+    incoming_raw = record.get("updated_at")
+    stored = _parsed_updated_at(stored_raw)
+    incoming = _parsed_updated_at(incoming_raw)
+
+    for label, raw, parsed in (
+        ("stored", stored_raw, stored),
+        ("incoming", incoming_raw, incoming),
+    ):
+        if raw is not None and parsed is None:
+            logger.warning(
+                "unparseable %s updated_at, upserting without the out-of-order check: "
+                "%s %s/%s value=%r",
+                label,
+                resource,
+                whoop_user_id,
+                resource_id,
+                raw,
+            )
+
+    if stored is not None and incoming is not None and incoming < stored:
         logger.info(
             "skipping out-of-order webhook upsert: %s %s/%s incoming=%s stored=%s",
             resource,
             whoop_user_id,
             resource_id,
-            incoming,
-            stored,
+            incoming_raw,
+            stored_raw,
         )
         return
     if resource == "sleep":
