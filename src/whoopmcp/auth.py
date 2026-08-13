@@ -575,6 +575,23 @@ class Authenticator:
         self._pending_state: str | None = None
         self._refresh_lock: RefreshLock = refresh_lock or InProcessRefreshLock()
         self._inflight_refresh: asyncio.Task[Token] | None = None
+        #: Bumped by logout()/revoke_and_forget() (issue #123). refresh()
+        #: captures this as its very first line -- before it ever awaits the
+        #: lock -- and passes it into _do_refresh, which re-checks it right
+        #: before persisting or installing a result; a mismatch means the
+        #: user's credentials were forgotten while this refresh was in
+        #: flight (or while it was merely queued and hadn't started yet), so
+        #: a token that is by then stale-by-policy must not be written back.
+        #: Capturing at refresh() entry, not inside _do_refresh, matters
+        #: because _do_refresh's task is created with asyncio.ensure_future
+        #: and does not actually start running until the event loop gets to
+        #: it -- a logout() that runs first in that same tick must still be
+        #: seen. logout() is synchronous (can't await/cancel the in-flight
+        #: task -- see its own docstring), so this, not a lock, is what
+        #: closes the race: plain int mutation needs nothing else on a
+        #: single event loop, since nothing can interleave between the
+        #: capture and the check without an `await` in between.
+        self._credential_epoch = 0
 
     def start_login(self) -> str:
         """Begin a login and return the URL the user must open."""
@@ -637,7 +654,22 @@ class Authenticator:
         identity check and the assignment, so nothing can interleave between
         them -- whichever waiter's continuation runs first clears it, and the
         rest see it is already gone.
+
+        The credential epoch (issue #123) is captured here, as the very
+        first line, before the lock is even acquired -- not inside
+        _do_refresh. _do_refresh's task is merely *created* with
+        asyncio.ensure_future; it does not start running until the event
+        loop schedules it, so a logout() that happens to run first in that
+        same tick (e.g. a sibling `whoop_logout` tool call ready in the same
+        loop iteration) would otherwise land before the epoch was ever
+        captured, and _do_refresh would capture the already-bumped,
+        post-logout epoch -- passing its own check and resurrecting a
+        forgotten grant. The same reasoning covers a caller that suspends on
+        the contended lock above and, once through, finds the store
+        recheck's `current` gone (a prior round failed and cleared it): the
+        epoch was still fixed before any of that could happen.
         """
+        epoch = self._credential_epoch
         await self._refresh_lock.acquire()
         try:
             current = self._store.load()
@@ -645,7 +677,7 @@ class Authenticator:
                 self._token = current
                 return current
             if self._inflight_refresh is None:
-                self._inflight_refresh = asyncio.ensure_future(self._do_refresh(token))
+                self._inflight_refresh = asyncio.ensure_future(self._do_refresh(token, epoch))
             inflight = self._inflight_refresh
         finally:
             self._refresh_lock.release()
@@ -656,7 +688,11 @@ class Authenticator:
             if self._inflight_refresh is inflight:
                 self._inflight_refresh = None
 
-    async def _do_refresh(self, token: Token) -> Token:
+    async def _do_refresh(self, token: Token, epoch: int) -> Token:
+        # `epoch` is captured by our caller, refresh(), before it even
+        # acquires the refresh lock -- not here. See refresh()'s own
+        # docstring for why capturing it inside this coroutine would be too
+        # late to close issue #123's race.
         async with httpx.AsyncClient(timeout=self._config.request_timeout) as client:
             try:
                 response = await client.post(
@@ -703,8 +739,25 @@ class Authenticator:
             # the fields it needs.
             metrics.record_token_refresh_failure("malformed_response")
             raise
-        self._store.save(new_token)
-        self._token = new_token
+        if epoch == self._credential_epoch:
+            self._store.save(new_token)
+            self._token = new_token
+        else:
+            # issue #123: logout()/revoke_and_forget() forgot the
+            # credentials while this refresh was in flight. WHOOP has
+            # already rotated the refresh token upstream regardless, but per
+            # D2 that is not a reason to write this one back to the store or
+            # install it as the session credential -- the user asked to
+            # forget, and a store that repopulates itself after logout is
+            # worse than one that never had a logout. The caller of *this*
+            # refresh still gets `new_token` back (below) rather than an
+            # exception: it is a genuinely valid token, and it was the
+            # store/session state the interleaved logout invalidated, not
+            # this particular call.
+            logger.info(
+                "discarding a token refresh that completed after logout(); "
+                "not persisting or installing it"
+            )
         metrics.record_token_refresh_success()
         return new_token
 
@@ -733,6 +786,11 @@ class Authenticator:
         self._store.clear()
         self._token = None
         self._pending_state = None
+        # issue #123: bump so any refresh already in flight discards its
+        # result instead of writing it back once it completes -- see
+        # _credential_epoch's comment in __init__. revoke_and_forget calls
+        # this method too, so it needs no bump of its own (D3).
+        self._credential_epoch += 1
 
     async def revoke_and_forget(self) -> None:
         """Revoke this grant upstream, then forget the local token.

@@ -632,6 +632,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #123 (#37 audit): `logout()`/`revoke_and_forget()` no longer race a
+  refresh already in flight. A refresh that completes after credentials were
+  forgotten used to run straight through to `self._store.save(new_token)` /
+  `self._token = new_token` regardless, silently resurrecting a fully live
+  grant on disk after the user asked to forget it. `logout()` is synchronous
+  and so cannot await or cancel that task, which rules out a "cancel the
+  refresh" fix; instead a monotonic credential epoch is captured at the top
+  of `refresh()`, before it even acquires the refresh lock, and passed into
+  `_do_refresh` to be re-checked immediately before the save/install, and
+  both `logout()` and `revoke_and_forget` (which calls it) bump it.
+  Capturing the epoch in `refresh()` rather than inside `_do_refresh` itself
+  matters because `_do_refresh` runs as a task created via
+  `asyncio.ensure_future` and doesn't start executing until the event loop
+  gets to it, so a logout arriving first in that same tick (e.g. a sibling
+  `whoop_logout` tool call) would otherwise still be captured as a "before
+  the request" epoch and pass the check. The in-flight call's own caller
+  still receives the token it obtained -- only persisting and installing it
+  as the session credential are skipped -- so the interleaved logout does
+  not raise out of an unrelated tool call. The coalescing machinery
+  (`_inflight_refresh`, the lock, single-flighted `refresh()`) is unchanged;
+  this adds a check, not a redesign.
 - Issue #109: `_execute_scoped`'s member-equality check now sits behind a
   new `_statement_restricts_to_one_member` helper instead of a bare
   `_MEMBER_EQUALITY_PREDICATE.search(sql)`, closing three ways a
