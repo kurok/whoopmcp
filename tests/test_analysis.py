@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import ast
 import math
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from whoopmcp import analysis
 from whoopmcp.analysis import (
     DEFAULT_LAG_SWEEP,
     MIN_CORRELATION_SAMPLES,
@@ -254,6 +257,351 @@ def test_extract_metric_all_metrics() -> None:
     assert extract_metric([record], "sleep_performance") == [88.0]
     assert extract_metric([record], "sleep_efficiency") == [91.5]
     assert extract_metric([record], "strain") == [11.2]
+
+
+# -- Issue #182: handle null metric values gracefully -------------------
+
+
+def test_extract_metric_skips_explicit_null_values() -> None:
+    """A SCORED record with explicit null for the requested metric is skipped.
+
+    This is issue #182: the docstring promises "skipping nulls", but the
+    implementation only checked for missing keys/score dicts, not for
+    explicit None values. A record with score["hrv_rmssd_milli"] = None
+    should be skipped, and the remaining records should produce a result.
+    """
+    records = [
+        scored_record("2026-08-01T06:00:00Z", hrv=48.5),
+        # Middle record: SCORED state but explicit None for hrv
+        {
+            "id": 12347,
+            "cycle_id": 900,
+            "created_at": "2026-08-02T06:00:00Z",
+            "updated_at": "2026-08-02T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {
+                "recovery_score": 65.0,
+                "hrv_rmssd_milli": None,  # Explicit null
+                "resting_heart_rate": 55,
+                "sleep_performance_percentage": 87.0,
+                "sleep_efficiency_percentage": 90.5,
+                "strain": 12.0,
+            },
+        },
+        scored_record("2026-08-03T06:00:00Z", hrv=52.0),
+    ]
+    result = extract_metric(records, "hrv")
+    # Only the first and third records (48.5 and 52.0), skipping the null
+    assert result == [48.5, 52.0]
+
+
+def test_summarize_skips_records_with_null_metrics() -> None:
+    """summarize() skips SCORED records with explicit null for the metric.
+
+    All analysis entry points share _filtered_records(), so the fix applies
+    uniformly. This test verifies summarize() specifically handles nulls.
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = [
+        scored_record(
+            (base_date + timedelta(days=0)).isoformat().replace("+00:00", "Z"),
+            recovery_score=60.0,
+        ),
+        # Day 1: SCORED but null recovery_score
+        {
+            "id": 12348,
+            "cycle_id": 901,
+            "created_at": (base_date + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+            "updated_at": (base_date + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+            "score_state": "SCORED",
+            "score": {"recovery_score": None},  # Explicit null
+        },
+        scored_record(
+            (base_date + timedelta(days=2)).isoformat().replace("+00:00", "Z"),
+            recovery_score=70.0,
+        ),
+        scored_record(
+            (base_date + timedelta(days=3)).isoformat().replace("+00:00", "Z"),
+            recovery_score=65.0,
+        ),
+    ]
+    result = summarize(records, "recovery_score", expected_days=4)
+    # Only 3 valid records: 60, 70, 65 (mean = 65, null is skipped)
+    assert result.count == 3
+    assert result.mean == pytest.approx(65.0)
+    # 3 unique calendar dates (days 0, 2, 3), 4 expected -> 1 day missing
+    assert result.days_missing == 1
+
+
+def test_trend_skips_records_with_null_metrics() -> None:
+    """trend() skips SCORED records with an explicit null for the metric.
+
+    Nine records, one nulled, leaving eight -- exactly ``MIN_TREND_SAMPLES``.
+    Seeding only eight would leave seven after the skip and raise
+    ``InsufficientDataError``, which would look like the guard working while
+    actually testing the sample floor.
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=50.0 + float(i),
+        )
+        for i in range(9)
+    ]
+    # Replace day 3 with a null value
+    records[3] = {
+        "id": 12349,
+        "cycle_id": 903,
+        "created_at": (base_date + timedelta(days=3)).isoformat().replace("+00:00", "Z"),
+        "updated_at": (base_date + timedelta(days=3)).isoformat().replace("+00:00", "Z"),
+        "score_state": "SCORED",
+        "score": {"recovery_score": None},  # Explicit null
+    }
+    result = trend(records, "recovery_score")
+    # 8 valid records survive the skip, so trend has exactly its minimum.
+    assert result.count == 8
+    # Slope should be approximately 1.0 per day
+    assert result.slope_per_day == pytest.approx(1.0, abs=0.1)
+
+
+def test_correlate_skips_records_with_null_metrics() -> None:
+    """correlate() skips SCORED records with explicit null for either metric."""
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    # Create 8+ pairs, but inject a null on the A side
+    records_a = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=50.0 + float(i),
+            cycle_id=i,
+        )
+        for i in range(9)
+    ]
+    # Day 2: SCORED but null recovery_score on A side
+    records_a[2] = {
+        "id": 12350,
+        "cycle_id": 2,
+        "created_at": (base_date + timedelta(days=2)).isoformat().replace("+00:00", "Z"),
+        "updated_at": (base_date + timedelta(days=2)).isoformat().replace("+00:00", "Z"),
+        "score_state": "SCORED",
+        "score": {"recovery_score": None},
+    }
+
+    records_b = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            strain=10.0 + float(i * 2),
+            cycle_id=i,
+        )
+        for i in range(9)
+    ]
+
+    result = correlate(records_a, "recovery_score", records_b, "strain")
+    # 8 valid pairs (cycle_id 0,1,3,4,5,6,7,8 matched, 2 skipped due to null on A)
+    assert result.count == 8
+
+
+def test_correlate_lag_sweep_skips_records_with_null_metrics() -> None:
+    """correlate_lag_sweep() skips records with explicit null for either metric."""
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records_a = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=50.0 + float(i),
+            cycle_id=None,
+        )
+        for i in range(10)
+    ]
+    # Day 1: SCORED but null recovery_score
+    records_a[1] = {
+        "id": 12351,
+        "created_at": (base_date + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+        "updated_at": (base_date + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+        "score_state": "SCORED",
+        "score": {"recovery_score": None},
+    }
+
+    records_b = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            hrv=30.0 + float(i),
+            cycle_id=None,
+        )
+        for i in range(10)
+    ]
+
+    results = correlate_lag_sweep(records_a, "recovery_score", records_b, "hrv", lags=(0,))
+    assert len(results) == 1
+    result = results[0]
+    # 9 pairs at lag 0 (10 minus the 1 null on day 1)
+    assert result.correlation is not None
+    assert result.correlation.count == 9
+
+
+def test_every_consumer_of_the_shared_filter_is_covered_above() -> None:
+    """Pin which functions the null guard actually protects (#182).
+
+    ``_filtered_records`` is the single place the SCORED-and-key-present filter
+    lives, so the guard covers exactly its callers -- and only those. It is
+    tempting to also list ``find_streaks`` and the outliers path, but both take
+    ``RollingPoint`` sequences rather than raw records and never reach this
+    filter, so a test naming them would assert nothing about it. (An earlier
+    draft of this file had exactly that: a test called
+    ``test_find_streaks_skips_records_with_null_metrics`` that in fact called
+    ``extract_metric``.)
+
+    This reads the source rather than trusting the list, so a function added
+    later that starts consuming the filter fails here until it is covered too.
+    """
+    source = Path(analysis.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    consumers = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "_filtered_records"
+            for inner in ast.walk(node)
+        )
+    }
+
+    # `correlate` and `correlate_lag_sweep` are absent because they reach the
+    # filter through `_dated_means`/`_grouped_values` rather than calling it
+    # directly -- their null-value tests above exercise it transitively.
+    assert consumers == {
+        "_dated_means",
+        "_grouped_values",
+        "extract_metric",
+        "summarize",
+        "trend",
+    }, (
+        "the set of functions sharing the null guard changed; cover the new one "
+        f"with a null-value test before updating this list. Found: {sorted(consumers)}"
+    )
+
+
+def test_extract_metric_all_null_raises_insufficient_data_error() -> None:
+    """When every SCORED record has null for the metric, it behaves like an
+    empty result set and raises InsufficientDataError, not TypeError.
+
+    This tests the broader contract: null values should never cause TypeError,
+    they should be skipped like missing values. An all-null set degrades to
+    the empty-set case and raises the appropriate error.
+    """
+    records = [
+        {
+            "id": 12353,
+            "cycle_id": 905,
+            "created_at": "2026-08-01T06:00:00Z",
+            "updated_at": "2026-08-01T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {"recovery_score": None},
+        },
+        {
+            "id": 12354,
+            "cycle_id": 906,
+            "created_at": "2026-08-02T06:00:00Z",
+            "updated_at": "2026-08-02T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {"recovery_score": None},
+        },
+        {
+            "id": 12355,
+            "cycle_id": 907,
+            "created_at": "2026-08-03T06:00:00Z",
+            "updated_at": "2026-08-03T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {"recovery_score": None},
+        },
+    ]
+    # With all nulls, summarize should raise InsufficientDataError, not TypeError
+    with pytest.raises(InsufficientDataError):
+        summarize(records, "recovery_score", expected_days=3)
+
+    # Same for trend
+    with pytest.raises(InsufficientDataError):
+        trend(records, "recovery_score")
+
+
+def test_extract_metric_non_numeric_values_are_skipped() -> None:
+    """Non-numeric non-null values (dict, list, non-numeric string) are skipped.
+
+    A dict, list, or unparseable string cannot be converted to float and should
+    be skipped rather than raising TypeError.
+    """
+    records = [
+        scored_record("2026-08-01T06:00:00Z", hrv=48.5),
+        # Non-numeric dict
+        {
+            "id": 12356,
+            "cycle_id": 908,
+            "created_at": "2026-08-02T06:00:00Z",
+            "updated_at": "2026-08-02T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {"hrv_rmssd_milli": {"nested": "dict"}},  # type: ignore[dict-item]
+        },
+        scored_record("2026-08-03T06:00:00Z", hrv=52.0),
+        # Non-numeric list
+        {
+            "id": 12357,
+            "cycle_id": 909,
+            "created_at": "2026-08-04T06:00:00Z",
+            "updated_at": "2026-08-04T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {"hrv_rmssd_milli": ["list", "value"]},  # type: ignore[dict-item]
+        },
+        scored_record("2026-08-05T06:00:00Z", hrv=50.0),
+        # Non-numeric string
+        {
+            "id": 12358,
+            "cycle_id": 910,
+            "created_at": "2026-08-06T06:00:00Z",
+            "updated_at": "2026-08-06T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {"hrv_rmssd_milli": "not_a_number"},
+        },
+        scored_record("2026-08-07T06:00:00Z", hrv=51.0),
+    ]
+    result = extract_metric(records, "hrv")
+    # Only numeric values: 48.5, 52.0, 50.0, 51.0 (four total)
+    assert result == [48.5, 52.0, 50.0, 51.0]
+    assert len(result) == 4
+
+
+def test_extract_metric_numeric_strings_are_still_accepted() -> None:
+    """REGRESSION: numeric strings like "60.0" are still accepted and converted.
+
+    The fix must preserve the existing ability to convert numeric strings,
+    which float() handles naturally.
+    """
+    records = [
+        scored_record("2026-08-01T06:00:00Z", recovery_score=60.0),
+        # Numeric string
+        {
+            "id": 12359,
+            "cycle_id": 911,
+            "created_at": "2026-08-02T06:00:00Z",
+            "updated_at": "2026-08-02T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {"recovery_score": "65.5"},  # type: ignore[dict-item]
+        },
+        scored_record("2026-08-03T06:00:00Z", recovery_score=70.0),
+        # Another numeric string variant
+        {
+            "id": 12360,
+            "cycle_id": 912,
+            "created_at": "2026-08-04T06:00:00Z",
+            "updated_at": "2026-08-04T06:00:00Z",
+            "score_state": "SCORED",
+            "score": {"recovery_score": "72"},  # type: ignore[dict-item]
+        },
+    ]
+    result = extract_metric(records, "recovery_score")
+    # All four should convert: 60.0, 65.5, 70.0, 72.0
+    assert result == [60.0, 65.5, 70.0, 72.0]
 
 
 # -- summarize --------------------------------------------------------
