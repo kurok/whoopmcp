@@ -2869,3 +2869,275 @@ async def test_rejected_cursor_never_echoes_the_token_or_the_cause(
         "binding parameter",
     ):
         assert fragment not in rendered
+
+
+# -- issue #181 tests (expected_days truncation bug) -------------------------
+
+
+async def test_summarize_period_interior_gap_reported_as_missing_day(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """An interior gap in coverage is reported as missing days.
+
+    This is the main test for issue #181: expected_days was computed using
+    .days (truncating partial days), causing gaps to be silently swallowed
+    when the clamp max(0, expected_days - len(unique_dates)) hid the
+    undercount.
+
+    Seed records on Aug 1 and Aug 3 only, leaving Aug 2 empty. Window is
+    2026-08-01T00:00:00Z to 2026-08-03T23:59:59Z (3 calendar days).
+    Current buggy code: expected_days = 2 (truncated), unique_dates = 2
+                       -> days_missing = max(0, 2 - 2) = 0 (WRONG)
+    Correct code:      expected_days = 3, unique_dates = 2
+                       -> days_missing = max(0, 3 - 2) = 1 (CORRECT)
+    """
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+
+    # Seed recovery on Aug 1 and Aug 3 only (Aug 2 is empty)
+    upsert_recovery(
+        conn,
+        12345,
+        recovery_fixture(cycle_id=100, recovery_score=65.0, created_at="2026-08-01T06:00:00Z"),
+    )
+    upsert_recovery(
+        conn,
+        12345,
+        recovery_fixture(cycle_id=102, recovery_score=75.0, created_at="2026-08-03T06:00:00Z"),
+    )
+
+    result = await call_tool(
+        server,
+        "summarize_period",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-03T23:59:59Z"},
+        app_context,
+    )
+
+    # The gap on Aug 2 should be reported as 1 missing day
+    assert result["summaries"]["recovery_score"]["days_missing"] == 1, (
+        f"Expected days_missing=1 (Aug 2 is missing), got "
+        f"{result['summaries']['recovery_score']['days_missing']}"
+    )
+
+
+async def test_summarize_period_fully_covered_no_regression(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """A fully-covered window still reports zero missing days.
+
+    This test ensures no regression: when all days in a window have data,
+    days_missing must remain 0.
+    """
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+
+    # Seed recovery on all three days: Aug 1, 2, 3
+    for i, (day, score) in enumerate([(1, 65.0), (2, 70.0), (3, 75.0)]):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i, recovery_score=score, created_at=f"2026-08-{day:02d}T06:00:00Z"
+            ),
+        )
+
+    result = await call_tool(
+        server,
+        "summarize_period",
+        {"start": "2026-08-01T00:00:00Z", "end": "2026-08-03T23:59:59Z"},
+        app_context,
+    )
+
+    # All three days have data, so no days missing
+    assert result["summaries"]["recovery_score"]["days_missing"] == 0, (
+        f"Expected days_missing=0 (all days covered), got "
+        f"{result['summaries']['recovery_score']['days_missing']}"
+    )
+
+
+async def test_summarize_period_non_utc_offset_uses_utc_dates(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """Window boundaries with non-UTC offsets count as UTC calendar dates.
+
+    The window start/end are parsed as ISO 8601 and converted to UTC for
+    calendar date calculations, consistent with how unique_dates are computed
+    in analysis.summarize() (via .astimezone(UTC).date()).
+
+    Example: window "2026-08-01T00:00:00+13:00" (Aug 1 midnight in +13)
+    is Aug 0 23:00:00 UTC (previous day in UTC). The contract is that
+    expected_days counts the UTC calendar dates the window spans.
+
+    Here we use "-11:00" offset (American Samoa UTC-11): a recovery record
+    created at "2026-08-02T12:00:00-11:00" is actually
+    "2026-08-02T23:00:00Z" in UTC (same UTC calendar date).
+    If we request a window in -11 offset that spans Aug 1-3 in that zone,
+    it will span a different range in UTC calendar dates. We verify the
+    reported days_missing matches the UTC calculation, not the local one.
+    """
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+
+    # Create records on Aug 2 and Aug 4 in -11:00 time
+    # "2026-08-02T12:00:00-11:00" is "2026-08-02T23:00:00Z" in UTC
+    # "2026-08-04T12:00:00-11:00" is "2026-08-04T23:00:00Z" in UTC
+    upsert_recovery(
+        conn,
+        12345,
+        recovery_fixture(cycle_id=200, recovery_score=60.0, created_at="2026-08-02T12:00:00-11:00"),
+    )
+    upsert_recovery(
+        conn,
+        12345,
+        recovery_fixture(cycle_id=202, recovery_score=70.0, created_at="2026-08-04T12:00:00-11:00"),
+    )
+
+    # Window expressed in -11:00 offset, spanning Aug 1-4 in that zone
+    # "2026-08-01T00:00:00-11:00" is "2026-08-01T11:00:00Z" in UTC
+    # "2026-08-04T23:59:59-11:00" is "2026-08-05T10:59:59Z" in UTC
+    # So the UTC calendar dates are Aug 1, 2, 3, 4, 5 (5 distinct dates)
+    # But we only have records on UTC Aug 2 and 4 (2 distinct dates)
+    # Expected missing: 5 - 2 = 3
+    result = await call_tool(
+        server,
+        "summarize_period",
+        {
+            "start": "2026-08-01T00:00:00-11:00",
+            "end": "2026-08-04T23:59:59-11:00",
+        },
+        app_context,
+    )
+
+    # The window spans 5 UTC calendar dates (Aug 1-5), we have data for 2,
+    # so 3 days are missing.
+    assert result["summaries"]["recovery_score"]["days_missing"] == 3, (
+        f"Expected days_missing=3 (window spans 5 UTC dates, only 2 have data), "
+        f"got {result['summaries']['recovery_score']['days_missing']}"
+    )
+
+
+async def test_compare_periods_coverage_ratio_reflects_days_missing(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """compare_periods coverage ratios derive from expected_days correctly.
+
+    The coverage_asymmetric flag and coverage ratios are computed as
+    1 - days_missing/expected_days. This test ensures the coverage value
+    is correct when days_missing is properly computed.
+
+    We set up two periods with known data:
+    - Baseline (Aug 1-3): has data on Aug 1 and 3 only (Aug 2 missing)
+      -> expected_days = 3, days_missing = 1, coverage = 1 - 1/3 ≈ 0.667
+    - Comparison (Aug 8-10): has data on all 3 days
+      -> expected_days = 3, days_missing = 0, coverage = 1 - 0/3 = 1.0
+    - abs(0.667 - 1.0) = 0.333, which is NOT > 0.5, so coverage_asymmetric = False
+    """
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+
+    # Baseline period: Aug 1-3 with gap on Aug 2
+    upsert_recovery(
+        conn,
+        12345,
+        recovery_fixture(cycle_id=100, recovery_score=65.0, created_at="2026-08-01T06:00:00Z"),
+    )
+    upsert_recovery(
+        conn,
+        12345,
+        recovery_fixture(cycle_id=102, recovery_score=75.0, created_at="2026-08-03T06:00:00Z"),
+    )
+
+    # Comparison period: Aug 8-10 fully covered
+    upsert_recovery(
+        conn,
+        12345,
+        recovery_fixture(cycle_id=200, recovery_score=70.0, created_at="2026-08-08T06:00:00Z"),
+    )
+    upsert_recovery(
+        conn,
+        12345,
+        recovery_fixture(cycle_id=201, recovery_score=72.0, created_at="2026-08-09T06:00:00Z"),
+    )
+    upsert_recovery(
+        conn,
+        12345,
+        recovery_fixture(cycle_id=202, recovery_score=68.0, created_at="2026-08-10T06:00:00Z"),
+    )
+
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-03T23:59:59Z",
+            "comparison_start": "2026-08-08T00:00:00Z",
+            "comparison_end": "2026-08-10T23:59:59Z",
+        },
+        app_context,
+    )
+
+    # Baseline: expected_days=3, days_missing=1 (Aug 2), coverage ≈ 0.667
+    baseline_days_missing = result["baseline"]["summary"]["recovery_score"]["days_missing"]
+    assert baseline_days_missing == 1, (
+        f"Baseline expected days_missing=1 (Aug 2 gap), got {baseline_days_missing}"
+    )
+
+    # Comparison: expected_days=3, days_missing=0 (all covered), coverage = 1.0
+    comparison_days_missing = result["comparison"]["summary"]["recovery_score"]["days_missing"]
+    assert comparison_days_missing == 0, (
+        f"Comparison expected days_missing=0 (all covered), got {comparison_days_missing}"
+    )
+
+    # coverage_asymmetric: |0.667 - 1.0| = 0.333, which is NOT > 0.5
+    coverage_asymmetric = result["delta"]["recovery_score"]["coverage_asymmetric"]
+    assert coverage_asymmetric is False, (
+        f"Expected coverage_asymmetric=False (0.333 difference < 0.5), got {coverage_asymmetric}"
+    )
+
+
+async def test_window_length_is_two_measures_not_one(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """A midnight-to-midnight week is 7 days long and touches 8 calendar dates.
+
+    Both numbers are right; they answer different questions, which is why #181
+    split them. ``days_missing`` compares against the distinct UTC dates a
+    record can carry, so it needs dates-touched (8). ``period_length_note``
+    warns about weekday/weekend imbalance, which is about duration, so it needs
+    elapsed days (7) -- feeding it 8 makes every whole-week window look partial
+    and fires the warning on precisely the periods that are balanced.
+
+    Pinned together in one test because the failure mode is using one value for
+    both: whichever measure you keep, the other consumer silently goes wrong.
+    """
+    assert app_context.store_conn is not None
+    # Seven of the eight dates covered; Aug 8 (the boundary instant) is not.
+    for day in range(1, 8):
+        upsert_recovery(
+            app_context.store_conn,
+            12345,
+            recovery_fixture(cycle_id=900 + day, created_at=f"2026-08-{day:02d}T06:30:00Z"),
+        )
+
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-08T00:00:00Z",
+            "comparison_start": "2026-08-10T00:00:00Z",
+            "comparison_end": "2026-08-24T00:00:00Z",
+        },
+        app_context,
+    )
+
+    # Duration: 7 and 14 days, both whole weeks, so no imbalance warning.
+    assert result["period_length_note"] is None, (
+        "a midnight-to-midnight week is a whole week; the note must not fire"
+    )
+
+    # Dates touched: Aug 1..Aug 8 is 8, of which 7 carry a record.
+    baseline = result["baseline"]["summary"]["recovery_score"]
+    assert baseline["days_missing"] == 1, (
+        "8 dates span the window and 7 carry a record, so exactly one is missing"
+    )

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #181: `days_missing` understated coverage gaps by a day, hiding them.
+  `_summarize_window` measured the window as `(end - start).days`, which
+  truncates the trailing partial day, so the inclusive whole-day window a
+  caller naturally writes for "the last three days" -- `T00:00:00Z` to
+  `T23:59:59Z` -- measured 2. Since `days_missing` is clamped with
+  `max(0, ...)`, the undercount never raised; it just reported better coverage
+  than the member actually had. With records on Aug 1 and Aug 3 and a real hole
+  on Aug 2, the tool reported zero missing days.
+
+  It now counts the distinct UTC calendar dates the window can hold a record
+  on, which is the unit `analysis.summarize` counts on the other side of the
+  subtraction. The old expression also skipped the `astimezone(UTC)` that side
+  applies, so a window given at a non-UTC offset counted dates in the caller's
+  offset while the records counted theirs in UTC.
+
+  Window length is now two values rather than one, because two consumers were
+  asking different questions of it. `days_missing` and the `compare_periods`
+  coverage ratios need dates-touched; `period_length_note`, which warns about
+  weekday/weekend imbalance, needs elapsed duration -- a midnight-to-midnight
+  Aug 1 to Aug 8 window is 7 days long but touches 8 dates. Feeding it
+  dates-touched made every whole-week window look partial and fired the warning
+  on exactly the periods that are balanced.
+
+
 - Issue #179: a forged `next_token` reached SQLite unchecked. `_decode_store_cursor`
   base64-decoded a caller-supplied cursor, `int()`-ed its `offset` and passed the
   result straight to a store query with no bounds and no error handling. Two
