@@ -1651,3 +1651,298 @@ async def test_logout_before_refresh_task_starts_leaves_store_empty(config: Conf
             f"store should be empty after a pre-request logout, but contains {store.load()}"
         )
         assert auth._token is None, "auth._token should be None after logout"
+
+
+# -- issue #122: invalid_grant conflates "stale token" with "grant gone" --------
+#
+# WHOOP rotates refresh tokens on use, so a stale token failing usually means it
+# was superseded -- and acting on the wrong reading destroys a valid credential
+# another process just saved. The tests below verify the fixes for D1-D3.
+#
+# Tests 1, 2, and 4 MUST FAIL against current main.
+
+
+async def test_issue_122_test_1_store_superseding_expired_token_is_refreshed(
+    config: Config,
+) -> None:
+    """Test 1 (D1): The store's superseding-but-expired token is what gets refreshed.
+
+    Seed the store with a fresher-but-expired token, call refresh() with a
+    stale one, and assert the token endpoint received the STORE's refresh
+    token, not the caller's stale one.
+
+    MUST FAIL against current main -- the code requires the stored token to be
+    non-expired to use the short-circuit (line 676: `not current.expired`).
+    When the store's token is expired, the code falls through and tries to
+    refresh the caller's stale token instead.
+    """
+    store = FileTokenStore(config.token_path)
+
+    # Store holds a fresher token (different refresh_token) but it is expired
+    store_token = Token(
+        access_token="store-access",
+        expires_at=time.time() - 100,  # expired
+        refresh_token="store-refresh",
+    )
+    store.save(store_token)
+
+    # Caller has a stale version of the same grant (older refresh_token)
+    caller_token = Token(
+        access_token="old-access",
+        expires_at=time.time() - 100,
+        refresh_token="old-refresh",
+    )
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": "new-access",
+                    "expires_in": 3600,
+                    "refresh_token": "new-refresh",
+                    "scope": "offline",
+                },
+            )
+        )
+
+        auth = Authenticator(config)
+        await auth.refresh(caller_token)
+
+    # CRITICAL ASSERTION: The token endpoint must have received the STORE's
+    # refresh token, not the caller's stale one. We inspect the actual request
+    # body sent to verify which refresh token was used.
+    assert route.called, "token endpoint must have been called"
+    request = route.calls.last.request
+    request_body = request.content.decode()
+
+    # The request must contain the store's "store-refresh", not the stale "old-refresh"
+    assert "refresh_token=store-refresh" in request_body, (
+        f"Expected store's token 'store-refresh' in request, but got: {request_body}"
+    )
+    assert "refresh_token=old-refresh" not in request_body, (
+        f"Expected NOT to send caller's stale token, but found 'old-refresh' in: {request_body}"
+    )
+
+
+async def test_issue_122_test_2_superseded_invalid_grant_does_not_clear_store(
+    config: Config,
+) -> None:
+    """Test 2 (D2): A superseded-token invalid_grant does not clear the store.
+
+    Store holds a fresher token, the caller's stale one fails with invalid_grant
+    -> the store still holds the fresher token afterwards.
+
+    MUST FAIL against current main -- the code unconditionally clears the store
+    on invalid_grant (lines 714-716), destroying the fresher token that another
+    process just saved.
+    """
+    store = FileTokenStore(config.token_path)
+
+    # Store holds a fresher token
+    store_token = Token(
+        access_token="store-access",
+        expires_at=time.time() - 100,
+        refresh_token="store-refresh",
+    )
+    store.save(store_token)
+
+    # Caller has a stale version
+    caller_token = Token(
+        access_token="old-access",
+        expires_at=time.time() - 100,
+        refresh_token="old-refresh",
+    )
+
+    with respx.mock:
+        # The caller's stale token is rejected with invalid_grant
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "Refresh token is expired.",
+                },
+            )
+        )
+
+        auth = Authenticator(config)
+        with pytest.raises(AuthError):
+            await auth.refresh(caller_token)
+
+    # CRITICAL ASSERTION: The store must still hold the fresher token.
+    # A test that only checks the exception type would pass the broken code.
+    persisted = store.load()
+    assert persisted is not None, "store must not be cleared"
+    assert persisted.refresh_token == "store-refresh", (
+        f"store should still hold the fresher token, but got: {persisted.refresh_token}"
+    )
+
+
+async def test_issue_122_test_3_genuine_invalid_grant_clears_store_and_raises(
+    config: Config,
+) -> None:
+    """Test 3 (genuine case, D3): The store holds the very token WHOOP rejected.
+
+    When the token that failed is the same one in the store, clear it and raise
+    GrantAlreadyGoneError, exactly as today. This proves the fix does not break
+    the genuine case.
+    """
+    from whoopmcp.auth import GrantAlreadyGoneError
+
+    store = FileTokenStore(config.token_path)
+
+    # Store and caller both have the same token
+    token = Token(
+        access_token="access",
+        expires_at=time.time() - 100,
+        refresh_token="refresh",
+    )
+    store.save(token)
+
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "Refresh token is expired.",
+                },
+            )
+        )
+
+        auth = Authenticator(config)
+        with pytest.raises(GrantAlreadyGoneError):
+            await auth.refresh(token)
+
+    # Store must be cleared
+    assert store.load() is None, "store should be cleared for the genuine case"
+
+
+async def test_issue_122_test_4_erase_member_does_not_report_fake_revoke_success(
+    config: Config,
+) -> None:
+    """Test 4 (fact #3, D3): erase-member does not report a revoke that did not happen.
+
+    Drive the CLI path where refresh fails on a superseded token and assert it
+    does NOT treat the revoke step as succeeded (i.e., does not catch
+    GrantAlreadyGoneError). The genuine case (store holds the failed token)
+    would raise GrantAlreadyGoneError, which the CLI catches as success. But when
+    the store has moved on (superseded token), the refresh failure must raise a
+    plain AuthError, not GrantAlreadyGoneError, so the CLI treats it as a real
+    failure and aborts rather than reporting a revoke that did not happen.
+    """
+    store = FileTokenStore(config.token_path)
+
+    # Store holds a fresher token
+    store_token = Token(
+        access_token="store-access",
+        expires_at=time.time() - 100,
+        refresh_token="store-refresh",
+    )
+    store.save(store_token)
+
+    # Caller has a stale version
+    caller_token = Token(
+        access_token="old-access",
+        expires_at=time.time() - 100,
+        refresh_token="old-refresh",
+    )
+
+    with respx.mock:
+        # The caller's stale token is rejected with invalid_grant
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "Refresh token is expired.",
+                },
+            )
+        )
+
+        auth = Authenticator(config)
+        with pytest.raises(AuthError) as exc_info:
+            # This simulates the revoke_and_forget() call from erase-member.
+            # It will attempt to refresh the (stale) token if expired.
+            await auth.refresh(caller_token)
+
+    # CRITICAL ASSERTION: The exception must be a plain AuthError, not
+    # GrantAlreadyGoneError. The CLI code catches GrantAlreadyGoneError as
+    # "nothing to revoke" and reports success. If this raises GrantAlreadyGoneError,
+    # the CLI would report a successful revoke when the grant is still live at WHOOP.
+    from whoopmcp.auth import GrantAlreadyGoneError
+
+    assert not isinstance(exc_info.value, GrantAlreadyGoneError), (
+        "Must raise plain AuthError, not GrantAlreadyGoneError, when the store has "
+        "moved on to a fresher token. GrantAlreadyGoneError would cause erase-member "
+        "to report a revoke that did not happen."
+    )
+
+
+async def test_issue_122_test_5_logout_during_refresh_leaves_store_empty_123(
+    config: Config,
+) -> None:
+    """Test 5 (D4): #123's interlock still holds.
+
+    A logout during refresh still leaves the store empty. This ensures the fix
+    for #122 does not disturb #123's epoch interlock.
+    """
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    refresh_started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def slow_refresh(request: httpx.Request) -> httpx.Response:
+        refresh_started.set()
+        await proceed.wait()
+        await asyncio.sleep(0.01)
+        return _mock_new_token_response()
+
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(side_effect=slow_refresh)
+
+        auth = Authenticator(config)
+        refresh_task = asyncio.create_task(auth.access_token())
+
+        await refresh_started.wait()
+        auth.logout()
+        proceed.set()
+
+        with contextlib.suppress(AuthError):
+            await refresh_task
+
+        # CRITICAL ASSERTION: #123's interlock must still work
+        assert store.load() is None
+        assert auth._token is None
+
+
+async def test_issue_122_test_6_coalescing_intact(
+    config: Config,
+) -> None:
+    """Test 6: Coalescing intact.
+
+    Two concurrent refreshes still share one token-endpoint request. This ensures
+    the fix for #122 does not break the coalescing optimization.
+    """
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(return_value=_mock_new_token_response())
+
+        auth = Authenticator(config)
+        results = await asyncio.gather(
+            auth.refresh(expired),
+            auth.refresh(expired),
+        )
+
+    # CRITICAL ASSERTION: exactly one request, not two
+    assert route.call_count == 1, (
+        f"expected 1 token endpoint request for coalesced refresh, got {route.call_count}"
+    )
+    assert results[0] == results[1]
+    assert results[0].access_token == "new-access"

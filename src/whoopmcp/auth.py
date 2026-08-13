@@ -673,11 +673,28 @@ class Authenticator:
         await self._refresh_lock.acquire()
         try:
             current = self._store.load()
-            if current is not None and not current.expired and _supersedes(current, token):
-                self._token = current
-                return current
+            refresh_target = token
+            if current is not None and _supersedes(current, token):
+                if not current.expired:
+                    self._token = current
+                    return current
+                # issue #122 (D1): `current` is a genuinely different
+                # (fresher) grant than `token`, just one that has itself
+                # expired -- it is still the right thing to refresh, unlike
+                # `token`, which is the caller's own stale copy. Refresh
+                # `current` instead of falling through to
+                # _do_refresh(token, ...), which would send WHOOP a refresh
+                # token it has already rotated past. `token` itself is kept
+                # unchanged and passed through as `original`: D2's
+                # invalid_grant classification needs to know what the
+                # CALLER's own view of "current" was, not which credential we
+                # opportunistically substituted in here -- see _do_refresh's
+                # own comment.
+                refresh_target = current
             if self._inflight_refresh is None:
-                self._inflight_refresh = asyncio.ensure_future(self._do_refresh(token, epoch))
+                self._inflight_refresh = asyncio.ensure_future(
+                    self._do_refresh(refresh_target, epoch, original=token)
+                )
             inflight = self._inflight_refresh
         finally:
             self._refresh_lock.release()
@@ -688,11 +705,17 @@ class Authenticator:
             if self._inflight_refresh is inflight:
                 self._inflight_refresh = None
 
-    async def _do_refresh(self, token: Token, epoch: int) -> Token:
+    async def _do_refresh(self, token: Token, epoch: int, *, original: Token) -> Token:
         # `epoch` is captured by our caller, refresh(), before it even
         # acquires the refresh lock -- not here. See refresh()'s own
         # docstring for why capturing it inside this coroutine would be too
         # late to close issue #123's race.
+        #
+        # `token` is the credential actually sent to WHOOP below -- ordinarily
+        # the caller's own, but D1 (refresh()) substitutes in a store token
+        # that supersedes-but-has-expired instead. `original` is always the
+        # caller's own, unsubstituted token, and exists only for the
+        # invalid_grant branch's D2 classification below.
         async with httpx.AsyncClient(timeout=self._config.request_timeout) as client:
             try:
                 response = await client.post(
@@ -712,14 +735,56 @@ class Authenticator:
                 metrics.record_token_refresh_failure("network_error")
                 raise
         if response.status_code == 400 and _is_invalid_grant(response):
-            self._store.clear()
-            self._token = None
             metrics.record_token_refresh_failure("invalid_grant")
-            # GrantAlreadyGoneError, not plain AuthError: the grant is gone,
-            # not merely unreachable -- see that class's own docstring.
-            raise GrantAlreadyGoneError(
-                "WHOOP rejected the refresh token (invalid_grant); it will not become valid "
-                "on retry -- run whoop_login to re-authorise"
+            # issue #122: invalid_grant means WHOOP rejected `token` -- it
+            # does NOT by itself mean the user's grant is gone. WHOOP rotates
+            # refresh tokens on use, so a rejection usually just means the
+            # credential sent was superseded by a rotation another (or this)
+            # process already completed and saved.
+            #
+            # D2 asks: does the store still hold the token that failed? That
+            # comparison must be against `original` -- the caller's own,
+            # unsubstituted view of "current" -- not `token`. When D1 has
+            # substituted in the store's own (expired) token and WHOOP
+            # rejects it too, comparing the store against `token` would
+            # always read as "unchanged" (nothing else touched the store
+            # between the substitution and this check), misclassifying an
+            # opportunistic refresh of someone else's rotation as the
+            # caller's own grant being gone. Comparing against `original`
+            # instead asks the question that actually matters here: has the
+            # store moved past what the caller itself knew, at all -- which
+            # is true whenever D1 substituted, regardless of whether that
+            # substituted attempt then failed too.
+            stored = self._store.load()
+            if stored is None or not _supersedes(stored, original):
+                # Genuine case: the store holds nothing, or still holds
+                # exactly the credential the caller itself knew about --
+                # WHOOP's rejection describes the grant itself, so clear it.
+                self._store.clear()
+                self._token = None
+                # GrantAlreadyGoneError, not plain AuthError: the grant is
+                # gone, not merely unreachable -- see that class's own
+                # docstring.
+                raise GrantAlreadyGoneError(
+                    "WHOOP rejected the refresh token (invalid_grant); it will not become "
+                    "valid on retry -- run whoop_login to re-authorise"
+                )
+            # The store had already moved on to a different, fresher
+            # credential than the caller's own before this call even started
+            # -- this rejection describes a stale (or opportunistically
+            # substituted) token, not necessarily the store's current state,
+            # which may still be live at WHOOP. Do not touch the store or
+            # self._token: clearing here could destroy a fresher credential,
+            # and GrantAlreadyGoneError here is exactly what #65's
+            # erase-member/delete-member catch as "revoke succeeded" (issue
+            # #122) -- reporting a revoke that never happened while the grant
+            # is still live. Raise a plain AuthError instead; the next
+            # refresh()/access_token() call re-reads the store and picks up
+            # whatever is actually current via the recheck at the top of
+            # refresh() -- no automatic retry from in here.
+            raise AuthError(
+                "WHOOP rejected a refresh token that the local store has already superseded "
+                "with a fresher one; the grant may still be live -- retry the operation"
             )
         try:
             _raise_for_token_error(response)
