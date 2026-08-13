@@ -580,3 +580,117 @@ def test_pipx_tools_are_version_pinned(project_root: Path) -> None:
         "every 'pipx run' must pin its tool with '--spec <package>==<version> <app>', "
         f"so a release published between runs cannot change what executes: {unpinned}"
     )
+
+
+def test_uvicorn_access_log_is_routed_to_stderr() -> None:
+    """Issue #126: PRIVACY.md says this software's logs go to stderr. In hosted
+    mode that was false.
+
+    The SDK's `run_streamable_http_async` builds `uvicorn.Config` with only host,
+    port and log level -- no `log_config` -- and uvicorn's default points the
+    `uvicorn.access` handler at `ext://sys.stdout`. Every request line, client IP
+    included, landed on stdout; for `/webhooks/whoop` and `/metrics` that is the
+    IP of someone whose health data this server holds.
+
+    This asserts the end state rather than the mechanism: after
+    `_route_uvicorn_access_log_to_stderr` runs, uvicorn's own
+    `configure_logging` must leave every `uvicorn.access` handler on stderr. That
+    is what keeps the documentation honest if the SDK ever starts passing its own
+    `log_config` -- the redirect would stop working and this fails, instead of the
+    docs silently becoming false again.
+
+    Both loggers are checked, via *effective* handlers rather than each logger's
+    own: uvicorn gives `uvicorn.access` its own handler but lets `uvicorn.error`
+    propagate up to `uvicorn`, so asking `uvicorn.error` for `.handlers` directly
+    returns an empty list. Walking the hierarchy the way `logging` does is what
+    makes the check accurate -- and checking `error` too would catch a fix that
+    moved `access` by clobbering the whole config.
+    """
+    import logging
+    import sys
+
+    import uvicorn
+
+    from whoopmcp.__main__ import _route_uvicorn_access_log_to_stderr
+
+    _route_uvicorn_access_log_to_stderr()
+
+    config = uvicorn.Config(app=lambda *_: None, host="127.0.0.1", port=0)
+    config.configure_logging()
+
+    def effective_streams(name: str) -> list[object]:
+        """Every stream a record logged to `name` can reach, following
+        propagation exactly as `logging.Logger.callHandlers` does."""
+        streams: list[object] = []
+        logger: logging.Logger | None = logging.getLogger(name)
+        while logger:
+            streams.extend(getattr(handler, "stream", None) for handler in logger.handlers)
+            logger = logger.parent if logger.propagate else None
+        return streams
+
+    for name in ("uvicorn.access", "uvicorn.error"):
+        streams = effective_streams(name)
+        assert streams, f"{name} reaches no stream handler, so this proves nothing"
+        assert all(stream is sys.stderr for stream in streams), (
+            f"{name} logs somewhere other than stderr: {streams}"
+        )
+
+
+def test_the_http_transport_path_redirects_the_access_log() -> None:
+    """The redirect has to be *called*, not merely defined.
+
+    A helper nobody invokes is the same as no fix, and the call site is one line
+    in `main()` that no other test covers -- so this reads the source rather than
+    leaving it unasserted.
+    """
+    import inspect
+
+    from whoopmcp import __main__ as cli
+
+    source = inspect.getsource(cli)
+    marker = 'if transport == "streamable-http":'
+    assert marker in source, "the streamable-http branch moved or was renamed"
+    http_branch = source[source.index(marker) :]
+
+    # Asserted separately so a missing call reports as that, rather than as a
+    # ValueError from str.index with no explanation of what went wrong.
+    assert "_route_uvicorn_access_log_to_stderr()" in http_branch, (
+        "the streamable-http branch does not call the access-log redirect, so "
+        "PRIVACY.md's stderr-only row is false again in hosted mode"
+    )
+    assert http_branch.index("_route_uvicorn_access_log_to_stderr()") < http_branch.index(
+        'run(transport="streamable-http"'
+    ), "the redirect must happen before the server starts, or uvicorn is already configured"
+
+
+def test_sdk_still_leaves_uvicorns_log_config_to_its_default() -> None:
+    """Issue #126: the access-log redirect only works while the SDK does *not*
+    pass its own `log_config` to `uvicorn.Config`.
+
+    `_route_uvicorn_access_log_to_stderr` mutates uvicorn's module-level
+    `LOGGING_CONFIG`, which `uvicorn.Config.__init__` consults only because it is
+    that parameter's default. An SDK that supplied its own dict would bypass the
+    mutation entirely and put access logs back on stdout, making PRIVACY.md false
+    again -- silently, because nothing else would change.
+
+    This is the test that actually watches for that, and it has to read the SDK's
+    source to do it. A test that builds its own `uvicorn.Config` -- as the
+    end-state test above does -- cannot detect a change in what the *SDK* passes;
+    verified by simulation, where an independent `log_config` sent access logs to
+    stdout while that test still passed. The docstring used to claim the
+    end-state test covered this. It did not.
+    """
+    import inspect
+
+    from mcp.server.mcpserver import MCPServer
+
+    source = inspect.getsource(MCPServer.run_streamable_http_async)
+    assert "uvicorn.Config(" in source, (
+        "the SDK no longer builds uvicorn.Config here, so the redirect's premise "
+        "needs re-deriving from scratch"
+    )
+    assert "log_config" not in source, (
+        "the SDK now passes its own log_config to uvicorn.Config, which bypasses "
+        "the LOGGING_CONFIG mutation in _route_uvicorn_access_log_to_stderr -- "
+        "access logs are back on stdout and PRIVACY.md's stderr-only row is false"
+    )

@@ -99,7 +99,7 @@ URLs are the only ones in the source, in `auth.py` and `client.py`.
 > cover the database or an export, which have no keychain equivalent.
 | Cached responses (local mode only) | `$WHOOPMCP_STATE_DIR/cache.sqlite3` | **Not written to disk by default.** By default the store — the principal/member link and the tool-call audit trail described below — lives **in memory only**, for the life of the running process, and `cache.sqlite3` is never created. It moves to disk, with the same protection as the token above (file mode `0600`, directory `0700` — **macOS and Linux only** — including the mechanism that protects sqlite's transient `-journal` sidecar; this software never enables WAL, so `-wal`/`-shm` never exist), only if you set `WHOOPMCP_CACHE=true` or enable webhooks (`WHOOPMCP_WEBHOOKS_ENABLED=true`) |
 | Data-subject export (`export-member --out`) | Wherever you point `--out` | File mode `0600` — **macOS and Linux only** |
-| Logs | stderr only | Never written to a file by this software |
+| Logs | stderr only | Never written to a file by this software. In hosted mode (`--transport streamable-http`) the embedded HTTP server's *access* log — one line per request, including the client IP — defaults to **stdout**; this software redirects it to stderr at startup so this row holds in both modes (#126). If you run the ASGI app under your own uvicorn or gunicorn instead of `whoopmcp --transport streamable-http`, that redirect does not apply and the access log is yours to configure |
 
 By default in **local mode**, the only thing this software writes to
 `$WHOOPMCP_STATE_DIR` is your token. The server also keeps, in memory only,
