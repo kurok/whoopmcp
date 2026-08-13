@@ -796,13 +796,42 @@ def _require_store(app: AppContext) -> sqlite3.Connection:
 
 
 def _iso(value: datetime | str | None) -> str | None:
-    """``value`` as an ISO 8601 string, same normalisation ``client._iso``
-    applies -- a ``datetime`` (from ``_default_range``'s own default) or an
-    already-string bound both need to be one consistent string shape before
-    they reach a store query or a coverage message."""
+    """``value`` as one canonical ISO 8601 UTC string: ``...THH:MM:SS.mmmZ``.
+
+    A ``datetime`` (from ``_default_range``) and a caller-supplied string both
+    have to come out in *the same shape*, because the store compares range
+    bounds against stored timestamps **as text** (``store.py`` -- ``created_at
+    >= ?``, ``start <= ?`` and friends). Text comparison only agrees with
+    chronological order when both sides share a format, and stored values are
+    WHOOP's own verbatim, e.g. ``2026-07-03T06:30:00.000Z``.
+
+    Before #174 this function returned a caller's string untouched, so an
+    offset form was compared byte-wise against a ``Z`` form. ``+`` (0x2B) and
+    ``.`` (0x2E) both sort below ``Z`` (0x5A), which is wrong in both
+    directions and by as much as the offset:
+
+        stored 2026-07-03T06:30:00.000Z
+        end    2026-07-03T06:30:00+00:00   -- the same instant, EXCLUDED
+        end    2026-07-03T09:00:00+03:00   -- 06:00Z, i.e. earlier, INCLUDED
+
+    Converting to UTC and emitting WHOOP's own millisecond form makes the text
+    comparison mean what the caller asked for. The docstring this replaces
+    already claimed both inputs became "one consistent string shape"; it just
+    was not true of the string branch.
+
+    **The assumption this rests on**, stated because it is the same one #140
+    was filed about: stored timestamps are uniformly WHOOP's millisecond ``Z``
+    form. If WHOOP ever emits a different precision, a same-instant boundary
+    can mis-sort again -- ``...00Z`` against ``...00.000Z`` differs at ``Z``
+    versus ``.``. That residue is far smaller than the offset bug (sub-second,
+    only exactly on a boundary) and is pinned by a test rather than left to be
+    rediscovered.
+    """
     if value is None:
         return None
-    return value.isoformat() if isinstance(value, datetime) else value
+    moment = value if isinstance(value, datetime) else _parse_iso(value)
+    moment = moment.astimezone(UTC)
+    return f"{moment.strftime('%Y-%m-%dT%H:%M:%S')}.{moment.microsecond // 1000:03d}Z"
 
 
 #: Every collection entity a repointed tool can consult, mapped to the
