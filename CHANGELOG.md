@@ -632,6 +632,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #154 (found reviewing #129, P3, latent): `_execute_scoped` examined
+  only the *first* parenthesis-depth-zero `WHERE`, so a compound statement's
+  second arm could supply the member predicate while the first spanned every
+  member. `SELECT raw_json FROM recoveries WHERE whoop_user_id != ? UNION
+  SELECT raw_json FROM recoveries WHERE whoop_user_id = ?` was accepted and
+  returned the other member's `raw_json` -- their health payload. #129's
+  depth requirement cannot catch this: the fragment it finds genuinely is at
+  depth zero, and the defect is in *which* `WHERE` anchors the search. The
+  statement is now split into arms at depth-zero `UNION` / `UNION ALL` /
+  `INTERSECT` / `EXCEPT`, and every arm must have a top-level `WHERE` whose
+  every occurrence carries a depth-zero fragment. Requiring the arm to *have*
+  one is the half that is easy to miss, and the first version of this fix
+  missed it: an arm with no `WHERE` at all (`SELECT raw_json FROM recoveries
+  UNION SELECT ... WHERE whoop_user_id = ?`) offers no anchor for a
+  `WHERE`-walking check to trip over, yet spans its whole table -- so the
+  invariant has to be a property of each arm, not of each `WHERE`. Also
+  replaces #109's and #129's two incremental parenthesis counters with a
+  single precomputed depth array, because a third hand-rolled counter for the
+  per-arm check was the next bug waiting to happen. Still latent: no path
+  routes caller-supplied SQL through `_execute_scoped`, and the universal
+  authorizer check was never affected. Verified against main by evaluating
+  every statement the suite routes through the check with both
+  implementations: 147 unique statements, 21 divergences -- 20 of them the new
+  tests' own compound shapes, all fail-closed -- and zero divergence on the
+  119 statements that predate this change, which is what pins the counter
+  restructure as behaviour-preserving. The 21st is discussed below.
+
+  Two rounds of review were needed to get this right, and both findings were
+  the same defect class as the issue itself -- a check whose invariant was one
+  step off what it needed to be:
+
+  * The first formulation required every top-level `WHERE` to carry a
+    fragment. An arm with no `WHERE` has no anchor, so a `WHERE`-walking loop
+    never visited it; `SELECT raw_json FROM recoveries UNION SELECT raw_json
+    FROM recoveries WHERE whoop_user_id = ?` returned every member's payload.
+  * The second required every arm, but the sanitiser *deleted* stripped
+    regions instead of replacing them, and to sqlite a comment is a token
+    separator. `UNION/**/ALL` collapsed to `UNIONALL` and
+    `recoveries/**/UNION` to `recoveriesUNION`, so the arm split silently did
+    not happen: `SELECT raw_json FROM recoveries EXCEPT/**/SELECT raw_json
+    FROM recoveries WHERE whoop_user_id = ?` was accepted and returned exactly
+    the *other* members' rows. Stripped regions now leave a space behind.
+
+  That second change makes the sanitiser strictly more faithful in both
+  directions. Deletion could *forge* a fragment the statement never wrote
+  (`WHERE whoop_user/**/_id = ?` fused into a match), and it could *hide* a
+  real anchor (`FROM recoveries/**/WHERE whoop_user_id = ?` fused into
+  `recoveriesWHERE`, so a properly restricted statement was refused). The
+  latter is the single `False -> True` divergence against main in the
+  measurement above, and accepting it is correct: sqlite parses that comment
+  as whitespace and applies the `WHERE`.
+
 - Issue #131 (#37 audit, P3): the sanitiser inside
   `_statement_restricts_to_one_member` stripped `'`- and `"`-quoted regions but
   not SQLite's other two identifier forms, `` `backticks` `` and `[brackets]`,
