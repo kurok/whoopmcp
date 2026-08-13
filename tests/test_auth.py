@@ -2642,3 +2642,268 @@ def test_concurrent_save_and_reseal_in_threads_never_loses_the_newer_token(
             assert on_disk in (stale, rotated), f"neither token survived intact: {on_disk}"
     finally:
         sys.setswitchinterval(original_interval)
+
+
+# -- contract violations: OSError and UnicodeDecodeError escape (issue #190) ----
+#
+# TokenStore.load() promises to return Token | None or raise AuthError.
+# FileTokenStore and EncryptedFileTokenStore violate this: they catch only
+# FileNotFoundError and let other OS errors (PermissionError, IsADirectoryError)
+# and UnicodeDecodeError escape as themselves. This test suite ensures the fix
+# wraps these in AuthError while preserving the "missing file → None" distinction.
+#
+# Every test below that asserts AuthError is raised MUST FAIL against current main
+# (it will receive PermissionError, IsADirectoryError, or UnicodeDecodeError instead).
+
+
+def _make_file_store(path: Path) -> FileTokenStore:
+    """Factory for FileTokenStore, for parametrized tests."""
+    return FileTokenStore(path)
+
+
+def _make_encrypted_file_store(path: Path) -> EncryptedFileTokenStore:
+    """Factory for EncryptedFileTokenStore, for parametrized tests."""
+    key = os.urandom(32)
+    return EncryptedFileTokenStore(path, keys={1: key}, current_version=1)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="chmod 000 has no effect on Windows")
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        pytest.param(_make_file_store, id="FileTokenStore"),
+        pytest.param(_make_encrypted_file_store, id="EncryptedFileTokenStore"),
+    ],
+)
+def test_unreadable_token_file_raises_autherror_not_permissionerror(
+    tmp_path: Path, store_factory: object
+) -> None:
+    """Test 1: A token file with mode 000 raises AuthError, not PermissionError.
+
+    This is a common operational situation (permission change, UID switch).
+    The contract promises to raise AuthError, not PermissionError.
+
+    MUST FAIL against current main with PermissionError.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("chmod 000 does not prevent reads when running as root")
+
+    path = tmp_path / "token.json"
+    store = store_factory(path)  # type: ignore[operator]
+
+    # Write a valid token first
+    token = Token("access-tok", expires_at=1234.0, refresh_token="refresh-tok")
+    store.save(token)
+
+    # Make it unreadable
+    path.chmod(0o000)
+    try:
+        with pytest.raises(AuthError):
+            store.load()
+    finally:
+        # Restore permissions so cleanup can remove the temp directory
+        path.chmod(0o600)
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        pytest.param(_make_file_store, id="FileTokenStore"),
+        pytest.param(_make_encrypted_file_store, id="EncryptedFileTokenStore"),
+    ],
+)
+def test_directory_at_token_path_raises_autherror_not_isadir(
+    tmp_path: Path, store_factory: object
+) -> None:
+    """Test 2: A directory at the token path raises AuthError, not IsADirectoryError.
+
+    This could happen if the user misconfigures the state directory path,
+    or through some race condition or user error.
+
+    MUST FAIL against current main with IsADirectoryError.
+    """
+    path = tmp_path / "token.json"
+    path.mkdir()  # Create a directory instead of a file
+    store = store_factory(path)  # type: ignore[operator]
+
+    with pytest.raises(AuthError):
+        store.load()
+
+
+def test_non_utf8_token_file_raises_autherror_not_unicodedecodeerror(
+    tmp_path: Path,
+) -> None:
+    """Test 3: A FileTokenStore with non-UTF-8 bytes raises AuthError.
+
+    EncryptedFileTokenStore already handles this correctly (issue #190's table),
+    so this test is only for FileTokenStore.
+
+    MUST FAIL against current main with UnicodeDecodeError.
+    """
+    path = tmp_path / "token.json"
+    # Write non-UTF-8 bytes
+    path.write_bytes(b"\xff\xfe not valid UTF-8")
+    store = FileTokenStore(path)
+
+    with pytest.raises(AuthError):
+        store.load()
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        pytest.param(_make_file_store, id="FileTokenStore"),
+        pytest.param(_make_encrypted_file_store, id="EncryptedFileTokenStore"),
+    ],
+)
+def test_missing_token_file_still_returns_none(tmp_path: Path, store_factory: object) -> None:
+    """Test 4: Missing token file returns None, not AuthError.
+
+    This is the regression test for the fix. If missing files get wrapped
+    in AuthError, every "not logged in" path would start raising errors.
+
+    MUST PASS against current main (missing file already returns None).
+    """
+    path = tmp_path / "token.json"
+    store = store_factory(path)  # type: ignore[operator]
+
+    # File does not exist
+    result = store.load()
+
+    assert result is None, "missing token file must return None, not raise or return an error"
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        pytest.param(_make_file_store, id="FileTokenStore"),
+        pytest.param(_make_encrypted_file_store, id="EncryptedFileTokenStore"),
+    ],
+)
+def test_corrupt_json_still_raises_autherror(tmp_path: Path, store_factory: object) -> None:
+    """Test 5: Corrupt JSON still raises AuthError (regression test).
+
+    This test ensures the fix doesn't break the existing behavior
+    for genuinely corrupt JSON.
+
+    MUST PASS against current main.
+    """
+    path = tmp_path / "token.json"
+    store = store_factory(path)  # type: ignore[operator]
+
+    if isinstance(store, FileTokenStore):
+        # FileTokenStore writes plaintext, so corrupt JSON is straightforward
+        path.write_text("{not valid json", encoding="utf-8")
+    else:
+        # EncryptedFileTokenStore needs valid JSON but corrupt contents
+        path.write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(AuthError):
+        store.load()
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        pytest.param(_make_file_store, id="FileTokenStore"),
+        pytest.param(_make_encrypted_file_store, id="EncryptedFileTokenStore"),
+    ],
+)
+def test_zero_byte_file_raises_autherror(tmp_path: Path, store_factory: object) -> None:
+    """Test 6: A zero-byte token file raises AuthError (regression test).
+
+    A truncated or cleared file should raise AuthError, not an OSError.
+
+    MUST PASS against current main.
+    """
+    path = tmp_path / "token.json"
+    path.touch()  # Create empty file
+    store = store_factory(path)  # type: ignore[operator]
+
+    with pytest.raises(AuthError):
+        store.load()
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        pytest.param(_make_file_store, id="FileTokenStore"),
+        pytest.param(_make_encrypted_file_store, id="EncryptedFileTokenStore"),
+    ],
+)
+def test_valid_token_still_loads_correctly(tmp_path: Path, store_factory: object) -> None:
+    """Test 7: A valid token still loads correctly (regression test).
+
+    The fix must not break the happy path where a valid token file exists.
+
+    MUST PASS against current main.
+    """
+    path = tmp_path / "token.json"
+    store = store_factory(path)  # type: ignore[operator]
+
+    token = Token("access-token-123", expires_at=1234.0, refresh_token="refresh-token-xyz")
+    store.save(token)
+
+    loaded = store.load()
+
+    assert loaded is not None, "valid token file must load"
+    assert loaded.access_token == "access-token-123"
+    assert loaded.refresh_token == "refresh-token-xyz"
+    assert loaded.expires_at == 1234.0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="chmod 000 has no effect on Windows")
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        pytest.param(_make_file_store, id="FileTokenStore"),
+        pytest.param(_make_encrypted_file_store, id="EncryptedFileTokenStore"),
+    ],
+)
+def test_autherror_message_does_not_leak_token_values(
+    tmp_path: Path, store_factory: object
+) -> None:
+    """Test 8: AuthError message doesn't leak token values.
+
+    The message MUST name no access token, no refresh token, no encryption key.
+    The path is acceptable (per issue #190's "existing errors name only the path").
+
+    Sentinel values are written, the file is made unreadable, and we assert
+    the sentinels appear nowhere in the error message.
+
+    MUST PASS against current main (once unreadable files raise AuthError).
+    """
+    if os.geteuid() == 0:
+        pytest.skip("chmod 000 does not prevent reads when running as root")
+
+    path = tmp_path / "token.json"
+    store = store_factory(path)  # type: ignore[operator]
+
+    # Use distinctive sentinel values
+    sentinel_access = "SENTINEL-ACCESS-TOKEN-abc123xyz"
+    sentinel_refresh = "SENTINEL-REFRESH-TOKEN-xyz789abc"
+    token = Token(sentinel_access, expires_at=1234.0, refresh_token=sentinel_refresh)
+    store.save(token)
+
+    # Make unreadable
+    path.chmod(0o000)
+    try:
+        with pytest.raises(AuthError) as exc_info:
+            store.load()
+
+        error_message = str(exc_info.value)
+
+        # The sentinels must not appear
+        assert sentinel_access not in error_message, (
+            f"access token leaked in AuthError: {error_message}"
+        )
+        assert sentinel_refresh not in error_message, (
+            f"refresh token leaked in AuthError: {error_message}"
+        )
+
+        # The path should be present (that's acceptable per issue #190)
+        assert str(path) in error_message or "token" in error_message.lower(), (
+            "error should name the token path for diagnostics"
+        )
+    finally:
+        path.chmod(0o600)

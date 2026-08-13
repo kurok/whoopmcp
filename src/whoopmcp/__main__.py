@@ -544,7 +544,7 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
                 "scopes": list(token.scopes) if token is not None else [],
                 "token_present": token is not None,
             }
-        except (AuthError, OSError, UnicodeDecodeError):
+        except AuthError:
             # Degrade rather than fail: `consent` is a convenience describing
             # what was granted, while the document itself is the data-subject
             # right being exercised. Letting the convenience deny the right is
@@ -552,17 +552,17 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
             # unreadable token store threw away a health export that had already
             # been read successfully.
             #
-            # `AuthError` alone is not enough. `FileTokenStore.load` guards only
-            # `FileNotFoundError` around its `read_text`, so a token file that
-            # exists but cannot be read still raises the raw OSError:
-            # `PermissionError` from a state directory restored under another
-            # uid, `IsADirectoryError`, or `UnicodeDecodeError` from non-UTF-8
-            # bytes. Each of those is "the token store cannot be read" by any
-            # ordinary reading, and each destroyed the export.
+            # `AuthError` alone is enough since #190. It was not before: the
+            # file-backed stores let a raw `OSError` escape `load()` -- a token
+            # file that exists but cannot be read -- so this caught those too.
+            # #190 made both stores honour the `Token | None` or `AuthError`
+            # contract they already documented, which is where that belongs;
+            # every caller benefits rather than just this one.
             #
-            # The narrowness that matters is the try body, not the exception
-            # tuple: it holds only the token read and a dict literal, so nothing
-            # in scope here could fail in a way that ought to abort the export.
+            # The narrowness that matters is the try body rather than which
+            # exception is caught: it holds only the token read and a dict
+            # literal, so nothing in scope here could fail in a way that ought
+            # to abort the export.
             document["consent"] = {
                 "scopes": None,
                 "token_present": None,  # nosec B105 -- the literal None (unknown, not a credential value)

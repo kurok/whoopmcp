@@ -11,6 +11,7 @@ never hitting WHOOP in a test.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -232,3 +233,41 @@ def test_entry_point_importable_without_optional_extras() -> None:
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="chmod 000 does not deny reads on Windows")
+def test_doctor_diagnoses_an_unreadable_token_file_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A token file that exists but cannot be read is diagnosed, not fatal (#190).
+
+    `doctor` catches `AuthError` around its store read, which was the whole
+    contract: `TokenStore.load` returns a token, returns `None`, or raises
+    `AuthError`. The file-backed stores did not honour it -- they guarded only
+    `FileNotFoundError`, so a `PermissionError` escaped as itself and took down
+    the very command whose job is diagnosing a broken setup. A state directory
+    restored under a different uid produces exactly this.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("running as root: mode 000 does not deny reads")
+
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp.config import Config
+    from whoopmcp.doctor import run_checks
+
+    config = Config.from_env()
+    FileTokenStore(config.token_path).save(_valid_token())
+    config.token_path.chmod(0o000)
+    try:
+        checks = run_checks()
+    finally:
+        config.token_path.chmod(0o600)
+
+    credentials = {check.name: check for check in checks}["credentials"]
+    assert credentials.ok is False
+    assert "could not be read" in credentials.message.lower()
+    # The token is real and on disk here, so these assertions can genuinely fail.
+    assert ACCESS_TOKEN_VALUE not in credentials.message
+    assert REFRESH_TOKEN_VALUE not in credentials.message
+    assert str(config.token_path) not in credentials.message or "AuthError" in credentials.message
