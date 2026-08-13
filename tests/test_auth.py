@@ -24,6 +24,7 @@ from whoopmcp.auth import (
     AuthError,
     EncryptedFileTokenStore,
     FileTokenStore,
+    KeyringTokenStore,
     Token,
     atomic_write_text,
     build_authorize_url,
@@ -2219,3 +2220,57 @@ def test_reseal_write_failure_leaves_the_stored_record_intact(
     assert path.read_text() == before, "a failed re-seal must not corrupt the stored record"
     reread = EncryptedFileTokenStore(path, keys={1: key1}, current_version=1).load()
     assert reread is not None and reread.access_token == "acc"
+
+
+# -- keyring corrupt-entry handling (issue #137) -------------------------------
+#
+# Both file-backed stores wrap a malformed record in AuthError; the keyring
+# store called Token.from_json bare, so a corrupt entry escaped as
+# JSONDecodeError/KeyError/ValueError. That breaks TokenStore.load's contract
+# and, per the #37 audit, means callers that catch AuthError to redact a
+# failure (doctor's store check) never see it.
+
+
+class _FakeKeyring:
+    """Minimal stand-in: the keyring extra is not a test dependency."""
+
+    def __init__(self, value: str | None) -> None:
+        self.value = value
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.value
+
+
+def _keyring_store_with(value: str | None) -> KeyringTokenStore:
+    """A KeyringTokenStore over a fake backend, bypassing the real import."""
+    store = object.__new__(KeyringTokenStore)
+    store._keyring = _FakeKeyring(value)
+    return store
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param("}{ not json at all", id="malformed-json"),
+        pytest.param('{"unrelated": 1}', id="missing-required-keys"),
+        pytest.param('{"access_token": 5, "expires_at": "soon"}', id="wrong-types"),
+    ],
+)
+def test_keyring_corrupt_entry_raises_autherror(payload: str) -> None:
+    """A corrupt keychain entry must surface as AuthError, not a raw exception."""
+    with pytest.raises(AuthError):
+        _keyring_store_with(payload).load()
+
+
+def test_keyring_corrupt_entry_error_does_not_echo_the_entry() -> None:
+    """The message must not include the entry -- unlike a path, it IS the credential."""
+    secret = "SHOULD-NOT-APPEAR-IN-ANY-MESSAGE"
+    with pytest.raises(AuthError) as excinfo:
+        _keyring_store_with(f'{{"access_token": "{secret}"}}').load()
+    assert secret not in str(excinfo.value)
+    assert secret not in repr(excinfo.value)
+
+
+def test_keyring_empty_entry_still_returns_none() -> None:
+    """No stored token is not an error -- that distinction must survive the fix."""
+    assert _keyring_store_with(None).load() is None
