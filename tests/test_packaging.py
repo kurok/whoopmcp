@@ -377,13 +377,18 @@ class TestSecurityLinting:
 
         The audit job must include pip-audit as a plain run step
         with no continue-on-error or || true, so it fails the build.
+
+        The pattern tolerates the `--spec pip-audit==X.Y.Z` pinning added by
+        #125 -- what this test is about is that the step is *required*, not how
+        the tool is fetched. Pinning is asserted separately by
+        `test_pipx_tools_are_version_pinned`.
         """
         assert "pip-audit" in ci_yml_content, "ci.yml must include a pip-audit step"
         # Verify the step is not marked as optional
         # Look for the pip-audit line and ensure it's not followed by continue-on-error or || true
-        audit_pattern = r"-\s*run:\s*pipx run pip-audit\s*\.?"
+        audit_pattern = r"-\s*run:\s*pipx run\s+(?:--spec\s+\S+\s+)?pip-audit\s*\.?"
         match = re.search(audit_pattern, ci_yml_content)
-        assert match, "ci.yml must have a plain 'pipx run pip-audit .' step"
+        assert match, "ci.yml must have a plain 'pipx run [--spec ...] pip-audit .' step"
 
         # Get the section around the pip-audit step to check for continue-on-error
         start = max(0, match.start() - 200)
@@ -524,4 +529,54 @@ def test_every_action_is_sha_pinned_with_its_version_recorded(
     assert undocumented == [], (
         "every SHA pin needs a trailing '# vX.Y.Z' naming the version it pins, "
         f"so it can be reviewed and upgraded: {undocumented}"
+    )
+
+
+def test_pipx_tools_are_version_pinned(project_root: Path) -> None:
+    """Issue #125: every `pipx run` in a workflow must pin an exact version.
+
+    `pipx run build` resolves whatever is on PyPI at run time. In `release.yml`
+    that is code execution inside the job that produces the distributions which
+    are then published, so a compromised `build` or `twine` release reaches the
+    artifact before anyone can inspect it. Requires compromising a high-profile
+    PyPA package, hence P3 -- but after #119 and #124 pinned every action, this
+    was the last unpinned code-execution step on the publish path.
+
+    The `--spec <package>==<version> <app>` form is required rather than the
+    shorter `pipx run <package>==<version>`, because the latter makes pipx infer
+    the app name from the spec, and `build`'s console script is `pyproject-build`
+    -- not `build`. `--spec` names the package and the app separately, which is
+    the only form that is unambiguous for all three tools here.
+
+    What this does NOT pin is each tool's own dependencies, which still resolve
+    at run time; that needs a hash-locked requirements file and is filed
+    separately. This test asserts what is claimed and no more.
+    """
+    pipx_re = re.compile(r"pipx run\s+(?P<args>.+)$")
+    spec_re = re.compile(
+        r"--spec\s+(?P<package>[A-Za-z0-9._-]+)==(?P<version>\d+\.\d+(?:\.\d+)?)\s"
+    )
+
+    workflows = sorted((project_root / ".github" / "workflows").glob("*.yml"))
+    assert workflows, "no workflow files found -- this test would pass vacuously"
+
+    unpinned: list[str] = []
+    found = 0
+    for path in workflows:
+        for number, line in enumerate(path.read_text().splitlines(), start=1):
+            stripped = line.strip()
+            # Only real steps, never a comment that happens to mention pipx.
+            if not stripped.startswith("- run:") and not stripped.startswith("run:"):
+                continue
+            match = pipx_re.search(stripped)
+            if not match:
+                continue
+            found += 1
+            if not spec_re.search(match.group("args") + " "):
+                unpinned.append(f"{path.name}:{number} -> {stripped}")
+
+    assert found >= 3, f"only found {found} 'pipx run' steps -- the scan is not working"
+    assert unpinned == [], (
+        "every 'pipx run' must pin its tool with '--spec <package>==<version> <app>', "
+        f"so a release published between runs cannot change what executes: {unpinned}"
     )
