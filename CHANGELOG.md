@@ -671,6 +671,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #140 (#37 audit, P3, latent): `_upsert_if_not_older` compared the
+  incoming and stored `updated_at` as *strings*. Lexicographic order equals
+  chronological order only while every value is uniform RFC3339 UTC at identical
+  precision, and `.` (0x2E) and `+` (0x2B) both sort below `Z` (0x5A), so two
+  spellings of the same second already broke it in both directions:
+
+  - stored `...:00Z` vs incoming `...:00.500Z` -- 0.5s **newer**, skipped as
+    older, silently discarding an update.
+  - stored `...:00.500Z` vs incoming `...:00Z` -- genuinely **older**, applied,
+    overwriting the newer record. This is the state regression on someone's
+    health record that the guard exists to prevent, and it is the direction the
+    issue mentions only in passing.
+
+  Both sides are now parsed to `datetime` before comparing. Latent rather than
+  live: it needs WHOOP's serialisation to vary, and nothing an attacker
+  controls reaches the comparison. Verified to be a no-op for the shape WHOOP
+  sends today -- across all 2916 pairs of uniform `...Z` second-precision
+  values the old and new verdicts agree exactly, and on the mixed-precision and
+  mixed-offset pairs where they differ the new one matches chronology, including
+  comparisons across a non-UTC offset.
+
+  One input class where parsing is *worse* than the string comparison, accepted
+  knowingly rather than glossed: `fromisoformat` truncates fractional seconds
+  past six digits, so values differing only in a 7th digit parse equal and the
+  incoming record is applied, where lexicographic order happened to get them
+  right. WHOOP sends second and millisecond precision, "equal" is the honest
+  reading of two values that cannot be distinguished, and reading the remaining
+  digits would mean hand-parsing them for an input that does not occur. Pinned
+  by a test so it stays a known cost.
+
+  An unparseable value on either side is treated as *not comparable* and
+  therefore upserted -- the same as an absent one, which is this function's
+  documented behaviour -- but logged at warning, since that is the case where
+  the guard quietly stops guarding and nothing else would say so. A value with
+  no offset is read as UTC, which is the assumption the string comparison was
+  already making.
+
 - Issue #154 (found reviewing #129, P3, latent): `_execute_scoped` examined
   only the *first* parenthesis-depth-zero `WHERE`, so a compound statement's
   second arm could supply the member predicate while the first spanned every
