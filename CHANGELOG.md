@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #190: the file-backed token stores let a raw `OSError` escape `load()`,
+  breaking the `Token | None` or `AuthError` contract that `TokenStore`
+  documents and that `KeyringTokenStore.load` was already fixed to honour
+  (#137). Both guarded only `FileNotFoundError` around their file read, so a
+  token file that existed but could not be read raised `PermissionError` (a
+  state directory restored under another uid), `IsADirectoryError`, or
+  `UnicodeDecodeError`.
+
+  Callers trust that contract and catch `AuthError` alone, so each of those took
+  down the command instead of being handled: `doctor` -- whose job is diagnosing
+  a broken setup -- crashed on one of the setups it exists to diagnose, and
+  `export-member` discarded a health export it had already built (#188).
+
+  Both stores now raise `AuthError`. A missing file still returns `None`,
+  meaning "not logged in"; `FileNotFoundError` is an `OSError` subclass, so that
+  handler stays first, and a test pins it. With the contract honoured at the
+  source, `_export_member`'s widened catch from #188 narrows back to
+  `except AuthError`.
+
+
 - Issue #188: `export-member` could destroy an export it had already built.
   `_export_member` reads the token store after assembling the full health
   document, purely to name the granted scopes in a `consent` field. That read

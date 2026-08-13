@@ -223,7 +223,14 @@ class FileTokenStore:
         try:
             raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            # Missing file means not logged in, which is normal.
             return None
+        except (OSError, UnicodeDecodeError) as exc:
+            # A file that exists but cannot be read (permission denied, is a directory,
+            # etc.) must become AuthError so callers that catch AuthError to redact or
+            # degrade a failure (doctor's store check, export-member) are aware. This
+            # matches the contract documented on KeyringTokenStore.load (issue #137).
+            raise AuthError(f"token file at {self._path} is unreadable: {exc}") from exc
         try:
             return Token.from_json(raw)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
@@ -330,7 +337,14 @@ class EncryptedFileTokenStore:
         try:
             raw_bytes = self._path.read_bytes()
         except FileNotFoundError:
+            # Missing file means not logged in, which is normal.
             return None
+        except OSError as exc:
+            # A file that exists but cannot be read (permission denied, is a directory,
+            # etc.) must become AuthError so callers that catch AuthError to redact or
+            # degrade a failure (doctor's store check, export-member) are aware. This
+            # matches the contract documented on KeyringTokenStore.load (issue #137).
+            raise AuthError(f"token file at {self._path} is unreadable: {exc}") from exc
 
         # Bytes, not text, and decoded explicitly here: the compare below needs
         # the exact on-disk bytes to be byte-exact, and `read_text` would both
