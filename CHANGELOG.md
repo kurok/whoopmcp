@@ -632,6 +632,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #131 (#37 audit, P3): the sanitiser inside
+  `_statement_restricts_to_one_member` stripped `'`- and `"`-quoted regions but
+  not SQLite's other two identifier forms, `` `backticks` `` and `[brackets]`,
+  so their contents were searched as live SQL. The issue rated this
+  robustness-only -- "I could not construct a weaponised false-accept from this
+  alone" -- and #129 made that assessment obsolete without either issue
+  noticing: once the member predicate had to sit at parenthesis depth zero, a
+  stray `)` inside an unstripped identifier could desynchronise the depth
+  counter. `... WHERE whoop_user_id != ? AND resource_id = (SELECT
+  max(resource_id) FROM recoveries AS [q)]) AND EXISTS (SELECT 1 FROM
+  recoveries r2 WHERE r2.whoop_user_id = ?)` was accepted, and mutated another
+  member's row. Both forms are now stripped, each with SQLite's own escape
+  rule, measured rather than assumed: backticks double (`` `a``b` `` is the one
+  identifier ``a`b``), brackets have no escape at all (SQLite rejects
+  `[a]]b]` as an unrecognised token), so they cannot share an implementation
+  branch -- giving brackets the doubling rule would consume past the real
+  terminator and swallow live SQL. Still latent: no caller routes
+  caller-supplied SQL through `_execute_scoped`, and the universal authorizer
+  check, which is the load-bearing control, was never affected. Verified
+  non-breaking by running the whole suite with both sanitisers side by side and
+  comparing the verdict on every statement that reached the check: five
+  divergences, all of them the new tests' own exploit shapes, all in the
+  fail-closed direction.
+
 - Issue #129 (#37 audit, P3, latent): `_statement_restricts_to_one_member`
   matched the member predicate depth-blind. #109 required the
   `whoop_user_id = ?` fragment to sit after the statement's first

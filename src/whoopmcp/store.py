@@ -449,8 +449,8 @@ class UnscopedQueryError(RuntimeError):
 #: The one predicate shape that pins a statement to a single member:
 #: ``whoop_user_id`` compared for equality against a *bound parameter*,
 #: sitting after the first top-level ``WHERE`` -- and at parenthesis depth
-#: zero itself -- in a comment- and
-#: string-literal-stripped copy of the statement. See
+#: zero itself -- in a copy of the statement with comments, string literals
+#: and quoted identifiers stripped. See
 #: ``_statement_restricts_to_one_member``, which does the stripping and the
 #: position check; this regex is only the fragment it searches for.
 #:
@@ -477,7 +477,8 @@ class UnscopedQueryError(RuntimeError):
 #:   NOT NULL``-on-UPDATE shape, which the universal check does not cover
 #:   either, since the statement does read the column. Now rejected: the
 #:   ``SET``-clause fragment sits before the statement's own ``WHERE``, and
-#:   comments/string literals are stripped from the copy searched.
+#:   comments, string literals and (since #131) quoted identifiers are
+#:   stripped from the copy searched.
 #: * CAUGHT, since #109 -- a subquery in ``SET`` supplying the fragment
 #:   while the outer statement stays unfiltered, e.g. ``UPDATE recoveries
 #:   SET x = (SELECT y FROM z WHERE whoop_user_id = ?) WHERE 1 = 1``: the
@@ -523,13 +524,14 @@ class UnscopedQueryError(RuntimeError):
 #:   while adversarially reviewing #129 and filed separately -- listed here
 #:   because leaving it out would make this list read as exhaustive when the
 #:   mechanism is distinct from the two bullets above.
-#: * NOT CAUGHT -- a bracket- or backtick-quoted identifier containing an
-#:   unbalanced parenthesis (``AS [q)]``), which the stripping pass does not
-#:   recognise as a quoted region, so a stray ``)`` desynchronises the depth
-#:   counter and a nested fragment can read as depth zero. That tokeniser gap
-#:   is #131's, is not new here, and defeats the depth requirement rather
-#:   than the position one -- so it is what makes #131 load-bearing for this
-#:   check rather than merely untidy.
+#: * CAUGHT, since #131 -- a bracket- or backtick-quoted identifier
+#:   containing an unbalanced parenthesis (``AS [q)]``). The stripping pass
+#:   did not recognise either form as a quoted region, so a stray ``)``
+#:   desynchronised the depth counter and a nested fragment read as depth
+#:   zero -- defeating #129's requirement rather than #109's position one,
+#:   which is what turned this from a tidiness gap into a cross-member
+#:   ``UPDATE``. Both forms are now stripped, with sqlite's own escape rules:
+#:   backticks double, brackets do not.
 #:
 #: The universal check remains the load-bearing control (it is backed by
 #: sqlite's own authorizer, so it cannot be talked out of by SQL text); this
@@ -562,11 +564,29 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
 
     Two refinements over a bare ``_MEMBER_EQUALITY_PREDICATE.search(sql)``:
 
-    1. ``--`` line comments, ``/* */`` block comments, and single- and
-       double-quoted string literals (SQL's doubled-quote escape honoured,
-       so ``''`` inside a literal does not end it early) are stripped from
-       the copy before it is searched, so a fragment sitting in any of
-       those cannot satisfy the check.
+    1. Six kinds of region are stripped from the copy before it is searched,
+       so a fragment sitting inside any of them cannot satisfy the check:
+       ``--`` line comments, ``/* */`` block comments, single- and
+       double-quoted string literals, and -- since #131 -- backtick- and
+       bracket-quoted identifiers. The doubled-quote escape is honoured for
+       ``'``, ``"`` and `````, so ``''`` inside a literal does not end it
+       early; brackets have no escape at all, per sqlite's own tokeniser.
+
+       That is every region sqlite treats as opaque, with one residue: the
+       ``x``/``X`` prefix of a blob literal (``x'29'``) is a separate token
+       and is left live, since only the quoted part is stripped. It is inert
+       for this check -- a bare identifier character cannot be a parenthesis
+       and cannot complete a ``whoop_user_id = ?`` fragment -- so it is named
+       here rather than described as stripped. Stating "everything opaque is
+       stripped" would be the same kind of slightly-too-broad claim that
+       #129 and #131 were both filed about.
+
+       This is not only about a fragment hiding inside a quoted region. The
+       characters a quoted region contains are invisible to sqlite as
+       *syntax*, so leaving them live desynchronises refinement 2's
+       parenthesis counting from what sqlite actually parses -- an ``AS
+       [q)]`` alias contributes a stray ``)`` that made a nested fragment
+       read as depth zero. #131 has the worked exploit.
     2. The match must fall after the first top-level (parenthesis-depth-
        zero) ``WHERE`` keyword, **and must itself sit at depth zero**. The
        first half rejects a ``SET``-clause fragment (it sits before any
@@ -605,7 +625,9 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
             i = n if end == -1 else end + 2
             continue
         ch = sql[i]
-        if ch in ("'", '"'):
+        if ch in ("'", '"', "`"):
+            # Backticks double to escape, exactly as ' and " do -- sqlite
+            # accepts ``a``b`` as the single identifier a`b (measured, #131).
             j = i + 1
             while j < n:
                 if sql[j] == ch:
@@ -618,6 +640,15 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
             else:
                 j = n
             i = j
+            continue
+        if ch == "[":
+            # Bracket-quoted identifiers have NO escape mechanism: the first
+            # ``]`` ends the identifier, and sqlite rejects ``[a]]b]`` as an
+            # unrecognised token rather than reading a doubled ``]`` (measured,
+            # #131). So this cannot share the doubling branch above -- doing so
+            # would consume past the real terminator and swallow live SQL.
+            end = sql.find("]", i + 1)
+            i = n if end == -1 else end + 1
             continue
         chars.append(ch)
         i += 1
