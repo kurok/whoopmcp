@@ -587,6 +587,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Issue #125 (#37 audit, P3): the three PyPI tools the workflows invoke are now
+  pinned to exact versions -- `build==1.5.0`, `twine==7.0.0`,
+  `pip-audit==2.10.1` -- across `release.yml` (2 sites) and `ci.yml` (3). They
+  previously resolved whatever was on PyPI at run time, and in `release.yml`
+  that is code execution inside the job that produces the distributions which
+  are then published, so a compromised `build` or `twine` release would reach
+  the artifact before anyone could inspect it. After #119 and #124 pinned every
+  action by commit SHA, this was the last unpinned code-execution step on the
+  publish path.
+
+  Pinned via `pipx run --spec <package>==<version> <app>`, not the shorter
+  `pipx run <package>==<version>`. The short form makes pipx infer the app name
+  from the spec, and `build`'s console script is `pyproject-build`, not `build`
+  -- verified against a real pipx rather than assumed, because `release.yml`
+  only runs on a tag, so a wrong invocation there would not surface until
+  release day.
+
+  This pins *which release of each tool* runs, not each tool's own dependency
+  closure, which pipx still resolves at run time. That residual is filed as
+  #159 rather than implied to be covered.
+
 - Issue #124 (#37 audit, P3): every GitHub-owned action is now pinned by commit
   SHA with its version in a trailing comment, matching the pattern the repo
   already used for third-party actions and stated as the right one. 19 `uses:`
