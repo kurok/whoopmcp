@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #187: a failure syncing one entity denied sync to the other three.
+  `run_sync` walked the four entities in a flat loop with no isolation, so an
+  exception while syncing `recoveries` aborted the call before `sleeps`,
+  `cycles` or `workouts` were attempted -- the blast radius was an accident of
+  ordering rather than of the fault.
+
+  Each entity is now isolated. A failed one is reported rather than raised:
+  `EntitySyncResult.error` names what went wrong, its `count` is 0, and its
+  stored cursor is left untouched so the next run retries from exactly where it
+  was. `asyncio.CancelledError` still propagates, since a cancelled run is not a
+  partial success.
+
+  **Behaviour change for callers:** `run_sync` no longer raises when one entity
+  fails, and the `whoop_sync` tool reports `"synced": true` only when *every*
+  entity succeeded. A partial run returns `"synced": false`, a `message` naming
+  which entities failed, and per-entity `error` fields -- so a caller checking
+  only the flag cannot read a partial run as a clean one.
+
+  This issue's other half -- an unparseable `updated_at` crashing the next run
+  -- was already closed by #186's parse guard, which stops such a value ever
+  becoming a stored mark.
+
+
 - Issue #186: one record with a future-dated `updated_at` could permanently
   poison the incremental-sync high-water mark. Nothing bounded the mark against
   the present, so such a value became the cursor; every later run then requested

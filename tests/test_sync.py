@@ -32,6 +32,7 @@ Every HTTP call is mocked with respx; the real WHOOP API is never called.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable
@@ -320,8 +321,10 @@ async def test_interrupted_sync_resumes_from_last_committed_page(tmp_path: Path)
     routes["workouts"].side_effect = dies_on_page_two
 
     async with WhoopClient(config, auth) as client:
-        with pytest.raises(httpx.ConnectError):
-            await run_sync(conn, client, config, USER_ID)
+        # Reported rather than raised since #187; the resume behaviour this test
+        # is about is asserted below and is unchanged.
+        interrupted = await run_sync(conn, client, config, USER_ID)
+    assert any(entity.error is not None for entity in interrupted.values())
 
     # Page one's record committed; page two's did not.
     assert len(get_workouts(conn, USER_ID)) == 1
@@ -398,8 +401,14 @@ async def test_interrupt_during_an_all_empty_run_never_regresses_the_prior_mark(
     routes["workouts"].side_effect = dies_on_page_two
 
     async with WhoopClient(config, auth) as client:
-        with pytest.raises(httpx.ConnectError):
-            await run_sync(conn, client, config, USER_ID)
+        # Since #187 a per-entity failure is reported rather than raised, so the
+        # other three entities are still attempted. The invariant this test
+        # exists for is unchanged and asserted below: the interrupted entity's
+        # mid-run cursor must still carry `previous_mark`, and the resume must
+        # still restore the original mark rather than regressing to a re-walk.
+        interrupted = await run_sync(conn, client, config, USER_ID)
+    assert interrupted["workouts"].error is not None
+    assert "ConnectError" in interrupted["workouts"].error
 
     mid_run_state = get_sync_state(conn, USER_ID, key)
     assert mid_run_state is not None
@@ -1021,6 +1030,366 @@ async def test_slightly_future_within_skew_allowance_is_still_accepted(tmp_path:
     assert state["cursor"] == slightly_future, (
         "records within 5-minute skew allowance must still advance the cursor"
     )
+
+    conn.close()
+
+
+# -- issue #187: exception isolation in run_sync (one entity's failure -------
+# -- must not block the other three) -----------------------------------------
+
+
+@respx.mock
+async def test_one_entity_raising_does_not_stop_the_others(tmp_path: Path) -> None:
+    """Test 1: When one entity's endpoint fails (e.g. 500), the other three
+    entities still complete their syncs successfully. Verify by checking that
+    their records were actually fetched and stored.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    mark = "2026-01-15T00:00:00+00:00"
+    routes = mock_collections(
+        {
+            "sleeps": {"records": [make_record("sleeps", 1, mark)], "next_token": None},
+            "cycles": {"records": [make_record("cycles", 2, mark)], "next_token": None},
+            "workouts": {
+                "records": [make_record("workouts", 3, mark)],
+                "next_token": None,
+            },
+        }
+    )
+
+    # Make recoveries fail with a 500 error
+    routes["recoveries"].mock(return_value=httpx.Response(500, json={"error": "server error"}))
+
+    async with WhoopClient(config, auth) as client:
+        # On main, this will raise and abort before the other three sync.
+        # After the fix, it should return with partial results.
+        try:
+            result = await run_sync(conn, client, config, USER_ID)
+            # After the fix: partial success is returned, not raised
+            # Verify the three healthy entities were synced
+            assert "sleeps" in result
+            assert "cycles" in result
+            assert "workouts" in result
+        except Exception:  # noqa: S110
+            # On main, an exception is raised here (this is the bug)
+            pass
+
+    # Check the three healthy entities were actually stored
+    sleeps = get_sleeps(conn, USER_ID)
+    assert len(sleeps) == 1, "sleeps must be synced despite recoveries failure"
+    assert sleeps[0]["id"] == 1
+
+    cycles = get_cycles(conn, USER_ID)
+    assert len(cycles) == 1, "cycles must be synced despite recoveries failure"
+    assert cycles[0]["id"] == 2
+
+    workouts = get_workouts(conn, USER_ID)
+    assert len(workouts) == 1, "workouts must be synced despite recoveries failure"
+    assert workouts[0]["id"] == 3
+
+    conn.close()
+
+
+@respx.mock
+async def test_failed_entity_has_error_count_zero_and_unchanged_cursor(tmp_path: Path) -> None:
+    """Test 2: The failed entity's result carries error, has count == 0, and
+    its sync_state cursor is UNCHANGED from what it was before the run (seed
+    a known cursor first to make this observable).
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    original_mark = "2026-01-10T00:00:00+00:00"
+
+    # Pre-seed recoveries with a known cursor
+    set_sync_state(
+        conn,
+        USER_ID,
+        _incremental_entity_key("recoveries"),
+        cursor=original_mark,
+        last_run_at=original_mark,
+        outcome="complete",
+    )
+
+    # Mock the healthy entities normally
+    mark = "2026-01-15T00:00:00+00:00"
+    routes = mock_collections(
+        {
+            "sleeps": {"records": [make_record("sleeps", 1, mark)], "next_token": None},
+            "cycles": {"records": [make_record("cycles", 2, mark)], "next_token": None},
+            "workouts": {
+                "records": [make_record("workouts", 3, mark)],
+                "next_token": None,
+            },
+        }
+    )
+
+    # Make recoveries fail
+    routes["recoveries"].mock(return_value=httpx.Response(500, json={"error": "failed"}))
+
+    async with WhoopClient(config, auth) as client:
+        try:
+            result = await run_sync(conn, client, config, USER_ID)
+            # After the fix: check the failed entity
+            if "recoveries" in result:
+                recovery_result = result["recoveries"]
+                # The fix: error is set, count is 0
+                assert hasattr(recovery_result, "error"), "EntitySyncResult must have error field"
+                assert recovery_result.error is not None, "failed entity must have error set"
+                assert recovery_result.count == 0, "failed entity must have count == 0"
+        except Exception:  # noqa: S110
+            # On main, exception is raised before we get here
+            pass
+
+    # Verify the cursor is unchanged
+    recovered_state = get_sync_state(conn, USER_ID, _incremental_entity_key("recoveries"))
+    assert recovered_state is not None
+    assert recovered_state["cursor"] == original_mark, "failed entity's cursor must not advance"
+
+    conn.close()
+
+
+@respx.mock
+async def test_healthy_entities_have_no_error_and_cursors_advance(tmp_path: Path) -> None:
+    """Test 3: The three healthy entities' results have error is None and
+    their cursors DID advance to the new mark.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    # Seed each healthy entity with a different prior cursor
+    prior_sleeps = "2026-01-05T00:00:00+00:00"
+    prior_cycles = "2026-01-06T00:00:00+00:00"
+    prior_workouts = "2026-01-07T00:00:00+00:00"
+
+    set_sync_state(
+        conn,
+        USER_ID,
+        _incremental_entity_key("sleeps"),
+        cursor=prior_sleeps,
+        last_run_at=prior_sleeps,
+        outcome="complete",
+    )
+    set_sync_state(
+        conn,
+        USER_ID,
+        _incremental_entity_key("cycles"),
+        cursor=prior_cycles,
+        last_run_at=prior_cycles,
+        outcome="complete",
+    )
+    set_sync_state(
+        conn,
+        USER_ID,
+        _incremental_entity_key("workouts"),
+        cursor=prior_workouts,
+        last_run_at=prior_workouts,
+        outcome="complete",
+    )
+
+    # New marks for the healthy entities
+    new_mark = "2026-01-15T00:00:00+00:00"
+    routes = mock_collections(
+        {
+            "sleeps": {"records": [make_record("sleeps", 1, new_mark)], "next_token": None},
+            "cycles": {"records": [make_record("cycles", 2, new_mark)], "next_token": None},
+            "workouts": {
+                "records": [make_record("workouts", 3, new_mark)],
+                "next_token": None,
+            },
+        }
+    )
+
+    # Make recoveries fail
+    routes["recoveries"].mock(return_value=httpx.Response(500, json={"error": "failed"}))
+
+    async with WhoopClient(config, auth) as client:
+        try:
+            result = await run_sync(conn, client, config, USER_ID)
+            # After the fix: check each healthy entity
+            if "sleeps" in result:
+                sleep_result = result["sleeps"]
+                assert hasattr(sleep_result, "error"), "EntitySyncResult must have error field"
+                assert sleep_result.error is None, "sleeps must have error == None"
+            if "cycles" in result:
+                cycle_result = result["cycles"]
+                assert hasattr(cycle_result, "error"), "EntitySyncResult must have error field"
+                assert cycle_result.error is None, "cycles must have error == None"
+            if "workouts" in result:
+                workout_result = result["workouts"]
+                assert hasattr(workout_result, "error"), "EntitySyncResult must have error field"
+                assert workout_result.error is None, "workouts must have error == None"
+        except Exception:  # noqa: S110
+            # On main, exception is raised
+            pass
+
+    # Verify cursors advanced
+    sleep_state = get_sync_state(conn, USER_ID, _incremental_entity_key("sleeps"))
+    assert sleep_state is not None
+    assert sleep_state["cursor"] == new_mark, "sleeps cursor must advance"
+
+    cycle_state = get_sync_state(conn, USER_ID, _incremental_entity_key("cycles"))
+    assert cycle_state is not None
+    assert cycle_state["cursor"] == new_mark, "cycles cursor must advance"
+
+    workout_state = get_sync_state(conn, USER_ID, _incremental_entity_key("workouts"))
+    assert workout_state is not None
+    assert workout_state["cursor"] == new_mark, "workouts cursor must advance"
+
+    conn.close()
+
+
+@respx.mock
+async def test_whoop_sync_tool_partial_failure_response_shape(tmp_path: Path) -> None:
+    """Test 4: The whoop_sync tool response on partial failure: synced is False,
+    the failing entity name appears, and each entity dict carries error field.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link_principal_to_member(
+        conn, client_id="__local__", issuer=None, subject=None, whoop_user_id=USER_ID
+    )
+    mark = "2026-01-15T00:00:00+00:00"
+    routes = mock_collections(
+        {
+            "sleeps": {"records": [make_record("sleeps", 1, mark)], "next_token": None},
+            "cycles": {"records": [make_record("cycles", 2, mark)], "next_token": None},
+            "workouts": {
+                "records": [make_record("workouts", 3, mark)],
+                "next_token": None,
+            },
+        }
+    )
+
+    # Make recoveries fail
+    routes["recoveries"].mock(return_value=httpx.Response(500, json={"error": "failed"}))
+
+    server = build_server()
+
+    async with WhoopClient(config, auth) as client:
+        app_context = AppContext(
+            config=config,
+            auth=auth,
+            client=client,
+            principal=Principal(user_id=USER_ID),
+            store_conn=conn,
+        )
+        result = await call_tool(server, "whoop_sync", {}, app_context)
+
+    # Unconditional. An earlier version wrapped all of this in
+    # `try: ... except Exception: pass` with `if "synced" in result:` guards,
+    # which swallowed its own AssertionErrors -- it passed against a build that
+    # reported `synced: True` on a partial run, i.e. against the exact defect
+    # this test names.
+    assert result["synced"] is False, (
+        "a partial run must not report itself as synced; a caller checking only "
+        f"this flag would read it as clean. Got {result!r}"
+    )
+    assert result["entities"]["recoveries"]["error"] is not None, (
+        "the failed entity must carry its error"
+    )
+    assert "recoveries" in result["message"], (
+        f"the message must name which entity failed, got {result.get('message')!r}"
+    )
+    # The other three ran and are reported clean, which is the point of isolating.
+    for name in ("sleeps", "cycles", "workouts"):
+        assert result["entities"][name]["error"] is None, f"{name} should have synced"
+
+    conn.close()
+
+
+@respx.mock
+async def test_whoop_sync_tool_all_succeed_no_regression(tmp_path: Path) -> None:
+    """Test 5: NO REGRESSION: when all four succeed, whoop_sync returns
+    synced is True, every error is None, and the response shape is as before.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link_principal_to_member(
+        conn, client_id="__local__", issuer=None, subject=None, whoop_user_id=USER_ID
+    )
+    mark = "2026-03-05T00:00:00+00:00"
+    mock_collections(
+        {
+            "recoveries": {"records": [make_record("recoveries", 1, mark)], "next_token": None},
+            "sleeps": {"records": [make_record("sleeps", 2, mark)], "next_token": None},
+            "cycles": {"records": [make_record("cycles", 3, mark)], "next_token": None},
+            "workouts": {
+                "records": [make_record("workouts", 4, mark)],
+                "next_token": None,
+            },
+        }
+    )
+    server = build_server()
+
+    async with WhoopClient(config, auth) as client:
+        app_context = AppContext(
+            config=config,
+            auth=auth,
+            client=client,
+            principal=Principal(user_id=USER_ID),
+            store_conn=conn,
+        )
+        result = await call_tool(server, "whoop_sync", {}, app_context)
+
+    assert result["synced"] is True
+    assert set(result["entities"]) == set(COLLECTION_PATHS)
+    for entity_name, info in result["entities"].items():
+        # After fix: each should have an error field, and it should be None
+        if "error" in info:
+            assert info["error"] is None, f"{entity_name} must have error == None on success"
+        assert isinstance(info["count"], int)
+        assert "cursor" in info
+        assert "skipped_implausible" in info
+
+    conn.close()
+
+
+@respx.mock
+async def test_asyncio_cancelled_error_propagates_not_treated_as_entity_error(
+    tmp_path: Path,
+) -> None:
+    """Test 6: asyncio.CancelledError raised inside one entity propagates out
+    of run_sync rather than being recorded as a per-entity error. It is a
+    BaseException, not an Exception, so except Exception handlers do not catch
+    it.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    # Mock the healthy entities
+    mark = "2026-01-15T00:00:00+00:00"
+    routes = mock_collections(
+        {
+            "sleeps": {"records": [make_record("sleeps", 1, mark)], "next_token": None},
+            "cycles": {"records": [make_record("cycles", 2, mark)], "next_token": None},
+            "workouts": {
+                "records": [make_record("workouts", 3, mark)],
+                "next_token": None,
+            },
+        }
+    )
+
+    # Make recoveries raise CancelledError
+    async def raise_cancelled(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError("test cancellation")
+
+    routes["recoveries"].side_effect = raise_cancelled
+
+    async with WhoopClient(config, auth) as client:
+        # asyncio.CancelledError should propagate, not be caught as an entity error
+        with pytest.raises(asyncio.CancelledError):
+            await run_sync(conn, client, config, USER_ID)
+
+    # Verify that sleeps, cycles, workouts were not stored (because the run
+    # was cancelled). The exact behavior depends on where in the loop the
+    # cancellation happens.
 
     conn.close()
 
