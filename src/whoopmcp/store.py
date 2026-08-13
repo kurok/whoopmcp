@@ -448,7 +448,8 @@ class UnscopedQueryError(RuntimeError):
 
 #: The one predicate shape that pins a statement to a single member:
 #: ``whoop_user_id`` compared for equality against a *bound parameter*,
-#: sitting after the first top-level ``WHERE`` in a comment- and
+#: sitting after the first top-level ``WHERE`` -- and at parenthesis depth
+#: zero itself -- in a comment- and
 #: string-literal-stripped copy of the statement. See
 #: ``_statement_restricts_to_one_member``, which does the stripping and the
 #: position check; this regex is only the fragment it searches for.
@@ -483,19 +484,66 @@ class UnscopedQueryError(RuntimeError):
 #:   fragment sits inside the subquery's parentheses, before the outer,
 #:   top-level ``WHERE``, so the position check rejects it even though the
 #:   outer ``WHERE`` itself carries no member predicate.
+#: * CAUGHT, since #129 -- the mirror image of the case above: a subquery or
+#:   parenthesised group *after* the top-level ``WHERE`` supplying the
+#:   fragment while the top-level predicate itself spans every member, e.g.
+#:   ``UPDATE recoveries SET score_state='MUTATED' WHERE whoop_user_id != ?
+#:   AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)``.
+#:   Until #129 the position check anchored only where the search *started*,
+#:   not the depth of what it found, so the nested fragment was accepted as
+#:   the statement's member restriction -- reproduced end to end as a
+#:   cross-member ``UPDATE`` and, in ``INSERT ... SELECT`` form, as another
+#:   member's ``raw_json`` health payload copied into the caller's own
+#:   partition. The match must now sit at depth zero as well.
+#: * CAUGHT, and a deliberate false positive -- a *genuine* restriction that
+#:   sits inside parentheses, which now covers more shapes than the exploit
+#:   it is aimed at. ``WHERE (whoop_user_id = ?)``, ``WHERE (whoop_user_id =
+#:   ? AND deleted_at IS NULL)`` and ``WHERE deleted_at IS NULL AND
+#:   (whoop_user_id = ?)`` are all rejected, as is ``WHERE whoop_user_id IN
+#:   (SELECT whoop_user_id FROM sleeps WHERE whoop_user_id = ?)``. Every one
+#:   of those does confine itself to one member. Depth zero cannot tell them
+#:   from the exploit above without parsing, so they fail closed -- the
+#:   survivable direction. No caller here writes any of them (all emit a bare
+#:   ``WHERE whoop_user_id = ?`` first), but a parenthesised conjunction is a
+#:   more plausible thing for a future caller to write than the ``IN`` form,
+#:   so write the predicate unparenthesised and at the top level.
 #: * NOT CAUGHT -- a statement that carries a matching fragment *after* its
-#:   top-level ``WHERE`` and widens its own reach anyway: ``WHERE
-#:   whoop_user_id = ? OR 1 = 1``, or a second ``OR``-ed member. Nothing
-#:   here understands boolean precedence.
+#:   top-level ``WHERE``, at depth zero, and widens its own reach anyway:
+#:   ``WHERE whoop_user_id = ? OR 1 = 1``, or a second ``OR``-ed member.
+#:   Nothing here understands boolean precedence.
 #: * NOT CAUGHT -- *which* table the fragment applies to when a statement
 #:   names two tenant-scoped tables. The universal read check is per-table;
 #:   this one is per-statement.
+#: * NOT CAUGHT -- a compound statement whose *second* arm supplies the
+#:   fragment at depth zero while the first spans every member: ``SELECT
+#:   raw_json FROM recoveries WHERE whoop_user_id != ? UNION SELECT raw_json
+#:   FROM recoveries WHERE whoop_user_id = ?`` returns the other member's
+#:   payload. Both arms' ``WHERE`` keywords are genuinely at depth zero, so
+#:   the depth requirement cannot help here; only the first is examined. Found
+#:   while adversarially reviewing #129 and filed separately -- listed here
+#:   because leaving it out would make this list read as exhaustive when the
+#:   mechanism is distinct from the two bullets above.
+#: * NOT CAUGHT -- a bracket- or backtick-quoted identifier containing an
+#:   unbalanced parenthesis (``AS [q)]``), which the stripping pass does not
+#:   recognise as a quoted region, so a stray ``)`` desynchronises the depth
+#:   counter and a nested fragment can read as depth zero. That tokeniser gap
+#:   is #131's, is not new here, and defeats the depth requirement rather
+#:   than the position one -- so it is what makes #131 load-bearing for this
+#:   check rather than merely untidy.
 #:
 #: The universal check remains the load-bearing control (it is backed by
 #: sqlite's own authorizer, so it cannot be talked out of by SQL text); this
 #: regex, via ``_statement_restricts_to_one_member``, is the second layer.
 #: Closing the remaining NOT-CAUGHT cases needs a real parser and is a
-#: follow-up issue, not part of #99 or #109.
+#: follow-up issue, not part of #99, #109 or #129.
+#:
+#: One lesson from #129 is worth keeping next to the list: every entry above
+#: is a claim about behaviour, and a stale one is worse than a missing one.
+#: #109 added the depth machinery and then described its reach in terms of
+#: *position* only, which read as broader than it was; the gap it left was
+#: found by an audit rather than by a test. When this check changes again,
+#: change this list in the same commit, and add the shape to
+#: ``tests/test_tenancy.py`` so the claim has something holding it up.
 _MEMBER_EQUALITY_PREDICATE = re.compile(r"whoop_user_id\s*=\s*\?", re.IGNORECASE)
 
 _TOP_LEVEL_WHERE = re.compile(r"\bWHERE\b", re.IGNORECASE)
@@ -520,12 +568,27 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
        the copy before it is searched, so a fragment sitting in any of
        those cannot satisfy the check.
     2. The match must fall after the first top-level (parenthesis-depth-
-       zero) ``WHERE`` keyword. This is what rejects a ``SET``-clause
-       fragment (it sits before any ``WHERE``) and a subquery in ``SET``
-       supplying the fragment from inside parentheses while the outer
-       statement stays unfiltered (the fragment then sits before the
-       *outer*, depth-zero ``WHERE``) -- see ``_MEMBER_EQUALITY_PREDICATE``
-       for the worked examples.
+       zero) ``WHERE`` keyword, **and must itself sit at depth zero**. The
+       first half rejects a ``SET``-clause fragment (it sits before any
+       ``WHERE``) and a subquery in ``SET`` supplying the fragment from
+       inside parentheses while the outer statement stays unfiltered (the
+       fragment then sits before the *outer*, depth-zero ``WHERE``). The
+       second half (#129) rejects the mirror image: a subquery or
+       parenthesised group *after* that ``WHERE`` supplying the fragment
+       while the top-level predicate spans every member. Both halves are
+       needed -- anchoring only the start of the search made the check
+       one-sided, and #129 reproduced a cross-member ``UPDATE`` and an
+       ``INSERT ... SELECT`` exfiltration through the gap. See
+       ``_MEMBER_EQUALITY_PREDICATE`` for the worked examples.
+
+       A statement whose only member restriction is *genuinely* nested, such
+       as ``WHERE whoop_user_id IN (SELECT whoop_user_id FROM sleeps WHERE
+       whoop_user_id = ?)``, is rejected too, even though it does confine
+       itself to one member. That is the fail-closed direction, and no
+       caller in this module writes that shape -- verified by running the
+       whole suite with both the old and the depth-checked form and
+       comparing every statement that reached here: they agreed on all of
+       them.
 
     Still a presence check on text, not a SQL parser -- see
     ``_MEMBER_EQUALITY_PREDICATE`` for what this still does not catch.
@@ -576,7 +639,26 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
 
     if where_end is None:
         return False
-    return _MEMBER_EQUALITY_PREDICATE.search(sanitized, where_end) is not None
+
+    # The fragment must ALSO sit at depth zero -- in the top-level WHERE
+    # itself, not nested inside a parenthesised group or subquery that
+    # follows it (#129). Anchoring only the start of the search left the
+    # check one-sided: ``WHERE whoop_user_id != ? AND EXISTS (SELECT 1 FROM
+    # recoveries r2 WHERE r2.whoop_user_id = ?)`` reads the column (so the
+    # universal authorizer check passes), spans every member but the caller,
+    # and had the nested fragment accepted as its member restriction.
+    depth = 0
+    pos = where_end
+    for match in _MEMBER_EQUALITY_PREDICATE.finditer(sanitized, where_end):
+        while pos < match.start():
+            if sanitized[pos] == "(":
+                depth += 1
+            elif sanitized[pos] == ")":
+                depth -= 1
+            pos += 1
+        if depth == 0:
+            return True
+    return False
 
 
 class _TenancyFindings(NamedTuple):

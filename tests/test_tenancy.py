@@ -2458,6 +2458,132 @@ def test_member_equality_not_caught_list_is_truthful() -> None:
         )
 
 
+# -- #129: the member predicate must sit at depth zero, not merely after the
+# top-level WHERE. #109 anchored where the search STARTED and not the depth of
+# what it found, so a fragment nested in a subquery after a non-restrictive
+# top-level predicate was accepted as the statement's member restriction. Both
+# exploits below are the audit's own, reproduced verbatim. ---------------------
+
+
+def test_member_equality_nested_fragment_after_where_is_rejected(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#129 exploit 1: a cross-member UPDATE must not be accepted.
+
+    ``WHERE whoop_user_id != ? AND EXISTS (SELECT 1 ... WHERE r2.whoop_user_id
+    = ?)`` reads the column, so the universal authorizer check passes, and it
+    spans every member *except* the caller. Its only equality fragment sits at
+    depth 1 inside the EXISTS subquery. Before #129 that fragment satisfied the
+    member-predicate check and member B's row was mutated by a caller who bound
+    only their own id.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+    conn.commit()
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "UPDATE recoveries SET score_state='MUTATED' WHERE whoop_user_id != ? "
+            "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+            (MEMBER_A, MEMBER_A),
+        )
+
+    conn.commit()
+    victim = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ?", (MEMBER_B,)
+    ).fetchone()[0]
+    assert victim == "SCORED", (
+        "member B's row was mutated by a statement bound only to member A's id"
+    )
+
+
+def test_member_equality_nested_fragment_insert_select_exfil_is_rejected(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#129 exploit 2: the INSERT ... SELECT exfiltration must not be accepted.
+
+    This one defeats two guards at once. ``INSERT`` is permanently exempt from
+    the member-predicate check (it has no WHERE of its own), so the SELECT
+    branch of ``_execute_scoped`` is what stops a read spanning other members.
+    The plain ``INSERT ... SELECT ... WHERE whoop_user_id != ?`` is correctly
+    rejected there; adding the nested fragment flipped it to accepted, copying
+    another member's ``raw_json`` -- their health payload -- into the caller's
+    own partition, where ordinary scoped getters then return it.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+    conn.commit()
+
+    before = conn.execute(
+        "SELECT COUNT(*) FROM recoveries WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchone()[0]
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "INSERT INTO recoveries (whoop_user_id,resource_id,raw_json,updated_at) "
+            "SELECT ?, resource_id, raw_json, updated_at FROM recoveries "
+            "WHERE whoop_user_id != ? "
+            "AND EXISTS(SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+            (MEMBER_A, MEMBER_A, MEMBER_A),
+        )
+
+    conn.commit()
+    after = conn.execute(
+        "SELECT COUNT(*) FROM recoveries WHERE whoop_user_id = ?", (MEMBER_A,)
+    ).fetchone()[0]
+    assert after == before, "another member's health payload was copied into A's partition"
+
+
+def test_member_equality_depth_is_checked_not_merely_position() -> None:
+    """The root-cause shapes from #129, at the predicate-check level.
+
+    Kept separate from the two end-to-end exploits because these isolate the
+    single property that changed: a fragment after the top-level WHERE is no
+    longer enough -- it must be at depth zero. The last case is a deliberate
+    false positive: it *does* confine itself to one member, and is rejected
+    anyway, because depth zero cannot tell it from the exploit above without a
+    parser. Pinned here so that trade-off is visible rather than incidental.
+    """
+    nested_rejected = [
+        "DELETE FROM recoveries WHERE whoop_user_id != ? AND (0 OR whoop_user_id = ?)",
+        "UPDATE recoveries SET score_state='X' WHERE whoop_user_id != ? "
+        "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+        # The rest are genuinely restrictive and rejected anyway -- fail-closed.
+        # Pinned so the cost of the depth requirement stays visible: a future
+        # caller that parenthesises its member predicate will be rejected, and
+        # should be written unparenthesised rather than have this loosened.
+        "DELETE FROM recoveries WHERE whoop_user_id IN "
+        "(SELECT whoop_user_id FROM sleeps WHERE whoop_user_id = ?)",
+        "DELETE FROM recoveries WHERE (whoop_user_id = ?)",
+        "DELETE FROM recoveries WHERE (whoop_user_id = ? AND deleted_at IS NULL)",
+        "DELETE FROM recoveries WHERE deleted_at IS NULL AND (whoop_user_id = ?)",
+    ]
+    for sql in nested_rejected:
+        assert not store._statement_restricts_to_one_member(sql), (
+            f"fragment nested below depth zero was accepted: {sql}"
+        )
+
+    # A depth-zero fragment is still accepted, including when a parenthesised
+    # group it is not inside appears in the same WHERE -- the depth counter
+    # must return to zero after that group closes, not stay elevated.
+    depth_zero_accepted = [
+        "DELETE FROM recoveries WHERE whoop_user_id = ?",
+        "UPDATE sleeps SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",
+        "SELECT raw_json FROM recoveries WHERE (score_state = ? OR score_state = ?) "
+        "AND whoop_user_id = ?",
+        "SELECT raw_json FROM recoveries WHERE whoop_user_id = ? "
+        "AND resource_id IN (SELECT resource_id FROM sleeps)",
+    ]
+    for sql in depth_zero_accepted:
+        assert store._statement_restricts_to_one_member(sql), (
+            f"a legitimate depth-zero predicate was rejected: {sql}"
+        )
+
+
 # -- exclusion rationale stays true (issue #130) -------------------------------
 
 
