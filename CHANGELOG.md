@@ -671,6 +671,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #159 (found fixing #125, P3, latent): #125 pinned `build`, `twine` and
+  `pip-audit` to exact versions, which fixed *which release of the named tool*
+  executes and left each tool's dependency closure to be resolved against PyPI at
+  run time. `build` pulls 3 more packages; `twine` and `pip-audit` pull 27 each. A
+  compromised release of any of them executes inside the job that produces the
+  distributions `release.yml` publishes -- the same blast radius as a compromised
+  `build`, differing only in how many packages an attacker must own.
+
+  Each tool's whole closure is now pinned by version and SHA-256 in
+  `.github/requirements/<tool>.txt`, and all five call sites across `ci.yml` and
+  `release.yml` install with `pip install --require-hashes` into a throwaway venv
+  instead of `pipx run`. `--require-hashes` is the load-bearing part: it rejects an
+  artifact whose hash is not listed, and refuses to run at all if any dependency is
+  unpinned, which is what makes the closure provably complete rather than merely
+  long.
+
+  Verified where it counts, because `release.yml` only runs on a tag and a mistake
+  there is invisible until release day: every lock resolves and downloads for
+  **Linux x86_64 / CPython 3.14** under `--require-hashes` (3, 22 and 28
+  artifacts). Generating a lock that works on the author's machine and fails on the
+  runner was the real risk, and it is measured rather than assumed.
+
+  `.github/requirements/README.md` documents regeneration, including why
+  `--universal` is required -- though not for the reason first written down. A
+  non-universal lock does *not* omit Linux's wheel hashes; it omits packages only
+  other platforms need (`twine.txt`: 22 packages instead of 28). Compiled both ways
+  and installed both on Linux to establish that, and the file now says so, because
+  the first draft of that explanation was wrong.
+
+  #125's `test_pipx_tools_are_version_pinned` is deleted, not loosened: with the
+  last `pipx run` gone its own "did the scan find anything?" guard could never be
+  satisfied, and its guarantee is strictly implied by the new test forbidding
+  `pipx run` outright. A scan that can never find its target is the vacuous shape
+  #143 and #163 were about.
+
 - Issue #128 (#37 audit, P3, latent): `compact_database`'s docstring said
   `PRAGMA secure_delete` is 0 "by design -- see PRIVACY.md", and PRIVACY.md said
   nothing about `secure_delete` or residual bytes anywhere. A pointer to

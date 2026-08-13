@@ -378,17 +378,18 @@ class TestSecurityLinting:
         The audit job must include pip-audit as a plain run step
         with no continue-on-error or || true, so it fails the build.
 
-        The pattern tolerates the `--spec pip-audit==X.Y.Z` pinning added by
-        #125 -- what this test is about is that the step is *required*, not how
-        the tool is fetched. Pinning is asserted separately by
-        `test_pipx_tools_are_version_pinned`.
+        This test is about the step being *required*, not how the tool is
+        fetched -- so it has been retargeted twice as the fetch changed: #125
+        added `--spec pip-audit==X.Y.Z`, and #159 replaced `pipx run` entirely
+        with a hash-locked install. How it is fetched is asserted by
+        `test_release_tools_are_installed_from_hash_locked_closures`.
         """
         assert "pip-audit" in ci_yml_content, "ci.yml must include a pip-audit step"
         # Verify the step is not marked as optional
         # Look for the pip-audit line and ensure it's not followed by continue-on-error or || true
-        audit_pattern = r"-\s*run:\s*pipx run\s+(?:--spec\s+\S+\s+)?pip-audit\s*\.?"
+        audit_pattern = r"/bin/pip-audit\s+\."
         match = re.search(audit_pattern, ci_yml_content)
-        assert match, "ci.yml must have a plain 'pipx run [--spec ...] pip-audit .' step"
+        assert match, "ci.yml must invoke pip-audit from its hash-locked venv"
 
         # Get the section around the pip-audit step to check for continue-on-error
         start = max(0, match.start() - 200)
@@ -532,54 +533,14 @@ def test_every_action_is_sha_pinned_with_its_version_recorded(
     )
 
 
-def test_pipx_tools_are_version_pinned(project_root: Path) -> None:
-    """Issue #125: every `pipx run` in a workflow must pin an exact version.
-
-    `pipx run build` resolves whatever is on PyPI at run time. In `release.yml`
-    that is code execution inside the job that produces the distributions which
-    are then published, so a compromised `build` or `twine` release reaches the
-    artifact before anyone can inspect it. Requires compromising a high-profile
-    PyPA package, hence P3 -- but after #119 and #124 pinned every action, this
-    was the last unpinned code-execution step on the publish path.
-
-    The `--spec <package>==<version> <app>` form is required rather than the
-    shorter `pipx run <package>==<version>`, because the latter makes pipx infer
-    the app name from the spec, and `build`'s console script is `pyproject-build`
-    -- not `build`. `--spec` names the package and the app separately, which is
-    the only form that is unambiguous for all three tools here.
-
-    What this does NOT pin is each tool's own dependencies, which still resolve
-    at run time; that needs a hash-locked requirements file and is filed
-    separately. This test asserts what is claimed and no more.
-    """
-    pipx_re = re.compile(r"pipx run\s+(?P<args>.+)$")
-    spec_re = re.compile(
-        r"--spec\s+(?P<package>[A-Za-z0-9._-]+)==(?P<version>\d+\.\d+(?:\.\d+)?)\s"
-    )
-
-    workflows = sorted((project_root / ".github" / "workflows").glob("*.yml"))
-    assert workflows, "no workflow files found -- this test would pass vacuously"
-
-    unpinned: list[str] = []
-    found = 0
-    for path in workflows:
-        for number, line in enumerate(path.read_text().splitlines(), start=1):
-            stripped = line.strip()
-            # Only real steps, never a comment that happens to mention pipx.
-            if not stripped.startswith("- run:") and not stripped.startswith("run:"):
-                continue
-            match = pipx_re.search(stripped)
-            if not match:
-                continue
-            found += 1
-            if not spec_re.search(match.group("args") + " "):
-                unpinned.append(f"{path.name}:{number} -> {stripped}")
-
-    assert found >= 3, f"only found {found} 'pipx run' steps -- the scan is not working"
-    assert unpinned == [], (
-        "every 'pipx run' must pin its tool with '--spec <package>==<version> <app>', "
-        f"so a release published between runs cannot change what executes: {unpinned}"
-    )
+# #125's `test_pipx_tools_are_version_pinned` lived here. It asserted that every
+# `pipx run` pinned its tool with `--spec <pkg>==<version>`. #159 removed the last
+# `pipx run` from the workflows, so the test's own "did the scan find anything?"
+# guard could no longer be satisfied -- and its guarantee is strictly weaker than
+# what replaced it: `test_no_workflow_still_resolves_a_tool_at_run_time` forbids
+# `pipx run` outright, which implies every one of them is pinned. Deleted rather
+# than loosened, because a scan that can never find its target is exactly the
+# vacuous-test shape #143 and #163 were about.
 
 
 def test_uvicorn_access_log_is_routed_to_stderr() -> None:
@@ -733,4 +694,103 @@ def test_compact_database_citation_of_privacy_md_resolves(project_root: Path) ->
         assert phrase in retention, (
             f"PRIVACY.md's retention section does not distinguish {phrase!r}; the "
             "row-versus-byte caveat is what #128 added"
+        )
+
+
+#: The release-path tools whose whole dependency closure is hash-locked (#159).
+HASH_LOCKED_TOOLS = ("build", "twine", "pip-audit")
+
+
+def test_release_tools_are_installed_from_hash_locked_closures(project_root: Path) -> None:
+    """Issue #159: #125 pinned each tool's version and left its dependency closure
+    to be resolved against PyPI at run time.
+
+    `build` pulls in `packaging` and `pyproject_hooks`; `twine` and `pip-audit`
+    pull in 27 more each. A compromised release of any of them executes inside the
+    job that produces the distributions `release.yml` publishes -- the same blast
+    radius as a compromised `build`, differing only in how many packages an
+    attacker must own.
+
+    Asserts the three properties that make the guarantee real: the lock exists,
+    both workflows install from it, and they do so with `--require-hashes`, which
+    refuses an artifact whose hash is not listed *and* refuses to run at all if any
+    dependency is unpinned. The last part is why the flag matters more than the
+    hashes: it is what makes the closure provably complete.
+
+    This is a *structural* check and deliberately not a cryptographic one. It does
+    not verify that any listed hash is the true digest of a real artifact -- that
+    needs the network, and it is exactly what `pip install --require-hashes` does
+    on every CI push. Confirmed that pip really enforces it: corrupting every hash
+    for one package in a copy of `build.txt` makes the install fail with "THESE
+    PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE". (Corrupting only
+    *one* of a package's two hashes does not, and that is correct -- pip matches
+    the artifact it downloaded against any listed hash, and a package normally
+    lists both its sdist and its wheel.)
+    """
+    requirements = project_root / ".github" / "requirements"
+    ci = (project_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    release = (project_root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    for tool in HASH_LOCKED_TOOLS:
+        lock = requirements / f"{tool}.txt"
+        assert lock.is_file(), f"{lock} is missing, so nothing pins {tool}'s closure"
+
+        body = lock.read_text(encoding="utf-8")
+        pinned = [line for line in body.splitlines() if line and not line.startswith((" ", "#"))]
+        assert pinned, f"{tool}.txt pins nothing"
+        for line in pinned:
+            assert "==" in line, f"{tool}.txt has an unpinned requirement: {line!r}"
+        assert body.count("--hash=sha256:") >= len(pinned), (
+            f"{tool}.txt has fewer hashes than requirements, so something is unhashed"
+        )
+
+        # `pip-audit` only runs in CI; `build` and `twine` run in both, and
+        # release.yml is the one that matters -- it only runs on a tag, so a
+        # mistake there is invisible until release day.
+        workflows = (
+            [("ci.yml", ci)] if tool == "pip-audit" else [("ci.yml", ci), ("release.yml", release)]
+        )
+        for name, text in workflows:
+            expected = f"--require-hashes -r .github/requirements/{tool}.txt"
+            assert expected in text, (
+                f"{name} does not install {tool} from its hash-locked closure "
+                f"(expected {expected!r})"
+            )
+
+
+def test_no_workflow_still_resolves_a_tool_at_run_time(project_root: Path) -> None:
+    """The other half of #159: the old mechanism must be gone, not merely joined.
+
+    `pipx run --spec X==V` pins the named tool and resolves its closure fresh on
+    every run. Leaving one behind would keep exactly the hole this issue closed,
+    while the test above still passed for the tools that had been converted.
+    """
+    for workflow in sorted((project_root / ".github" / "workflows").glob("*.yml")):
+        text = workflow.read_text(encoding="utf-8")
+        for number, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert "pipx run" not in stripped, (
+                f"{workflow.name}:{number} still resolves a tool's closure at run "
+                f"time: {stripped!r}"
+            )
+
+
+def test_lock_files_match_their_declared_input_version(project_root: Path) -> None:
+    """The `.in` file is the source of truth for the version; the `.txt` must agree.
+
+    Without this, editing `build.in` to a new version and forgetting to recompile
+    leaves the old closure installed while the repository appears to say otherwise
+    -- the same stale-claim failure mode as a docstring citing text that no longer
+    exists.
+    """
+    requirements = project_root / ".github" / "requirements"
+    for tool in HASH_LOCKED_TOOLS:
+        declared = (requirements / f"{tool}.in").read_text(encoding="utf-8").strip()
+        assert "==" in declared, f"{tool}.in does not pin a version: {declared!r}"
+        locked = (requirements / f"{tool}.txt").read_text(encoding="utf-8")
+        assert any(line.startswith(declared) for line in locked.splitlines()), (
+            f"{tool}.txt does not pin {declared!r}; regenerate it (see "
+            ".github/requirements/README.md)"
         )

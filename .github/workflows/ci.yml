@@ -77,16 +77,24 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      - run: pipx run --spec build==1.5.0 pyproject-build
-      - run: pipx run --spec twine==7.0.0 twine check dist/*
+      - name: pyproject-build (hash-locked closure, #159)
+        run: |
+          python -m venv /tmp/tool-build
+          /tmp/tool-build/bin/pip install --require-hashes -r .github/requirements/build.txt
+          /tmp/tool-build/bin/pyproject-build
+      - name: twine check dist/* (hash-locked closure, #159)
+        run: |
+          python -m venv /tmp/tool-twine
+          /tmp/tool-twine/bin/pip install --require-hashes -r .github/requirements/twine.txt
+          /tmp/tool-twine/bin/twine check dist/*
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
       # Prove the built wheel is actually installable and runnable standalone
       # -- a clean venv, no editable install, no project source on the path
-      # -- since `pipx run build`/`twine check` only prove the archive is
-      # well-formed, not that installing it produces a working console
+      # -- since the build and `twine check` steps above only prove the archive
+      # is well-formed, not that installing it produces a working console
       # script. Reversible, pre-release verification only; nothing here
       # publishes anything.
       - name: Wheel installs and the console script runs
@@ -103,7 +111,11 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      - run: pipx run --spec pip-audit==2.10.1 pip-audit .
+      - name: pip-audit . (hash-locked closure, #159)
+        run: |
+          python -m venv /tmp/tool-pip-audit
+          /tmp/tool-pip-audit/bin/pip install --require-hashes -r .github/requirements/pip-audit.txt
+          /tmp/tool-pip-audit/bin/pip-audit .
 
   security:
     name: Static security scan
