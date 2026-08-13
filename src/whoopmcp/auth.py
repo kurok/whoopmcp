@@ -600,11 +600,32 @@ class Authenticator:
         return url
 
     def verify_state(self, state: str) -> None:
-        """Reject a callback whose ``state`` does not match the pending login."""
+        """Reject a callback whose ``state`` does not match the pending login.
+
+        issue #120: OAuth's security BCP requires ``state`` to be single-use,
+        so a *successful* verification clears ``_pending_state`` -- a second
+        call with the same value then fails exactly as an unknown state does,
+        the same way it would after a fresh ``start_login()``. Consuming the
+        state here rather than in ``exchange_code`` means a failed exchange
+        (e.g. WHOOP rejects the code) does not leave the state usable for a
+        retry: the caller must run ``start_login`` again. That is intentional
+        (D3) -- the state has already done its one job of authenticating this
+        callback, and a fresh login is the correct BCP-compliant recovery, not
+        a bug.
+
+        A *mismatched* state does NOT clear ``_pending_state``. That is not an
+        oversight: the state is 32 bytes from `secrets.token_urlsafe`, so
+        there is nothing an attacker can brute-force by guessing, and a
+        genuine login is still in progress. If a wrong value cleared it too,
+        anyone who can reach the callback URL could kill someone else's
+        legitimate in-flight login by sending one bad ``state`` -- clearing
+        only on success avoids handing out that denial-of-service for free.
+        """
         if self._pending_state is None:
             raise AuthError("no login in progress; call start_login first")
         if not secrets.compare_digest(state, self._pending_state):
             raise AuthError("state mismatch; discarding this authorization code")
+        self._pending_state = None
 
     async def exchange_code(self, code: str) -> Token:
         """Trade an authorization code for a token, and persist it."""

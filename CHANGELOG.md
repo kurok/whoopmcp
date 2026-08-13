@@ -632,6 +632,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #120 (#37 audit): the OAuth `state` is now single-use.
+  `Authenticator.verify_state` used to leave `_pending_state` in place after
+  a successful check, so the same value verified indefinitely instead of
+  only for the one callback it was issued for, violating OAuth's security
+  BCP. A successful verification now clears the pending state, so a second
+  verification of the same value fails exactly like an unknown one; a
+  *mismatched* state still does not clear it, since doing so would let
+  anyone able to reach the callback kill a genuine in-progress login by
+  sending one bad value, and the state's 32 random bytes leave nothing to
+  brute-force in the meantime. State generation and the `compare_digest`
+  comparison are unchanged.
+
 - Issue #119 (#37 audit): `softprops/action-gh-release` in the release
   workflow's `contents: write` job is now pinned by commit SHA rather than the
   mutable `v3` tag. It was the one non-GitHub action still on a floating tag in

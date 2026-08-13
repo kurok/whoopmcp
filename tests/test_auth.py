@@ -89,6 +89,171 @@ def test_verify_state_rejects_when_no_login_is_pending(config: Config) -> None:
         Authenticator(config).verify_state("anything")
 
 
+# -- single-use state (issue #120) ------------------------------------------
+#
+# OAuth's security BCP requires state to be single-use: a successful
+# verification must consume it so a second verification of the same value
+# fails, while a failed verification must NOT consume it (D2).
+
+
+def test_verify_state_is_consumed_on_successful_verification(config: Config) -> None:
+    """Test 1 (headline): one start_login(), then verify_state(state) succeeds
+    and a second verify_state(state) raises AuthError.
+
+    This test MUST FAIL against current main -- the state is not cleared on
+    successful verification, so the second call would also succeed.
+    """
+    auth = Authenticator(config)
+    url = auth.start_login()
+    state = parse_qs(urlparse(url).query)["state"][0]
+
+    # First verification succeeds
+    auth.verify_state(state)
+
+    # Second verification must fail with the state now consumed
+    with pytest.raises(AuthError, match="no login in progress"):
+        auth.verify_state(state)
+
+
+def test_verify_state_mismatch_does_not_consume_pending_state(config: Config) -> None:
+    """Test 2: A mismatch does not consume the pending state (D2).
+
+    verify_state("wrong") raises, and a subsequent verify_state(correct)
+    still succeeds. This is important because clearing on mismatch would let
+    an attacker kill a legitimate in-progress login by sending one bad value.
+    """
+    auth = Authenticator(config)
+    url = auth.start_login()
+    state = parse_qs(urlparse(url).query)["state"][0]
+
+    # A mismatch raises but does NOT consume the state
+    with pytest.raises(AuthError, match="state mismatch"):
+        auth.verify_state("wrong-state")
+
+    # The correct state can still verify
+    auth.verify_state(state)
+
+
+def test_fresh_start_login_issues_new_state(config: Config) -> None:
+    """Test 3: A fresh start_login() issues a new state and the previous one
+    no longer verifies.
+    """
+    auth = Authenticator(config)
+
+    # First login
+    url1 = auth.start_login()
+    state1 = parse_qs(urlparse(url1).query)["state"][0]
+    auth.verify_state(state1)  # Consume the first state
+
+    # Second login with a new state
+    url2 = auth.start_login()
+    state2 = parse_qs(urlparse(url2).query)["state"][0]
+
+    # The states must be different
+    assert state1 != state2
+
+    # The old state no longer verifies. A new login is pending (state2), so
+    # per D2 the old value is indistinguishable from any other wrong guess:
+    # it raises "state mismatch", exactly like test 2's foreign value, and
+    # does not consume the new pending state. Raising "no login in progress"
+    # here would require remembering previously-consumed values, which would
+    # hand an attacker an oracle distinguishing "was once a real state" from
+    # "never issued".
+    with pytest.raises(AuthError, match="state mismatch"):
+        auth.verify_state(state1)
+
+    # The new state should verify
+    auth.verify_state(state2)
+
+
+@respx.mock
+async def test_both_real_flows_work_end_to_end(config: Config) -> None:
+    """Test 4: Both real flows (verify-then-exchange) work end to end.
+
+    Tests the __main__.py login path and server.py's whoop_complete_login,
+    each doing verify-then-exchange once. Mock HTTP with respx.
+    """
+    # Mock the token endpoint
+    respx.post(TOKEN_URL).mock(
+        return_value=respx.MockResponse(
+            200,
+            json={
+                "access_token": "new-access-token",
+                "expires_in": 3600,
+                "refresh_token": "new-refresh-token",
+                "scope": "read:sleep offline",
+            },
+        )
+    )
+
+    auth = Authenticator(config)
+
+    # Simulate __main__.py's _login flow: verify-then-exchange
+    url = auth.start_login()
+    state = parse_qs(urlparse(url).query)["state"][0]
+    auth.verify_state(state)
+    token = await auth.exchange_code("auth-code-123")
+    assert token.access_token == "new-access-token"
+
+    # Verify the token was persisted
+    assert FileTokenStore(config.token_path).load() == token
+
+    # Clear for the second flow test
+    auth.logout()
+    FileTokenStore(config.token_path).clear()
+
+    # Simulate server.py's whoop_complete_login flow: verify-then-exchange
+    url = auth.start_login()
+    state = parse_qs(urlparse(url).query)["state"][0]
+    auth.verify_state(state)
+    token = await auth.exchange_code("another-code-456")
+    assert token.access_token == "new-access-token"
+
+    # Verify the token was persisted
+    assert FileTokenStore(config.token_path).load() == token
+
+
+def test_state_does_not_appear_in_exception_messages_or_logs(
+    config: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test 6: No state value reaches any log record or exception message.
+
+    State is cryptographic material and must never appear in error messages
+    or logs, on either the verify or exchange path.
+    """
+    caplog.set_level(logging.DEBUG)
+
+    auth = Authenticator(config)
+    url = auth.start_login()
+    state = parse_qs(urlparse(url).query)["state"][0]
+
+    # Consume the state on verify path
+    auth.verify_state(state)
+
+    # Try to verify again -- the exception should not leak the state value
+    with pytest.raises(AuthError) as exc_info:
+        auth.verify_state(state)
+
+    error_message = str(exc_info.value)
+    assert state not in error_message, (
+        f"state value {state!r} leaked in exception message: {error_message}"
+    )
+
+    # Check logs do not contain state
+    # caplog.text is every captured record's message plus its formatted exc_info
+    assert state not in caplog.text, f"state value {state!r} leaked in log records"
+
+    # Also check each record individually
+    for record in caplog.records:
+        assert state not in record.getMessage(), (
+            f"state value {state!r} leaked in log message: {record.getMessage()}"
+        )
+        if record.exc_text:
+            assert state not in record.exc_text, (
+                f"state value {state!r} leaked in log exc_text: {record.exc_text}"
+            )
+
+
 # -- token -----------------------------------------------------------------
 
 
