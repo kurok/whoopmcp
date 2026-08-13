@@ -406,9 +406,14 @@ def test_third_party_actions_in_write_privileged_jobs_are_sha_pinned(
     Scoped deliberately to *non-GitHub* actions in *write-privileged* jobs,
     which is the audit's own framing: "the one non-GitHub floating-tag action
     in the highest-privilege job". GitHub-owned actions (`actions/*`,
-    `github/*`) still on tags are a separate, lower-severity concern (issue
-    #124) and are not asserted here, so this test cannot quietly drift into
-    being that one.
+    `github/*`) are exempted here so this test keeps asserting exactly what it
+    says it does, and cannot quietly drift into being a broader one.
+
+    Since #124 that broader property -- *every* action in *every* workflow is
+    SHA-pinned -- holds, and is asserted by
+    `test_every_action_is_sha_pinned_with_its_version_recorded`. The exemption
+    below is therefore no longer load-bearing: nothing it skips is unpinned.
+    It stays because the narrow claim is worth keeping separately provable.
 
     Scanned as text rather than parsed: PyYAML is not a declared dependency of
     this project, and every other workflow assertion in this file works on the
@@ -452,4 +457,71 @@ def test_third_party_actions_in_write_privileged_jobs_are_sha_pinned(
     assert violations == [], (
         "non-GitHub actions in write-privileged jobs must be pinned by commit SHA, "
         f"not a mutable tag: {violations}"
+    )
+
+
+def test_every_action_is_sha_pinned_with_its_version_recorded(
+    project_root: Path,
+) -> None:
+    """Issue #124: every action in every workflow must be pinned by commit SHA,
+    with the human-readable version in a trailing comment.
+
+    #119 pinned the one third-party action in the release job; the GitHub-owned
+    ones stayed on moving major tags (`actions/checkout@v7`,
+    `github/codeql-action/init@v4`, ...) against this repo's own stated pattern.
+    GitHub-owned is lower risk than a random third party, not no risk: a moving
+    tag is still a mutable pointer, and `actions/download-artifact` sits between
+    the build and the PyPI publish, where a swapped artifact is a released
+    artifact.
+
+    The trailing `# vX.Y.Z` is asserted, not just the SHA. A bare 40-hex pin is
+    unreviewable and unupgradeable -- nobody can tell what it is or whether it
+    is current -- which is the practical objection to SHA pinning, and the
+    reason dependabot needs the comment to bump it. Recording the version is
+    what makes the pin maintainable rather than merely correct.
+
+    Scanned as text rather than parsed: PyYAML is not a declared dependency of
+    this project, and every other workflow assertion in this file does the same.
+    Local actions (`uses: ./...`) are exempt and everything else is not -- see
+    the comment on that branch for why, including why `docker://` refs are
+    deliberately still flagged.
+    """
+    uses_re = re.compile(r"^\s*-?\s*uses:\s*(?P<uses>\S+)(?P<rest>.*)$")
+    pinned_re = re.compile(r"^[^@]+@(?P<sha>[0-9a-f]{40})$")
+    version_comment_re = re.compile(r"^\s*#\s*v\d+\.\d+")
+
+    workflows = sorted((project_root / ".github" / "workflows").glob("*.yml"))
+    assert workflows, "no workflow files found -- this test would pass vacuously"
+
+    unpinned: list[str] = []
+    undocumented: list[str] = []
+    total = 0
+    for path in workflows:
+        for number, line in enumerate(path.read_text().splitlines(), start=1):
+            found = uses_re.match(line)
+            if not found:
+                continue
+            uses, rest = found.group("uses"), found.group("rest")
+            uses = uses.strip("\"'")  # `uses: "owner/repo@sha"` is valid YAML
+            # A local action lives in this repository and is already at whatever
+            # commit the workflow runs from, so there is no third party to pin
+            # and nothing to bump. Exempted so adding one does not fail this test
+            # with a message demanding an impossible pin. `docker://` refs are
+            # deliberately NOT exempted: a mutable image tag is the same exposure
+            # this test exists to catch, and should carry a digest.
+            if uses.startswith("./"):
+                continue
+            total += 1
+            if not pinned_re.match(uses):
+                unpinned.append(f"{path.name}:{number} -> {uses}")
+            elif not version_comment_re.match(rest):
+                undocumented.append(f"{path.name}:{number} -> {uses}{rest}")
+
+    assert total >= 20, f"only found {total} action references -- the scan is not working"
+    assert unpinned == [], (
+        f"every action must be pinned to a 40-character commit SHA, not a tag: {unpinned}"
+    )
+    assert undocumented == [], (
+        "every SHA pin needs a trailing '# vX.Y.Z' naming the version it pins, "
+        f"so it can be reviewed and upgraded: {undocumented}"
     )

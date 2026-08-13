@@ -587,6 +587,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Issue #124 (#37 audit, P3): every GitHub-owned action is now pinned by commit
+  SHA with its version in a trailing comment, matching the pattern the repo
+  already used for third-party actions and stated as the right one. 19 `uses:`
+  lines across `ci.yml`, `codeql.yml` and `release.yml` were on moving major
+  tags -- `actions/checkout@v7`, `actions/setup-python@v7`,
+  `actions/upload-artifact@v7`, `actions/download-artifact@v8`,
+  `github/codeql-action/{init,analyze}@v4`. GitHub-owned is lower risk than a
+  random third party, not no risk: a major tag is a mutable pointer, and
+  `actions/download-artifact` sits between the build job and the PyPI publish,
+  where a swapped artifact is a released artifact. Each SHA was resolved from
+  the tag and then confirmed to exist in the action's own repository, and the
+  precise release it corresponds to (`v7.0.1`, `v7.0.0`, `v7.0.1`, `v8.0.1`,
+  `v4.37.6`) is recorded inline. A new test asserts both halves -- the 40-hex
+  pin *and* the version comment -- since a bare SHA is unreviewable and
+  unupgradeable, which is the practical objection to pinning and the reason
+  dependabot needs the comment to bump it. `dependabot.yml` already tracks the
+  `github-actions` ecosystem weekly, so the pins get bumped rather than rot.
+
 - Issue #54: `metric_trend`'s `rolling_7d`/`rolling_30d`/`rolling_90d` are now
   downsampled -- decimated, never averaged -- to whichever of `daily`
   (step 1 calendar day), `weekly` (7), or `monthly` (30) resolution keeps
