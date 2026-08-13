@@ -671,6 +671,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #126 (#37 audit, P3, reachable in hosted mode): PRIVACY.md's storage table
+  said logs go to "stderr only", which was false under
+  `--transport streamable-http`. The SDK's `run_streamable_http_async` builds
+  `uvicorn.Config` with only host, port and log level -- no `log_config` -- and
+  uvicorn's default points the `uvicorn.access` handler at `ext://sys.stdout`. So
+  every request line landed on stdout, client IP included, and for
+  `/webhooks/whoop` and `/metrics` that is the IP of someone whose health data
+  this server holds.
+
+  Rather than only documenting the exception, the behaviour now matches the
+  contract: the streamable-http branch redirects uvicorn's access handler to
+  stderr before the server starts. There is no parameter for this --
+  `MCPServer.run` forwards `**kwargs` to a fixed keyword-only signature that
+  accepts no `log_config` -- so the lever is uvicorn's module-level
+  `LOGGING_CONFIG`, which `uvicorn.Config.__init__` captures *by reference* as a
+  default argument, making an in-place mutation visible to the `dictConfig` call
+  uvicorn makes at startup. Verified against the installed uvicorn by identity
+  check, not assumed.
+
+  PRIVACY.md's row now also names the carve-out: if you run the ASGI app under
+  your own uvicorn or gunicorn rather than `whoopmcp --transport streamable-http`,
+  the redirect does not apply and the access log is yours to configure.
+
+  Three tests. One asserts the end state -- every *effective* handler for
+  `uvicorn.access` and `uvicorn.error` lands on stderr, walking propagation the
+  way `logging` does, since uvicorn gives `access` its own handler but lets
+  `error` propagate. One pins that the redirect is actually *called*, and before
+  the server starts, because a helper nobody invokes is the same as no fix. The
+  third watches the SDK: the redirect only works while the SDK leaves
+  `log_config` to uvicorn's default, so that test reads the SDK's source and
+  fails if it ever starts passing its own. Each was checked against a mutation
+  that should break it -- blanking the helper, deleting the call site, and a
+  simulated future SDK that supplies a `log_config`.
+
+  That third test exists because an earlier draft of this change claimed the
+  end-state test already covered the SDK case. It does not: a test that builds
+  its *own* `uvicorn.Config` cannot observe what the SDK passes. Simulated it,
+  and the end-state test passed while access logs really did go to stdout.
+
+  The stdio path is untouched and deliberately so: it never starts uvicorn, and
+  its stdout *is* the JSON-RPC channel, where a stray log line would corrupt the
+  protocol.
+
 - Issue #163 (found reviewing #121): three tests named for the RFC 8707 audience
   check did not detect its removal. Their tokens carried no `claims`, so
   `_issued_by_trusted_as` rejected them first -- `claims=None` is not a dict --

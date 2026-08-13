@@ -21,6 +21,49 @@ if TYPE_CHECKING:
     from whoopmcp.reconciliation import ReconciliationResult
 
 
+def _route_uvicorn_access_log_to_stderr() -> None:
+    """Send uvicorn's access log to stderr before the HTTP transport starts.
+
+    PRIVACY.md states that this software's logs go to stderr and are never
+    written to a file by it. That was false in hosted mode (#126). The SDK's
+    ``run_streamable_http_async`` builds ``uvicorn.Config`` with only host, port
+    and log level -- no ``log_config`` -- and uvicorn's default config points the
+    ``uvicorn.access`` handler at ``ext://sys.stdout``. So every request line,
+    client IP included, landed on stdout: for ``/webhooks/whoop`` and ``/metrics``
+    that is the IP of someone whose health data this server holds. The trap is an
+    operator redirecting stdout to a world-readable file *because the docs say
+    nothing is logged there*.
+
+    There is no parameter to pass. ``MCPServer.run`` forwards ``**kwargs`` to
+    ``run_streamable_http_async``, whose signature is keyword-only and fixed, so
+    a ``log_config`` cannot be threaded through. What is reachable is uvicorn's
+    module-level ``LOGGING_CONFIG``: ``uvicorn.Config.__init__`` captures that
+    dict *by reference* as its default argument, so mutating it in place here --
+    before the server is constructed -- is seen by the ``dictConfig`` call uvicorn
+    makes from inside that same ``__init__``. Verified against the installed
+    uvicorn by identity check.
+
+    **This depends on the SDK not supplying its own ``log_config``.** If it ever
+    does, ``LOGGING_CONFIG`` stops being consulted and this redirect silently
+    does nothing. ``test_sdk_still_leaves_uvicorns_log_config_to_its_default``
+    pins exactly that, by reading the SDK's own source: it is the SDK's behaviour
+    that has to be watched, and a test that builds its *own* ``uvicorn.Config``
+    cannot see a change there -- which is what an earlier version of this
+    docstring wrongly claimed was covered.
+
+    The import is function-local for locality only, not to defer anything:
+    ``mcp`` declares ``uvicorn>=0.31.1`` as a hard dependency, and importing
+    ``whoopmcp.server`` -- which ``main`` does unconditionally, before the
+    transport branch -- already pulls uvicorn into ``sys.modules`` on both
+    transports via ``sse_starlette``. Measured; an earlier version of this
+    docstring claimed the local import avoided an HTTP-only import, and that
+    benefit does not exist here.
+    """
+    from uvicorn.config import LOGGING_CONFIG
+
+    LOGGING_CONFIG["handlers"]["access"]["stream"] = "ext://sys.stderr"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="whoopmcp",
@@ -291,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if transport == "streamable-http":
+            _route_uvicorn_access_log_to_stderr()
             build_server().run(transport="streamable-http", host=host, port=port)
         else:
             build_server().run(transport="stdio")
