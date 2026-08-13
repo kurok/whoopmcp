@@ -166,13 +166,31 @@ def atomic_write_text(path: Path, contents: str) -> None:
     ``os.replace`` then swaps the temp file onto ``path`` as an atomic,
     non-dereferencing rename: if ``path`` itself is already a symlink, the
     symlink is what gets replaced, not the file it points to.
+
+    The data is ``fsync``ed before the rename, and the parent directory
+    after it (issue #136). Without the first, the rename can reach disk
+    before the bytes do, so a power loss leaves an empty or partial file
+    exactly where a good token used to be -- rename-after-write is atomic
+    against a *process* crash on its own, but not against the machine
+    losing power. Without the second, the rename itself may not be durable.
+    The directory sync is POSIX-only: Windows cannot open a directory for
+    ``fsync``, and its rename durability is the filesystem's business
+    rather than something this function can request.
     """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
             tmp_file.write(contents)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
         os.replace(tmp_name, path)
+        if os.name != "nt":
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)

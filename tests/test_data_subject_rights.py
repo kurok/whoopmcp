@@ -1532,6 +1532,14 @@ def test_export_member_never_opens_a_world_readable_window(
         def __init__(self, real: io.TextIOWrapper) -> None:
             self._real = real
 
+        def __getattr__(self, name: str) -> object:
+            # Delegate everything this spy does not itself intercept. It exists
+            # to observe the write, not to constrain what else the code under
+            # test may legitimately call on its own file object -- #136 added
+            # flush()/fileno() for fsync, and a proxy that forbids them would
+            # be testing the proxy rather than the behaviour.
+            return getattr(self._real, name)
+
         def __enter__(self) -> _SpyOnWrite:
             return self
 
