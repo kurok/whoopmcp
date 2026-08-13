@@ -671,6 +671,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #138 (#37 audit, P3, latent): `crypto._associated_data` built the AEAD
+  associated data as `f"whoopmcp.seal.v{version}".encode() + extra`, with nothing
+  between the two, so `(version=1, extra=b"2whoopmcp.token")` and
+  `(version=12, extra=b"whoopmcp.token")` produced identical bytes. Unexploitable
+  today -- one caller, one fixed `extra` -- but the module advertises itself as a
+  generic primitive, and a second caller whose `extra` began with a digit would
+  have silently voided the key-version binding the AD exists to provide. A `|`
+  now follows the version, which is sufficient rather than merely better: a key
+  version is an integer, so it can never contain `|`, and the first one therefore
+  always terminates it whatever the caller passes.
+
+  The AD layout is **recorded per envelope** (`"adv"`) rather than simply
+  changed, because changing it changes the AEAD tag: every already-sealed record
+  would stop authenticating, which for the `encrypted-file` backend means an
+  operator's stored token becomes undecryptable and they have to log in again.
+  That is too high a price for a hardening fix with no reachable exploit. An
+  envelope without `adv` is pre-#138 by definition and is read with the legacy
+  layout, so existing records keep working; new seals always stamp the current
+  format.
+
+  A tampered marker needs no separate binding into the tag and gets none: the two
+  layouts produce different bytes, so flipping it makes `unseal` compute an AD
+  the tag was never made with. Verified in both directions -- downgrading a new
+  envelope to the ambiguous layout, and relabelling a legacy one -- plus unknown
+  values, which raise `SealError` rather than silently selecting a layout.
+
+  Legacy envelopes are deliberately not migrated, and that is safe rather than
+  merely convenient: the version binding still holds for them, so one caller's
+  record does not authenticate under another caller's `extra`. The residual
+  ambiguity is confined to inputs that would have to collide within a single
+  caller's own fixed `extra`, and any second caller writes the new format.
+
 - Issue #139 (#37 audit, P3, latent): a webhook payload's `id` was copied into
   `WebhookEvent.resource_id` with no shape check and interpolated straight into
   an outbound request path -- `client.get_sleep` builds
