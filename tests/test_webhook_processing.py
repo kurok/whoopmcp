@@ -145,6 +145,22 @@ def create_webhook_event_payload(
     }
 
 
+def resource_uuid(label: str) -> str:
+    """A deterministic UUID for a readable `label`.
+
+    #139: `_parse_event` now requires a webhook payload's `id` to be a real
+    hyphenated UUID, because it is interpolated into an outbound request path.
+    These tests used readable ids like resource_uuid("sleep-uuid-001"), which are not UUIDs, so
+    they would exercise the new rejection path instead of whatever each test is
+    actually about -- the same trap the #102 note in test_mcpauth.py describes.
+
+    `uuid5` keeps the label visible in the source, and being deterministic means
+    the same label yields the same UUID for the payload, the respx route, and the
+    stored row, which is what keeps each test self-consistent.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, label))
+
+
 def encode_webhook_body(payload: dict[str, Any]) -> bytes:
     """Encode a webhook event payload to bytes."""
     return json.dumps(payload).encode("utf-8")
@@ -187,7 +203,7 @@ class TestWebhookProcessingIdempotency:
         (same trace_id) is recognised as already-processed and skipped
         before any fetch, rather than re-fetching and re-upserting.
         """
-        sleep_id = "sleep-uuid-001"
+        sleep_id = resource_uuid("sleep-uuid-001")
         user_id = 123
 
         insert_principal(db, user_id)
@@ -246,7 +262,7 @@ class TestRecoverySleepUUIDResolution:
         cycle_id directly.
         """
         user_id = 123
-        sleep_id = "sleep-uuid-abc"
+        sleep_id = resource_uuid("sleep-uuid-abc")
         cycle_id = 999
 
         # Insert principal
@@ -321,7 +337,7 @@ class TestRecoverySleepUUIDResolution:
         fetch should occur.
         """
         user_id = 123
-        sleep_id = "sleep-uuid-xyz"
+        sleep_id = resource_uuid("sleep-uuid-xyz")
         cycle_id = 999
 
         insert_principal(db, user_id)
@@ -393,7 +409,7 @@ class TestRecoverySleepUUIDResolution:
         ask for one.
         """
         user_id = 123
-        sleep_id = "sleep-uuid-never-seen"
+        sleep_id = resource_uuid("sleep-uuid-never-seen")
 
         insert_principal(db, user_id)
         # Deliberately no upsert_sleep call -- this is the "no locally-stored
@@ -428,7 +444,7 @@ class TestSleepAndWorkoutResolution:
     ) -> None:
         """Sleep.updated event fetches sleep by its UUID (the id field)."""
         user_id = 123
-        sleep_id = "sleep-uuid-001"
+        sleep_id = resource_uuid("sleep-uuid-001")
 
         insert_principal(db, user_id)
 
@@ -469,7 +485,7 @@ class TestSleepAndWorkoutResolution:
     ) -> None:
         """Workout.updated event fetches workout by its UUID (the id field)."""
         user_id = 456
-        workout_id = "workout-uuid-001"
+        workout_id = resource_uuid("workout-uuid-001")
 
         insert_principal(db, user_id)
 
@@ -512,7 +528,7 @@ class TestDeletedEvents:
     ) -> None:
         """Sleep.deleted event sets deleted_at and issues no fetch."""
         user_id = 123
-        sleep_id = "sleep-uuid-deleted"
+        sleep_id = resource_uuid("sleep-uuid-deleted")
 
         insert_principal(db, user_id)
 
@@ -549,7 +565,7 @@ class TestDeletedEvents:
     ) -> None:
         """Workout.deleted event sets deleted_at and issues no fetch."""
         user_id = 456
-        workout_id = "workout-uuid-deleted"
+        workout_id = resource_uuid("workout-uuid-deleted")
 
         insert_principal(db, user_id)
 
@@ -613,7 +629,7 @@ class TestUnknownUserHandling:
         call the real API from a test" rule instead of catching it.
         """
         unknown_user_id = 999999
-        sleep_id = "sleep-uuid-unknown"
+        sleep_id = resource_uuid("sleep-uuid-unknown")
 
         # Deliberately don't link a principal for this user_id -- no
         # principal_members row, which is the gate _apply_event now checks.
@@ -664,7 +680,7 @@ class TestMembershipGate:
         that user -- `upsert_profile` has zero callers in `src/`, so a gate
         keyed on `profiles` would drop every event forever."""
         user_id = 123
-        sleep_id = "sleep-uuid-linked-no-profile"
+        sleep_id = resource_uuid("sleep-uuid-linked-no-profile")
 
         insert_principal(db, user_id)  # principal_members only -- no profiles row
 
@@ -709,7 +725,7 @@ class TestMembershipGate:
         event for unknown user_id" -- that log line is reserved for a
         genuinely unlinked whoop_user_id."""
         user_id = 456
-        sleep_id = "sleep-uuid-no-drop-log"
+        sleep_id = resource_uuid("sleep-uuid-no-drop-log")
 
         insert_principal(db, user_id)
 
@@ -740,7 +756,7 @@ class TestMembershipGate:
         reaches `_apply_event` again, and (once the member has since linked)
         actually applies."""
         user_id = 789
-        sleep_id = "sleep-uuid-redelivery"
+        sleep_id = resource_uuid("sleep-uuid-redelivery")
 
         # Build the payload/body once, and redeliver the exact same bytes --
         # a real WHOOP retry of its own webhook is byte-identical, and this
@@ -797,7 +813,7 @@ class TestOutOfOrderEventHandling:
         incoming >= stored.
         """
         user_id = 123
-        sleep_id = "sleep-uuid-ooo"
+        sleep_id = resource_uuid("sleep-uuid-ooo")
 
         insert_principal(db, user_id)
 
@@ -863,7 +879,7 @@ class TestOutOfOrderEventHandling:
         delivery clobbering a newer record, and here it dropped the newer one.
         """
         user_id = 456
-        sleep_id = "sleep-uuid-precision"
+        sleep_id = resource_uuid("sleep-uuid-precision")
         insert_principal(db, user_id)
 
         from whoopmcp.store import get_sleeps, upsert_sleep
@@ -1100,7 +1116,7 @@ class TestRetryAndDeadLetterLogic:
         unrelated case.
         """
         user_id = 123
-        sleep_id = "sleep-uuid-fail"
+        sleep_id = resource_uuid("sleep-uuid-fail")
 
         insert_principal(db, user_id)
 
@@ -1114,7 +1130,7 @@ class TestRetryAndDeadLetterLogic:
         event_bytes_1 = encode_webhook_body(event_payload_1)
 
         # Event 2: Another event that should succeed (proves queue isn't blocked)
-        sleep_id_2 = "sleep-uuid-ok"
+        sleep_id_2 = resource_uuid("sleep-uuid-ok")
         sleep_record_2 = {
             "id": sleep_id_2,
             "start": "2026-08-10T20:00:00Z",
@@ -1172,7 +1188,7 @@ class TestRateLimiterIntegration:
         the route would still be hit despite the rejecting limiter.
         """
         user_id = 123
-        sleep_id = "sleep-uuid-rl"
+        sleep_id = resource_uuid("sleep-uuid-rl")
 
         insert_principal(db, user_id)
 
@@ -1295,7 +1311,7 @@ class TestWebhookReplay:
         already-'success' event must reach exactly the same store state as
         the original delivery produced -- no second fetch, no changed row.
         """
-        sleep_id = "sleep-replay-1"
+        sleep_id = resource_uuid("sleep-replay-1")
         user_id = 123
         insert_principal(db, user_id)
 
@@ -1340,7 +1356,7 @@ class TestWebhookReplay:
         already-'success'/'dead_letter' row does. This is replay's real
         operational value: development iteration on a code change, and
         recovering an event that never got a chance to complete."""
-        sleep_id = "sleep-replay-2"
+        sleep_id = resource_uuid("sleep-replay-2")
         user_id = 123
         insert_principal(db, user_id)
 
@@ -1422,7 +1438,7 @@ class TestLastDeliveryTracking:
 
         assert get_last_webhook_delivery(db, user_id) is None
 
-        sleep_id_1 = "sleep-delivery-1"
+        sleep_id_1 = resource_uuid("sleep-delivery-1")
         respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id_1}").mock(
             return_value=httpx.Response(
                 200,
@@ -1451,7 +1467,7 @@ class TestLastDeliveryTracking:
         later = "2099-01-01T00:00:00+00:00"
         monkeypatch.setattr(store_module, "_now", lambda: later)
 
-        sleep_id_2 = "sleep-delivery-2"
+        sleep_id_2 = resource_uuid("sleep-delivery-2")
         respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id_2}").mock(
             return_value=httpx.Response(
                 200,
@@ -1483,9 +1499,147 @@ class TestLastDeliveryTracking:
         # Deliberately never insert_principal(db, unknown_user_id).
 
         event_payload = create_webhook_event_payload(
-            "sleep.updated", "sleep-unknown-member", unknown_user_id
+            "sleep.updated", resource_uuid("sleep-unknown-member"), unknown_user_id
         )
         await process_webhook_event(db, client, encode_webhook_body(event_payload))
 
         assert get_last_webhook_delivery(db, unknown_user_id) is None
         assert len(respx.calls) == 0, "an unlinked member's event must never even reach a fetch"
+
+
+# -- #139: a payload id is interpolated into an outbound request path, so its
+# shape is validated at parse time -------------------------------------------
+
+
+class TestResourceIdShapeIsValidated:
+    """`resource_id` reaches `client.get_sleep`, which builds
+    `f"/v2/activity/sleep/{sleep_id}"`. An id of `../../v2/user/profile/basic`
+    therefore traverses to a different WHOOP endpoint, fetched with the member's
+    own bearer token.
+
+    Latent, not reachable by an outsider: a body only gets here after
+    `verify_webhook_request`'s HMAC gate, so forging one needs the client secret.
+    The second route in is `replay_webhook_event` re-parsing a stored body, which
+    is covered too because validation happens in `_parse_event`.
+    """
+
+    @respx.mock
+    async def test_traversal_id_is_rejected_before_any_fetch_or_row(
+        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """The issue's exact payload. Rejected, no request issued, no row stored.
+
+        The no-row assertion is the one worth having: the validation is placed
+        before `insert_webhook_event`, so a hostile id leaves nothing behind for
+        `replay_webhook_event` to pick up later.
+        """
+        from whoopmcp.store import get_webhook_event
+
+        user_id = 123
+        insert_principal(db, user_id)
+        traversal = "../../v2/user/profile/basic"
+
+        # A catch-all, and the assertion is that NOTHING is requested. Matching a
+        # specific expected URL is what an earlier version of this test did, and
+        # it guessed the normalised path wrong -- `BASE_URL` ends in `/developer`,
+        # so the traversal resolves to `/developer/v2/v2/user/profile/basic`, not
+        # `/developer/v2/user/profile/basic`. The test passed against unfixed code
+        # because its route simply never matched. Asserting zero requests cannot
+        # go wrong that way, and it is the property that actually matters.
+        everything = respx.route().mock(return_value=httpx.Response(200, json={}))
+
+        payload = create_webhook_event_payload("sleep.updated", traversal, user_id)
+        await process_webhook_event(db, client, encode_webhook_body(payload))
+
+        assert not everything.called, (
+            "a request was issued for a non-UUID id: "
+            f"{[str(call.request.url) for call in everything.calls]}"
+        )
+        assert get_webhook_event(db, payload["trace_id"]) is None, (
+            "a rejected event left a webhook_events row behind"
+        )
+
+    @respx.mock
+    async def test_a_real_uuid_is_still_processed(
+        self, config: Config, auth: Authenticator, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """The positive companion: without it, `_RESOURCE_ID` could reject
+        everything and every test in this class would still pass."""
+        from whoopmcp.store import get_webhook_event
+
+        user_id = 123
+        insert_principal(db, user_id)
+        sleep_id = resource_uuid("sleep-139-valid")
+
+        route = respx.get(f"{BASE_URL}/v2/activity/sleep/{sleep_id}").mock(
+            return_value=httpx.Response(
+                200, json={"id": sleep_id, "start": "2026-08-10T08:00:00Z", "cycle_id": 9}
+            )
+        )
+        payload = create_webhook_event_payload("sleep.updated", sleep_id, user_id)
+        await process_webhook_event(db, client, encode_webhook_body(payload))
+
+        assert route.called
+        row = get_webhook_event(db, payload["trace_id"])
+        assert row is not None and row["status"] == "success"
+
+    @respx.mock
+    async def test_replay_of_a_stored_hostile_body_issues_no_fetch(
+        self, db: sqlite3.Connection, client: WhoopClient
+    ) -> None:
+        """The second injection route the issue names.
+
+        `replay_webhook_event` re-parses a stored `event_body`, so a body
+        persisted before this validation existed must not be trusted just because
+        it is already in the database. The row is inserted directly here, which is
+        exactly that pre-existing-data case.
+
+        It does not raise: `process_webhook_event` catches
+        `UnresolvableEventError` and drops the event with a warning, which is the
+        established behaviour for any unparseable body. So this asserts the thing
+        that matters -- no outbound request is built from the hostile id -- rather
+        than an exception type that would be the wrong contract to pin.
+        """
+        from whoopmcp.store import insert_webhook_event
+
+        user_id = 123
+        insert_principal(db, user_id)
+        payload = create_webhook_event_payload("sleep.updated", "../../v2/user/profile/basic", 123)
+        raw = encode_webhook_body(payload)
+        insert_webhook_event(
+            db,
+            payload["trace_id"],
+            whoop_user_id=user_id,
+            event_type="sleep.updated",
+            event_body=raw.decode("utf-8"),
+        )
+
+        everything = respx.route().mock(return_value=httpx.Response(200, json={}))
+
+        await replay_webhook_event(db, client, payload["trace_id"])
+
+        # Against unfixed code this fires: the replay issues five requests to
+        # https://api.prod.whoop.com/developer/v2/v2/user/profile/basic -- the
+        # retry loop, each one a real traversal out of the sleep endpoint.
+        assert not everything.called, (
+            "replay issued a request built from a non-UUID id: "
+            f"{[str(call.request.url) for call in everything.calls]}"
+        )
+
+    def test_only_hyphenated_uuids_are_accepted(self) -> None:
+        """The shape rule itself, including forms that are not path-dangerous but
+        are still not ids -- the check is "is this a UUID", not "does this look
+        risky", so it does not have to enumerate attacks to stay correct."""
+        assert webhook_processor._RESOURCE_ID.match("550e8400-e29b-41d4-a716-446655440000")
+        assert webhook_processor._RESOURCE_ID.match("550E8400-E29B-41D4-A716-446655440000")
+        for bad in (
+            "../../v2/user/profile/basic",
+            "a/b",
+            "550e8400e29b41d4a716446655440000",  # unhyphenated: real UUID, wrong shape
+            "{550e8400-e29b-41d4-a716-446655440000}",  # braced form
+            "urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+            "550e8400-e29b-41d4-a716-446655440000 ",  # trailing space
+            "sleep-uuid-001",
+            "",
+        ):
+            assert not webhook_processor._RESOURCE_ID.match(bad), f"accepted {bad!r}"

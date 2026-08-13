@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import sqlite3
 import time
 from collections.abc import Callable
@@ -59,6 +60,28 @@ logger = logging.getLogger("whoopmcp")
 #: issuing SQL against one (#67): every entity read/write it needs goes
 #: through a store.py accessor instead.
 _WEBHOOK_RESOURCES: frozenset[str] = frozenset({"recovery", "sleep", "workout"})
+
+#: The shape a webhook payload's ``id`` must have before this module will use it.
+#:
+#: Every resource in ``_WEBHOOK_RESOURCES`` is keyed by a standard hyphenated
+#: UUID -- including ``recovery``, whose events carry the *sleep* UUID (see the
+#: module docstring's V2 trap). No webhook resource here is keyed by an integer:
+#: ``cycle`` is the one that would be, and it is deliberately not in that set.
+#: The integer ``cycle_id`` that ``_apply_event`` does use comes from the store
+#: or from WHOOP's own response body, never from the payload.
+#:
+#: Enforced because ``resource_id`` is interpolated into an outbound request
+#: path -- ``client.get_sleep`` builds ``f"/v2/activity/sleep/{sleep_id}"`` --
+#: so a payload ``id`` of ``../../v2/user/profile/basic`` would traverse to a
+#: different WHOOP endpoint, fetched with the member's own bearer token (#139).
+#:
+#: This is a second layer, not the primary control. The primary one is the HMAC
+#: gate in ``webhooks.py``: a body only reaches here after
+#: ``verify_webhook_request`` passes, so forging one needs the client secret. The
+#: other way in is ``replay_webhook_event`` re-parsing an already-stored body,
+#: which this also covers, because validation happens at parse time and every
+#: path -- live delivery and replay alike -- goes through ``_parse_event``.
+_RESOURCE_ID = re.compile(r"\A[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\Z")
 
 #: How many times `process_webhook_event` retries a transient failure before
 #: giving up and dead-lettering the event. Matches client.py's own
@@ -177,6 +200,15 @@ def _parse_event(raw_body: bytes) -> WebhookEvent:
         raise UnresolvableEventError(
             f"webhook body missing/malformed user_id or id: {exc}"
         ) from exc
+
+    # Rejected here rather than at the fetch, so a hostile id never reaches the
+    # store either: this raise happens before `insert_webhook_event`, so the
+    # event is dropped without leaving a row behind (#139).
+    if not _RESOURCE_ID.match(resource_id):
+        raise UnresolvableEventError(
+            f"webhook body's id is not a UUID, so it cannot be a {resource} id "
+            f"and will not be interpolated into a request path: {resource_id!r}"
+        )
 
     return WebhookEvent(
         trace_id=trace_id,
