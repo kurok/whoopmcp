@@ -671,6 +671,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #155 (found reviewing #154, P3, latent): `_execute_scoped` documents
+  that it calls `conn.rollback()` before raising, because a non-`SELECT`
+  statement has already run by the time a tenancy violation can be detected.
+  That rollback is a **no-op** for a statement whose leading token is outside
+  `INSERT`/`UPDATE`/`DELETE`/`REPLACE`: Python's `sqlite3` auto-opens a
+  transaction only for those, so anything else runs in autocommit. Measured on
+  main: `WITH x AS (SELECT 1) DELETE FROM recoveries WHERE whoop_user_id != ?
+  AND (SELECT 1 FROM x)` is correctly *rejected* by the member-predicate check
+  and the other member's rows stay deleted anyway -- the guard detecting a
+  cross-member delete and failing to reverse it.
+
+  Fixed by enforcing the precondition the rollback depends on, in
+  `_execute_with_tenancy_authorizer` *before* anything executes, so both entry
+  points inherit it by construction rather than by convention. Chosen over
+  flipping `isolation_level` globally or opening a transaction inside
+  `_execute_scoped`: both change transaction semantics for every write in the
+  module -- including #104's erasure batch and `enforce_retention`'s -- to close
+  a hole no caller can currently reach. Every mutating statement here is static
+  in-repo SQL, so after this check the documented guarantee is true across the
+  whole reachable set, and the guard is what keeps it true.
+
+  Review of the fix turned up a **second vector #155 never mentioned**: sqlite's
+  tokeniser skips a UTF-8 BOM but the driver's DML detection does not, so
+  `\ufeffDELETE FROM ...` also executes in autocommit and survives a rollback.
+  The guard already refused it, because the leading-keyword scan stops at the
+  first non-alphabetic byte -- now deliberate and pinned by a test, since
+  "helpfully" skipping a BOM would reopen it.
+
+  The guard over-rejects, deliberately: a read-only `WITH ... SELECT` mutates
+  nothing yet is refused, as are `EXPLAIN` and a bare `VALUES`. Telling a
+  read-only CTE from a writing one needs the SQL parser this module has declined
+  four times, and sqlite's own `sqlite3_stmt_readonly` is not exposed by
+  Python's driver. No caller writes those shapes; the cost is documented and
+  pinned rather than left to be rediscovered.
+
 - Issue #140 (#37 audit, P3, latent): `_upsert_if_not_older` compared the
   incoming and stored `updated_at` as *strings*. Lexicographic order equals
   chronological order only while every value is uniform RFC3339 UTC at identical
