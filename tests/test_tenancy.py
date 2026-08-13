@@ -2584,6 +2584,166 @@ def test_member_equality_depth_is_checked_not_merely_position() -> None:
         )
 
 
+# -- #131: the sanitiser must strip bracket- and backtick-quoted identifiers,
+# because sqlite tokenises them as one opaque unit. Leaving them live let a
+# stray `)` inside an identifier desynchronise #129's depth counter, so a
+# nested fragment read as depth zero. ------------------------------------------
+
+
+def test_bracket_identifier_cannot_desynchronise_the_depth_counter(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#131's weaponised shape: `AS [q)]` must not buy a cross-member UPDATE.
+
+    The bracket-quoted alias contributes a `)` that sqlite never sees as
+    syntax. Before #131 the depth counter did, driving it negative so the
+    nested EXISTS fragment landed at counter-depth zero and satisfied #129's
+    requirement. The universal authorizer check does not stop this shape --
+    `recoveries.whoop_user_id` is read by the top-level `!= ?` -- so the
+    member-predicate layer is the only thing standing here.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+    conn.commit()
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "UPDATE recoveries SET score_state='PWNED' WHERE whoop_user_id != ? "
+            "AND resource_id = (SELECT max(resource_id) FROM recoveries AS [q)]) "
+            "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+            (MEMBER_A, MEMBER_A),
+        )
+
+    conn.commit()
+    victim = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ?", (MEMBER_B,)
+    ).fetchone()[0]
+    assert victim == "SCORED", "a bracket-quoted identifier bought a cross-member UPDATE"
+
+
+def test_backtick_identifier_cannot_desynchronise_the_depth_counter(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """The backtick form of the same exploit. Kept separate from the bracket
+    case because the two have *different* escape rules -- backticks double,
+    brackets do not -- so they cannot share an implementation branch, and a
+    regression could plausibly hit one and not the other.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+    conn.commit()
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "UPDATE recoveries SET score_state='PWNED' WHERE whoop_user_id != ? "
+            "AND resource_id = (SELECT max(resource_id) FROM recoveries AS `q)`) "
+            "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+            (MEMBER_A, MEMBER_A),
+        )
+
+    conn.commit()
+    victim = conn.execute(
+        "SELECT score_state FROM recoveries WHERE whoop_user_id = ?", (MEMBER_B,)
+    ).fetchone()[0]
+    assert victim == "SCORED", "a backtick-quoted identifier bought a cross-member UPDATE"
+
+
+def test_sqlite_really_has_the_escape_rules_the_sanitiser_encodes() -> None:
+    """Assert the escape rules against sqlite itself, not against our belief
+    about them.
+
+    The sanitiser hard-codes an asymmetry -- backticks double, brackets have no
+    escape -- and gets it from sqlite's tokeniser. A test that only checked the
+    sanitiser would pass just as happily if that belief were wrong, which is the
+    failure mode this whole series of issues keeps producing. So this asserts
+    sqlite's observable behaviour first, and the next test checks the sanitiser
+    agrees with it.
+    """
+    conn = sqlite3.connect(":memory:")
+
+    # Backticks double: `a``b` names one column, literally a`b.
+    conn.execute("CREATE TABLE doubled (`a``b` INTEGER)")
+    assert [r[1] for r in conn.execute("PRAGMA table_info(doubled)")] == ["a`b"], (
+        "sqlite did not read a doubled backtick as an escape"
+    )
+
+    # Brackets have no escape at all: ]] is a syntax error, not an escaped ].
+    with pytest.raises(sqlite3.OperationalError):
+        conn.execute("CREATE TABLE bracketed ([a]]b] INTEGER)")
+
+    # ...and the first ] closes, so [a] is just the column a.
+    conn.execute("CREATE TABLE closes ([a] INTEGER)")
+    assert [r[1] for r in conn.execute("PRAGMA table_info(closes)")] == ["a"]
+
+    # A parenthesis inside either form is identifier CONTENT, invisible to
+    # sqlite as syntax. This is the property the depth counter depends on: if
+    # sqlite ignores those parens and the sanitiser does not, the two disagree
+    # about nesting -- which is exactly the #131 exploit.
+    for table, quoted in [("pb", "[q)]"), ("pt", "`q)`")]:
+        conn.execute(f"CREATE TABLE {table} ({quoted} INTEGER)")
+        assert [r[1] for r in conn.execute(f"PRAGMA table_info({table})")] == ["q)"], (
+            f"sqlite did not treat the parenthesis as identifier content: {quoted}"
+        )
+
+    # An unterminated bracket is a sqlite syntax error, so the sanitiser
+    # consuming to end-of-statement there can only ever cost a rejection of a
+    # statement sqlite would refuse anyway.
+    with pytest.raises(sqlite3.OperationalError):
+        conn.execute("SELECT * FROM closes WHERE [oops")
+
+    conn.close()
+
+
+def test_quoted_identifier_stripping_follows_sqlite_escape_rules() -> None:
+    """The sanitiser agrees with the sqlite behaviour pinned by the test above.
+
+    * Backticks double: ``a``b`` is the single identifier a`b, so a doubled
+      backtick must NOT end the region early.
+    * Brackets have NO escape: the first ``]`` ends the identifier. So brackets
+      must NOT be given the doubling rule -- doing so would consume past the
+      real terminator and swallow live SQL, including a member predicate.
+    """
+    # A fragment hidden inside either quoted form must not satisfy the check.
+    for hidden in [
+        "DELETE FROM recoveries WHERE resource_id = `whoop_user_id = ?`",
+        "DELETE FROM recoveries WHERE resource_id = [whoop_user_id = ?]",
+    ]:
+        assert not store._statement_restricts_to_one_member(hidden), (
+            f"a fragment inside a quoted identifier satisfied the check: {hidden}"
+        )
+
+    # Backtick doubling: the region continues past ``, so the real predicate
+    # after it is still found at depth zero.
+    doubled = "DELETE FROM recoveries WHERE `a``b` IS NULL AND whoop_user_id = ?"
+    assert store._statement_restricts_to_one_member(doubled), (
+        "a doubled backtick ended the quoted region early and hid the predicate"
+    )
+
+    # Brackets do not double: the first ] closes, so what follows is live SQL.
+    # Treating ]] as an escape here would swallow the predicate and reject a
+    # statement sqlite would have accepted.
+    bracket_closes_at_first = "DELETE FROM recoveries WHERE [a] IS NULL AND whoop_user_id = ?"
+    assert store._statement_restricts_to_one_member(bracket_closes_at_first), (
+        "the bracket region did not end at its first ]"
+    )
+
+    # An unterminated quoted identifier consumes to end-of-statement, matching
+    # how the existing branches already treat an unterminated string literal.
+    # A predicate swallowed by it is therefore not found -- fail-closed.
+    assert not store._statement_restricts_to_one_member(
+        "DELETE FROM recoveries WHERE [oops AND whoop_user_id = ?"
+    ), "a predicate swallowed by an unterminated bracket must fail closed"
+
+    # ...while one that precedes the unterminated region is still found.
+    assert store._statement_restricts_to_one_member(
+        "DELETE FROM recoveries WHERE whoop_user_id = ? AND [oops"
+    )
+
+
 # -- exclusion rationale stays true (issue #130) -------------------------------
 
 
