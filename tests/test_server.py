@@ -7,7 +7,9 @@ a tool a client may stop asking permission for.
 
 from __future__ import annotations
 
+import base64
 import inspect
+import json
 import re
 import time
 from collections.abc import Callable
@@ -2465,3 +2467,405 @@ async def test_auth_tools_are_not_principal_gated(server: MCPServer[AppContext])
             f"{name} is an auth tool and must keep working with no resolved "
             "principal, but its body calls _ensure_principal"
         )
+
+
+# -- issue #179: cursor validation -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tool_name,fixture_fn,upsert_fn",
+    [
+        ("list_recoveries", recovery_fixture, upsert_recovery),
+        ("list_sleeps", sleep_fixture, upsert_sleep),
+        ("list_workouts", workout_fixture, upsert_workout),
+        ("list_cycles", cycle_fixture, upsert_cycle),
+    ],
+)
+async def test_list_tools_reject_out_of_range_offset_too_large(
+    app_context: AppContext,
+    server: MCPServer[AppContext],
+    tool_name: str,
+    fixture_fn: Callable[..., dict[str, Any]],
+    upsert_fn: Callable[..., Any],
+) -> None:
+    """A forged token with offset=2**63 (out of range) raises ValueError, not OverflowError.
+
+    This tests the explicit ceiling at _MAX_CURSOR_OFFSET = 2**63 - 1, ensuring
+    that an out-of-range offset is caught before reaching the store and raises
+    a clear "not a valid pagination cursor" error.
+    """
+    assert app_context.store_conn is not None
+    upsert_fn(app_context.store_conn, 12345, fixture_fn())
+
+    # Forge a cursor with an offset that's too large (2**63)
+    forged_cursor = base64.urlsafe_b64encode(
+        json.dumps({"offset": 2**63, "start": None, "end": None}).encode("utf-8")
+    ).decode("ascii")
+
+    with pytest.raises(ToolError, match="not a valid pagination cursor"):
+        await call_tool(
+            server,
+            tool_name,
+            {
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-08T00:00:00Z",
+                "next_token": forged_cursor,
+            },
+            app_context,
+        )
+
+
+@pytest.mark.parametrize(
+    "tool_name,fixture_fn,upsert_fn",
+    [
+        ("list_recoveries", recovery_fixture, upsert_recovery),
+        ("list_sleeps", sleep_fixture, upsert_sleep),
+        ("list_workouts", workout_fixture, upsert_workout),
+        ("list_cycles", cycle_fixture, upsert_cycle),
+    ],
+)
+async def test_list_tools_reject_negative_offset(
+    app_context: AppContext,
+    server: MCPServer[AppContext],
+    tool_name: str,
+    fixture_fn: Callable[..., dict[str, Any]],
+    upsert_fn: Callable[..., Any],
+) -> None:
+    """A forged token with a negative offset raises ValueError, not silent reordering.
+
+    SQLite treats negative OFFSET as 0, which would silently re-serve earlier rows.
+    The validation must reject negative offsets with a clear error.
+    """
+    assert app_context.store_conn is not None
+    upsert_fn(app_context.store_conn, 12345, fixture_fn())
+
+    # Forge a cursor with a negative offset
+    forged_cursor = base64.urlsafe_b64encode(
+        json.dumps({"offset": -5, "start": None, "end": None}).encode("utf-8")
+    ).decode("ascii")
+
+    with pytest.raises(ToolError, match="not a valid pagination cursor"):
+        await call_tool(
+            server,
+            tool_name,
+            {
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-08T00:00:00Z",
+                "next_token": forged_cursor,
+            },
+            app_context,
+        )
+
+
+@pytest.mark.parametrize(
+    "tool_name,fixture_fn,upsert_fn,bad_cursor",
+    [
+        # bad base64 padding
+        ("list_recoveries", recovery_fixture, upsert_recovery, "not-base64!!!"),
+        # valid base64 but not JSON
+        (
+            "list_sleeps",
+            sleep_fixture,
+            upsert_sleep,
+            base64.urlsafe_b64encode(b"not json").decode("ascii"),
+        ),
+        # valid JSON but missing "offset" key
+        (
+            "list_workouts",
+            workout_fixture,
+            upsert_workout,
+            base64.urlsafe_b64encode(b'{"start": null, "end": null}').decode("ascii"),
+        ),
+        # valid JSON with non-integer offset
+        (
+            "list_cycles",
+            cycle_fixture,
+            upsert_cycle,
+            base64.urlsafe_b64encode(b'{"offset": "abc", "start": null, "end": null}').decode(
+                "ascii"
+            ),
+        ),
+        # valid JSON but payload is a list (not dict)
+        (
+            "list_recoveries",
+            recovery_fixture,
+            upsert_recovery,
+            base64.urlsafe_b64encode(b"[1, 2, 3]").decode("ascii"),
+        ),
+        # empty string (neither base64 nor JSON)
+        ("list_sleeps", sleep_fixture, upsert_sleep, ""),
+    ],
+)
+async def test_list_tools_reject_malformed_cursors(
+    app_context: AppContext,
+    server: MCPServer[AppContext],
+    tool_name: str,
+    fixture_fn: Callable[..., dict[str, Any]],
+    upsert_fn: Callable[..., Any],
+    bad_cursor: str,
+) -> None:
+    """Each malformed-cursor shape (bad base64, bad JSON, missing keys, etc.)
+    raises the same clear ValueError, not driver-specific exceptions.
+
+    This covers all the malformed cases from issue #179's description:
+    - bad base64 → binascii.Error
+    - valid base64, not JSON → JSONDecodeError
+    - missing "offset" key → KeyError
+    - non-integer offset → ValueError from int()
+    - JSON list (not dict) → TypeError
+    - empty string → JSONDecodeError
+    """
+    assert app_context.store_conn is not None
+    upsert_fn(app_context.store_conn, 12345, fixture_fn())
+
+    with pytest.raises(ToolError, match="not a valid pagination cursor"):
+        await call_tool(
+            server,
+            tool_name,
+            {
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-08T00:00:00Z",
+                "next_token": bad_cursor,
+            },
+            app_context,
+        )
+
+
+@pytest.mark.parametrize(
+    "tool_name,make_record,upsert_fn,id_field",
+    [
+        (
+            "list_recoveries",
+            lambda i: recovery_fixture(
+                cycle_id=1000 + i, created_at=f"2026-08-{i + 1:02d}T06:30:00Z"
+            ),
+            upsert_recovery,
+            "cycle_id",
+        ),
+        (
+            "list_sleeps",
+            # `start`, not `created_at`: get_sleeps is ORDER BY start with no
+            # tiebreaker, so records sharing a start leave the order of two
+            # separate LIMIT/OFFSET queries unspecified and the walk below
+            # flaky. sleep_fixture hardcodes start, hence the override.
+            lambda i: {
+                **sleep_fixture(sleep_id=f"sleep-{i}"),
+                "start": f"2026-08-01T{i:02d}:00:00Z",
+                "end": f"2026-08-01T{i:02d}:45:00Z",
+            },
+            upsert_sleep,
+            "id",
+        ),
+        (
+            "list_workouts",
+            lambda i: {
+                **workout_fixture(workout_id=f"workout-{i}"),
+                "start": f"2026-08-{i + 1:02d}T06:00:00Z",
+                "end": f"2026-08-{i + 1:02d}T07:30:00Z",
+            },
+            upsert_workout,
+            "id",
+        ),
+        (
+            "list_cycles",
+            # Same reason as sleeps above: get_cycles is ORDER BY start too.
+            lambda i: {
+                **cycle_fixture(cycle_id=2000 + i),
+                "start": f"2026-08-01T{i:02d}:00:00Z",
+                "end": f"2026-08-01T{i:02d}:45:00Z",
+            },
+            upsert_cycle,
+            "id",
+        ),
+    ],
+)
+async def test_list_tools_accept_legitimate_large_offset_and_continue(
+    app_context: AppContext,
+    server: MCPServer[AppContext],
+    tool_name: str,
+    make_record: Callable[[int], dict[str, Any]],
+    upsert_fn: Callable[..., Any],
+    id_field: str,
+) -> None:
+    """A legitimate round-trip cursor with a large but valid offset continues unchanged.
+
+    Seeds 10 records and walks the first five a page at a time, so the walk runs
+    at offsets 0 through 4, then forges a cursor at the legal ceiling
+    (2**63 - 1) and checks it is accepted -- it returns no records, since the
+    offset is far past the end, and that is the point: accepted, not refused.
+
+    Non-vacuous in two directions: it fails if the implementation over-rejects
+    (rejecting the ceiling itself, or offset 0), and the id assertions at the end
+    fail if the cursor stops advancing, since five pages each holding one record
+    is equally true of a cursor stuck at offset 0.
+    """
+    assert app_context.store_conn is not None
+    total = 10
+    for i in range(total):
+        upsert_fn(app_context.store_conn, 12345, make_record(i))
+
+    window = {"start": "2026-08-01T00:00:00Z", "end": "2026-08-09T00:00:00Z"}
+
+    # First, walk through the first 5 records one at a time
+    seen: list[Any] = []
+    page = await call_tool(server, tool_name, {**window, "limit": 1}, app_context)
+    for page_num in range(5):
+        assert page["count"] == 1
+        assert len(page["records"]) == 1
+        seen.extend(record[id_field] for record in page["records"])
+        if page_num < 4:  # not on the last iteration
+            assert page["next_token"] is not None
+            page = await call_tool(
+                server, tool_name, {"next_token": page["next_token"], "limit": 1}, app_context
+            )
+
+    # Now forge a cursor with the maximum legal offset (2**63 - 1)
+    # and verify it is accepted without raising
+    max_offset_cursor = base64.urlsafe_b64encode(
+        json.dumps(
+            {"offset": 2**63 - 1, "start": "2026-08-01T00:00:00Z", "end": "2026-08-09T00:00:00Z"}
+        ).encode("utf-8")
+    ).decode("ascii")
+
+    # This call should NOT raise. It may return 0 records (the offset is beyond the end),
+    # but the point is that a valid large offset is accepted.
+    result = await call_tool(
+        server,
+        tool_name,
+        {"next_token": max_offset_cursor, "limit": 1},
+        app_context,
+    )
+
+    # Verify the result has the expected structure (proving the call succeeded)
+    assert "records" in result
+    assert "count" in result
+    assert "coverage" in result
+    # At such a large offset, we expect 0 records (the offset is past the end)
+    assert result["count"] == 0
+
+    # The walk above is only worth anything if it asserts the cursor MOVED.
+    # Five pages each holding one record is equally true of a cursor stuck at
+    # offset 0 re-serving the same row, so compare the ids actually served.
+    assert len(seen) == 5, f"the walk must serve five records, got {seen}"
+    assert len(set(seen)) == 5, f"a stuck cursor would repeat a record: {seen}"
+    assert seen == [record[id_field] for record in (make_record(i) for i in range(5))], (
+        f"the walk must serve the first five seeded records in order, got {seen}"
+    )
+    assert len(result["records"]) == 0
+
+
+async def test_zero_offset_cursor_is_accepted(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """``offset = 0`` sits inside the valid range, not on the rejected side of it.
+
+    No server-issued cursor ever carries it -- every ``next_token`` encodes
+    ``offset + limit`` and ``limit`` is at least 1 -- so this is only reachable
+    by forging one, and a forged zero is harmless: it addresses the first page,
+    exactly what no cursor at all would. It is pinned because the range check
+    has two ends and the ceiling end is pinned; a later tightening to
+    ``0 < offset`` would otherwise pass the whole suite.
+    """
+    assert app_context.store_conn is not None
+    for i in range(3):
+        record = sleep_fixture(sleep_id=f"sleep-{i}")
+        record["start"] = f"2026-08-01T{i:02d}:00:00Z"
+        record["end"] = f"2026-08-01T{i:02d}:45:00Z"
+        upsert_sleep(app_context.store_conn, 12345, record)
+
+    zero_cursor = base64.urlsafe_b64encode(
+        json.dumps(
+            {"offset": 0, "start": "2026-08-01T00:00:00Z", "end": "2026-08-02T00:00:00Z"}
+        ).encode("utf-8")
+    ).decode("ascii")
+
+    result = await call_tool(server, "list_sleeps", {"next_token": zero_cursor}, app_context)
+
+    assert [record["id"] for record in result["records"]] == ["sleep-0", "sleep-1", "sleep-2"], (
+        "a zero-offset cursor must address the first page, not be rejected"
+    )
+
+
+#: Cursor payloads that must all be refused identically. Each entry is a shape
+#: the decode could plausibly meet in the wild or from a forged token; several
+#: were reaching the caller as a driver-level error before #179.
+_BAD_CURSOR_PAYLOADS: list[tuple[str, str]] = [
+    ("offset_infinity", '{"offset": Infinity, "start": null, "end": null}'),
+    ("offset_overflowing_float", '{"offset": 1e400, "start": null, "end": null}'),
+    ("offset_negative_infinity", '{"offset": -Infinity, "start": null, "end": null}'),
+    ("offset_float", '{"offset": 2.9, "start": null, "end": null}'),
+    ("offset_numeric_string", '{"offset": "12", "start": null, "end": null}'),
+    ("offset_bool", '{"offset": true, "start": null, "end": null}'),
+    ("start_is_object", '{"offset": 0, "start": {"a": 1}, "end": null}'),
+    ("start_is_list", '{"offset": 0, "start": [1], "end": null}'),
+    ("end_is_number", '{"offset": 0, "start": null, "end": 5}'),
+    ("missing_start", '{"offset": 1}'),
+    ("missing_end", '{"offset": 1, "start": null}'),
+]
+
+
+@pytest.mark.parametrize(
+    "shape,payload", _BAD_CURSOR_PAYLOADS, ids=[s for s, _ in _BAD_CURSOR_PAYLOADS]
+)
+async def test_cursor_shapes_that_used_to_reach_the_driver(
+    app_context: AppContext, server: MCPServer[AppContext], shape: str, payload: str
+) -> None:
+    """Each of these decoded cleanly and failed somewhere lower down.
+
+    ``Infinity`` and an overflowing float literal are accepted by ``json.loads``
+    and become ``float("inf")``; ``int()`` on that raises ``OverflowError``,
+    which is an ``ArithmeticError`` rather than a ``ValueError`` and so escaped
+    the decode handler entirely -- surfacing the very ``OverflowError`` #179 was
+    filed to remove. A non-string ``start``/``end`` reached the query and raised
+    ``sqlite3.ProgrammingError: Error binding parameter``. A missing ``start``
+    or ``end`` key raised a bare ``KeyError``.
+    """
+    token = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+    with pytest.raises(ToolError) as excinfo:
+        await call_tool(server, "list_sleeps", {"next_token": token}, app_context)
+
+    # Exact tail match, not a substring search: the guarantee is one *identical*
+    # message, so a variant that appended "(offset 5 out of range)" would still
+    # satisfy a `match=` search while breaking the property.
+    assert str(excinfo.value).endswith("next_token is not a valid pagination cursor"), (
+        f"{shape} must give the one unified message, got: {excinfo.value}"
+    )
+
+
+async def test_rejected_cursor_never_echoes_the_token_or_the_cause(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """The rejection must not reflect caller-controlled input back at the caller.
+
+    A ``next_token`` is attacker-influenceable (tool arguments are
+    model-generated), so echoing it, or the decode exception's own text, puts
+    bytes the caller chose into an error string that may be logged or shown.
+    The underlying exception stays reachable through ``__cause__`` for a
+    developer reading a traceback; it must not appear in the message.
+
+    Untested until now, which mattered: appending the token or ``exc`` to the
+    message passed the entire suite, because every other cursor test asserts
+    with a substring search that a longer message still satisfies.
+    """
+    marker = "SENTINEL-do-not-echo-abc123"
+    payload = json.dumps({"offset": -1, "start": marker, "end": None})
+    token = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+    with pytest.raises(ToolError) as excinfo:
+        await call_tool(server, "list_sleeps", {"next_token": token}, app_context)
+
+    rendered = str(excinfo.value)
+    assert marker not in rendered, "the cursor's own contents leaked into the error"
+    assert token not in rendered, "the raw token leaked into the error"
+    assert rendered.endswith("next_token is not a valid pagination cursor")
+
+    # Nothing from the chained cause -- the phrasing sqlite/binascii/json would
+    # have contributed -- may appear either.
+    for fragment in (
+        "Incorrect padding",
+        "Expecting value",
+        "invalid literal",
+        "binding parameter",
+    ):
+        assert fragment not in rendered
