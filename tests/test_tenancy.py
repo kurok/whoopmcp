@@ -2744,6 +2744,205 @@ def test_quoted_identifier_stripping_follows_sqlite_escape_rules() -> None:
     )
 
 
+# -- #154: every top-level WHERE must carry its own fragment. A compound
+# statement has one per arm, all genuinely at depth zero, so checking only the
+# first let the second arm supply the predicate while the first spanned every
+# member -- a cross-member READ that #129's depth requirement cannot see. ------
+
+
+def test_compound_select_second_arm_cannot_supply_the_member_predicate(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#154: the UNION exfiltration must be rejected, not merely filtered.
+
+    Both arms read `recoveries.whoop_user_id`, so the universal authorizer
+    check passes. The first arm spans every member but the caller; the second
+    restricts to the caller and used to be the only arm examined. The assertion
+    that matters is that the *other member's payload* is not returned -- so this
+    reads back what the statement would have produced rather than trusting the
+    exception alone.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+    conn.commit()
+
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(
+            conn,
+            "SELECT raw_json FROM recoveries WHERE whoop_user_id != ? "
+            "UNION SELECT raw_json FROM recoveries WHERE whoop_user_id = ?",
+            (MEMBER_A, MEMBER_A),
+        )
+
+    # The same statement, run unguarded, is what the guard must be preventing:
+    # two rows, the second being the other member's. Proving it here keeps the
+    # test honest about what was at stake rather than asserting on the raise.
+    leaked = conn.execute(
+        "SELECT raw_json FROM recoveries WHERE whoop_user_id != ? "
+        "UNION SELECT raw_json FROM recoveries WHERE whoop_user_id = ?",
+        (MEMBER_A, MEMBER_A),
+    ).fetchall()
+    assert len(leaked) == 2, (
+        "the exploit statement no longer spans two members, so this test would "
+        "pass even if the guard were removed -- re-derive it"
+    )
+
+
+def test_stripped_regions_become_separators_not_deletions(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """A stripped comment or quoted region must leave a SPACE behind.
+
+    To sqlite a comment is a token separator, so deleting one fuses the tokens
+    it stood between -- and every check here is a `\\b`-anchored keyword search
+    over the sanitised copy. `UNION/**/ALL` collapsed to `UNIONALL` and
+    `recoveries/**/UNION` to `recoveriesUNION`, so the arm split silently did
+    not happen and an unfiltered arm was accepted. sqlite treats all four
+    statements below as ordinary compounds, and the `EXCEPT` pair is the
+    cleanest exfiltration primitive in this file: all-members EXCEPT self is
+    *exactly* the other members' rows.
+
+    This shape got through the first version of #154's fix and its tests,
+    because both assumed operators separated by a single plain space.
+    """
+    conn = store_conn
+    for member, cycle in ((MEMBER_A, 1), (MEMBER_B, 2)):
+        store.upsert_recovery(conn, member, {"cycle_id": cycle, "score_state": "SCORED"})
+    conn.commit()
+
+    glued = [
+        "SELECT raw_json FROM recoveries EXCEPT/**/SELECT raw_json FROM recoveries "
+        "WHERE whoop_user_id = ?",
+        "SELECT raw_json FROM recoveries/**/EXCEPT SELECT raw_json FROM recoveries "
+        "WHERE whoop_user_id = ?",
+        "SELECT raw_json FROM recoveries UNION/**/ALL SELECT raw_json FROM recoveries "
+        "WHERE whoop_user_id = ?",
+        "SELECT raw_json FROM recoveries/**/UNION SELECT raw_json FROM recoveries "
+        "WHERE whoop_user_id = ?",
+    ]
+    for sql in glued:
+        with pytest.raises(store.UnscopedQueryError):
+            store._execute_scoped(conn, sql, (MEMBER_A,))
+        # Guard on the guard: sqlite accepts these, and unguarded they really do
+        # reach member B's rows -- so the rejection above is the guard working,
+        # not sqlite refusing to parse a contrived string.
+        assert conn.execute(sql, (MEMBER_A,)).fetchall(), (
+            f"sqlite returned nothing for {sql!r}, so this proves nothing"
+        )
+
+    # The separator also removes a false *rejection*: a comment between FROM's
+    # table and WHERE used to fuse them into `recoveriesWHERE`, hiding the
+    # anchor, so a properly restricted statement was refused.
+    assert store._statement_restricts_to_one_member(
+        "DELETE FROM recoveries/**/WHERE whoop_user_id = ?"
+    ), "a comment before WHERE still hides the anchor"
+
+
+def test_compound_arm_with_no_where_is_rejected_end_to_end(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """The arm-with-no-WHERE shape, through the real guard.
+
+    Kept as its own end-to-end case rather than folded into the predicate-level
+    table above, because this is the shape that got through my first attempt at
+    #154: the universal authorizer check passes (the second arm reads
+    `whoop_user_id` on `recoveries`, and that check is per-table), and the
+    unfiltered arm returns every member's payload.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_recovery(conn, MEMBER_B, {"cycle_id": 2, "score_state": "SCORED"})
+    conn.commit()
+
+    exploit = (
+        "SELECT raw_json FROM recoveries "
+        "UNION SELECT raw_json FROM recoveries WHERE whoop_user_id = ?"
+    )
+    with pytest.raises(store.UnscopedQueryError):
+        store._execute_scoped(conn, exploit, (MEMBER_A,))
+
+    # Guard on the guard: unguarded, this statement really does span both
+    # members, so the assertion above is not passing for an unrelated reason.
+    assert len(conn.execute(exploit, (MEMBER_A,)).fetchall()) == 2, (
+        "the exploit statement no longer spans two members -- re-derive this test"
+    )
+
+
+def test_every_compound_arm_must_restrict_to_the_member() -> None:
+    """Each compound operator, in both orders, for both ways an arm can fail to
+    restrict -- plus the shapes that must stay accepted.
+
+    Three separate off-by-one traps, which is why this enumerates rather than
+    picking one example:
+
+    * `widening` first catches "only the first arm is examined";
+    * `widening` second catches a fix that examined only the *last* arm;
+    * `unfiltered` -- an arm with no WHERE at all -- catches the formulation
+      that walks WHERE keywords instead of arms. That arm has no anchor, so a
+      WHERE-driven check never visits it and never objects, even though it
+      spans the whole table. I wrote that formulation first and it accepted
+      this shape; the test exists because the bug did.
+    """
+    # Naming the arms keeps the interpolation free of SQL keywords, so nothing
+    # here needs an S608 suppression, and the shapes read as what they are.
+    restricted = "SELECT raw_json FROM recoveries WHERE whoop_user_id = ?"
+    widening = "SELECT raw_json FROM recoveries WHERE whoop_user_id != ?"
+    unfiltered = "SELECT raw_json FROM recoveries"
+
+    for operator in ("UNION", "UNION ALL", "INTERSECT", "EXCEPT"):
+        for label, bad_arm in (("widening", widening), ("unfiltered", unfiltered)):
+            assert not store._statement_restricts_to_one_member(
+                f"{bad_arm} {operator} {restricted}"
+            ), f"{operator}: a {label} first arm was accepted"
+
+            assert not store._statement_restricts_to_one_member(
+                f"{restricted} {operator} {bad_arm}"
+            ), f"{operator}: a {label} second arm was accepted"
+
+        assert store._statement_restricts_to_one_member(f"{restricted} {operator} {restricted}"), (
+            f"{operator}: a compound statement restricting every arm was rejected"
+        )
+
+    # A compound operator nested inside a subquery is not a top-level arm
+    # boundary: the statement is one arm, and its own WHERE pins the member.
+    assert store._statement_restricts_to_one_member(
+        "DELETE FROM recoveries WHERE whoop_user_id = ? AND resource_id IN "
+        "(SELECT a FROM sleeps UNION SELECT b FROM workouts)"
+    ), "a nested compound operator was treated as a top-level arm boundary"
+
+    # A WHERE nested inside a subquery is at depth >= 1 and is therefore not an
+    # anchor at all -- it must not be required to carry its own fragment, or
+    # every legitimate statement with a filtered subquery would be rejected.
+    assert store._statement_restricts_to_one_member(
+        "DELETE FROM recoveries WHERE whoop_user_id = ? AND resource_id IN "
+        "(SELECT resource_id FROM sleeps WHERE deleted_at IS NULL)"
+    ), "a nested WHERE was treated as a top-level anchor"
+
+
+def test_earlier_tenancy_exploits_stay_closed_after_the_154_restructure() -> None:
+    """#154 replaced #109's and #129's two incremental depth counters with a
+    single depth array. That is a rewrite of the most safety-critical function
+    in this module, so the exploits those issues closed are re-asserted here
+    against the new implementation rather than assumed to still be covered.
+    """
+    must_reject = [
+        # #109: fragment in the SET clause, before any WHERE
+        "UPDATE recoveries SET whoop_user_id = ? WHERE whoop_user_id IS NOT NULL",
+        # #129: fragment nested in a subquery after a widening top-level predicate
+        "UPDATE recoveries SET score_state='X' WHERE whoop_user_id != ? "
+        "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+        # #131: stray ) inside a quoted identifier desynchronising the depth count
+        "UPDATE recoveries SET score_state='X' WHERE whoop_user_id != ? "
+        "AND resource_id = (SELECT max(resource_id) FROM recoveries AS [q)]) "
+        "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+    ]
+    for sql in must_reject:
+        assert not store._statement_restricts_to_one_member(sql), (
+            f"an exploit closed by an earlier issue was re-opened: {sql}"
+        )
+
+
 # -- exclusion rationale stays true (issue #130) -------------------------------
 
 

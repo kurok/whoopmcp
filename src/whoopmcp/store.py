@@ -515,15 +515,21 @@ class UnscopedQueryError(RuntimeError):
 #: * NOT CAUGHT -- *which* table the fragment applies to when a statement
 #:   names two tenant-scoped tables. The universal read check is per-table;
 #:   this one is per-statement.
-#: * NOT CAUGHT -- a compound statement whose *second* arm supplies the
-#:   fragment at depth zero while the first spans every member: ``SELECT
-#:   raw_json FROM recoveries WHERE whoop_user_id != ? UNION SELECT raw_json
-#:   FROM recoveries WHERE whoop_user_id = ?`` returns the other member's
-#:   payload. Both arms' ``WHERE`` keywords are genuinely at depth zero, so
-#:   the depth requirement cannot help here; only the first is examined. Found
-#:   while adversarially reviewing #129 and filed separately -- listed here
-#:   because leaving it out would make this list read as exhaustive when the
-#:   mechanism is distinct from the two bullets above.
+#: * CAUGHT, since #154 -- a compound statement in which any top-level arm
+#:   fails to restrict to the member, while another arm carries the fragment:
+#:   ``SELECT raw_json FROM recoveries WHERE whoop_user_id != ? UNION SELECT
+#:   raw_json FROM recoveries WHERE whoop_user_id = ?`` returned the other
+#:   member's payload. Both arms' ``WHERE`` keywords are genuinely at depth
+#:   zero, so #129's depth requirement could not help: only the first was
+#:   examined. The statement is now split into arms at depth-zero ``UNION`` /
+#:   ``UNION ALL`` / ``INTERSECT`` / ``EXCEPT``, and each arm must have a
+#:   top-level ``WHERE`` whose every occurrence carries a depth-zero fragment.
+#:   Requiring the arm to *have* one is the half that is easy to miss: an arm
+#:   with no ``WHERE`` (``SELECT raw_json FROM recoveries UNION SELECT ...
+#:   WHERE whoop_user_id = ?``) spans its whole table and offers no anchor for
+#:   a ``WHERE``-walking check to trip over. A compound statement whose every
+#:   arm restricts to the member is still accepted; this module writes no
+#:   compound statement either way.
 #: * CAUGHT, since #131 -- a bracket- or backtick-quoted identifier
 #:   containing an unbalanced parenthesis (``AS [q)]``). The stripping pass
 #:   did not recognise either form as a quoted region, so a stray ``)``
@@ -550,6 +556,15 @@ _MEMBER_EQUALITY_PREDICATE = re.compile(r"whoop_user_id\s*=\s*\?", re.IGNORECASE
 
 _TOP_LEVEL_WHERE = re.compile(r"\bWHERE\b", re.IGNORECASE)
 
+#: sqlite's compound-SELECT operators. Used by
+#: ``_statement_restricts_to_one_member`` to split a statement into arms at
+#: parenthesis depth zero, because the member restriction has to hold for each
+#: arm independently (#154) -- an arm carrying no ``WHERE`` at all spans its
+#: whole table, and a check that walks ``WHERE`` keywords never visits it.
+_TOP_LEVEL_COMPOUND_OPERATOR = re.compile(
+    r"\b(?:UNION\s+ALL|UNION|INTERSECT|EXCEPT)\b", re.IGNORECASE
+)
+
 
 def _statement_restricts_to_one_member(sql: str) -> bool:
     """Return whether ``sql`` carries a ``whoop_user_id = ?`` predicate that
@@ -572,6 +587,15 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
        ``'``, ``"`` and `````, so ``''`` inside a literal does not end it
        early; brackets have no escape at all, per sqlite's own tokeniser.
 
+       Each stripped region leaves a **space** behind rather than vanishing,
+       because sqlite treats these regions as token separators: deleting one
+       fuses the tokens it stood between, and both kinds of search below are
+       fooled by fusion. The keyword searches (``WHERE`` and the compound
+       operators) are ``\b``-anchored, so fusion *hides* a keyword from them;
+       the fragment search matches a fixed thirteen-character token with no
+       word boundaries, so fusion can equally *forge* a match. See the code
+       for what each cost.
+
        That is every region sqlite treats as opaque, with one residue: the
        ``x``/``X`` prefix of a blob literal (``x'29'``) is a separate token
        and is left live, since only the quoted part is stripped. It is inert
@@ -587,19 +611,37 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
        parenthesis counting from what sqlite actually parses -- an ``AS
        [q)]`` alias contributes a stray ``)`` that made a nested fragment
        read as depth zero. #131 has the worked exploit.
-    2. The match must fall after the first top-level (parenthesis-depth-
-       zero) ``WHERE`` keyword, **and must itself sit at depth zero**. The
-       first half rejects a ``SET``-clause fragment (it sits before any
-       ``WHERE``) and a subquery in ``SET`` supplying the fragment from
-       inside parentheses while the outer statement stays unfiltered (the
-       fragment then sits before the *outer*, depth-zero ``WHERE``). The
-       second half (#129) rejects the mirror image: a subquery or
-       parenthesised group *after* that ``WHERE`` supplying the fragment
-       while the top-level predicate spans every member. Both halves are
-       needed -- anchoring only the start of the search made the check
-       one-sided, and #129 reproduced a cross-member ``UPDATE`` and an
-       ``INSERT ... SELECT`` exfiltration through the gap. See
-       ``_MEMBER_EQUALITY_PREDICATE`` for the worked examples.
+    2. **Every** top-level (parenthesis-depth-zero) ``WHERE`` must be
+       followed by a fragment that itself sits at depth zero, before the next
+       top-level ``WHERE``. Three separate defects made that one sentence, in
+       three commits:
+
+       * Requiring the match to fall *after* a top-level ``WHERE`` at all
+         (#109) rejects a ``SET``-clause fragment, which sits before any
+         ``WHERE``, and a subquery in ``SET`` supplying the fragment from
+         inside parentheses while the outer statement stays unfiltered.
+       * Requiring the match to sit *at depth zero* (#129) rejects the mirror
+         image: a parenthesised group after that ``WHERE`` supplying the
+         fragment while the top-level predicate spans every member.
+       * Requiring it of every top-level compound *arm* (#154) rejects a
+         compound statement whose second arm carries the predicate while its
+         first spans every member. #129 cannot see that one: the fragment it
+         finds genuinely is at depth zero, so the defect is in *which*
+         ``WHERE`` anchors the search, not in the depth of the match.
+
+       Each of the three was a cross-member read or mutation, reproduced end
+       to end before being fixed. See ``_MEMBER_EQUALITY_PREDICATE`` for the
+       worked examples.
+
+       The unit is the **arm**, not the ``WHERE``, and the difference is not
+       cosmetic. "Every top-level ``WHERE`` carries a fragment" is the
+       formulation that suggests itself, and it is wrong: an arm with no
+       ``WHERE`` at all has no anchor to walk to, so a ``WHERE``-driven loop
+       never visits it and never objects. ``SELECT raw_json FROM recoveries
+       UNION SELECT raw_json FROM recoveries WHERE whoop_user_id = ?`` has one
+       top-level ``WHERE``, which does carry a fragment, and returns every
+       member's payload. So an arm must be required to *have* a top-level
+       ``WHERE``, and each ``WHERE`` it has must carry a fragment.
 
        A statement whose only member restriction is *genuinely* nested, such
        as ``WHERE whoop_user_id IN (SELECT whoop_user_id FROM sleeps WHERE
@@ -613,15 +655,40 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
     Still a presence check on text, not a SQL parser -- see
     ``_MEMBER_EQUALITY_PREDICATE`` for what this still does not catch.
     """
+    # Every stripped region is replaced by a SPACE, never deleted. To sqlite a
+    # comment and a quoted region are token *separators*, so deleting one fuses
+    # the tokens it stood between, and fusion breaks both searches below, in
+    # opposite directions:
+    #
+    # * It HIDES a keyword from the ``\b``-anchored searches (``WHERE``, the
+    #   compound operators). ``UNION/**/ALL`` collapsed to ``UNIONALL`` and
+    #   ``recoveries/**/UNION`` to ``recoveriesUNION``, so the arm split
+    #   silently did not happen and an unfiltered arm was accepted --
+    #   reproduced as ``SELECT raw_json FROM recoveries EXCEPT/**/SELECT
+    #   raw_json FROM recoveries WHERE whoop_user_id = ?`` returning exactly
+    #   the *other* members' rows. It can also hide a legitimate ``WHERE``
+    #   (``FROM recoveries/**/WHERE ...``), which is a false rejection.
+    # * It FORGES a match for ``_MEMBER_EQUALITY_PREDICATE``, which has no word
+    #   boundaries: ``WHERE whoop_user/**/_id = ?`` fused into a predicate the
+    #   statement never wrote. Not exploitable on its own -- such a statement
+    #   never reads ``whoop_user_id``, so the universal authorizer check
+    #   rejects it -- but the layer was forgeable, not merely suppressible.
+    #
+    # A separator can only split a token, never join two, so it closes both:
+    # it cannot spell any character of a keyword or of the thirteen-character
+    # fragment token, and a keyword it reveals is bordered by separators on
+    # both sides, which is exactly when sqlite tokenises it as that keyword.
     chars: list[str] = []
     i, n = 0, len(sql)
     while i < n:
         if sql[i : i + 2] == "--":
             newline = sql.find("\n", i)
+            chars.append(" ")
             i = n if newline == -1 else newline
             continue
         if sql[i : i + 2] == "/*":
             end = sql.find("*/", i + 2)
+            chars.append(" ")
             i = n if end == -1 else end + 2
             continue
         ch = sql[i]
@@ -639,6 +706,7 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
                 j += 1
             else:
                 j = n
+            chars.append(" ")
             i = j
             continue
         if ch == "[":
@@ -648,48 +716,70 @@ def _statement_restricts_to_one_member(sql: str) -> bool:
             # #131). So this cannot share the doubling branch above -- doing so
             # would consume past the real terminator and swallow live SQL.
             end = sql.find("]", i + 1)
+            chars.append(" ")
             i = n if end == -1 else end + 1
             continue
         chars.append(ch)
         i += 1
     sanitized = "".join(chars)
 
+    # Depth is computed once, for every index, rather than re-walked per
+    # search. #109 tracked it incrementally to find one anchor and #129 added
+    # a second incremental walk for the fragment; #154 needs a fragment check
+    # per anchor, and a third hand-rolled counter would be the bug waiting to
+    # happen. With this, "is this token at depth zero" is an index lookup.
+    depths: list[int] = []
     depth = 0
-    pos = 0
-    where_end: int | None = None
-    for match in _TOP_LEVEL_WHERE.finditer(sanitized):
-        while pos < match.start():
-            if sanitized[pos] == "(":
-                depth += 1
-            elif sanitized[pos] == ")":
-                depth -= 1
-            pos += 1
-        if depth == 0:
-            where_end = match.end()
-            break
+    for ch in sanitized:
+        if ch == "(":
+            depth += 1
+            depths.append(depth)
+        elif ch == ")":
+            depths.append(depth)
+            depth -= 1
+        else:
+            depths.append(depth)
 
-    if where_end is None:
-        return False
+    # Split into top-level compound ARMS first, and require every arm to
+    # restrict to the member (#154).
+    #
+    # The obvious formulation -- "every top-level WHERE must carry a fragment"
+    # -- is the wrong invariant, and I wrote it before catching this: an arm
+    # with no ``WHERE`` at all has no anchor, so a WHERE-counting loop never
+    # sees it. ``SELECT raw_json FROM recoveries UNION SELECT raw_json FROM
+    # recoveries WHERE whoop_user_id = ?`` has exactly one top-level ``WHERE``,
+    # which does carry a fragment, and returns every member's payload. The
+    # thing that must be true is a property of each arm, not of each ``WHERE``.
+    arm_bounds = [0]
+    for match in _TOP_LEVEL_COMPOUND_OPERATOR.finditer(sanitized):
+        if depths[match.start()] == 0:
+            arm_bounds.append(match.start())
+            arm_bounds.append(match.end())
+    arm_bounds.append(len(sanitized))
+    arms = [(arm_bounds[i], arm_bounds[i + 1]) for i in range(0, len(arm_bounds) - 1, 2)]
 
-    # The fragment must ALSO sit at depth zero -- in the top-level WHERE
-    # itself, not nested inside a parenthesised group or subquery that
-    # follows it (#129). Anchoring only the start of the search left the
-    # check one-sided: ``WHERE whoop_user_id != ? AND EXISTS (SELECT 1 FROM
-    # recoveries r2 WHERE r2.whoop_user_id = ?)`` reads the column (so the
-    # universal authorizer check passes), spans every member but the caller,
-    # and had the nested fragment accepted as its member restriction.
-    depth = 0
-    pos = where_end
-    for match in _MEMBER_EQUALITY_PREDICATE.finditer(sanitized, where_end):
-        while pos < match.start():
-            if sanitized[pos] == "(":
-                depth += 1
-            elif sanitized[pos] == ")":
-                depth -= 1
-            pos += 1
-        if depth == 0:
-            return True
-    return False
+    for arm_start, arm_end in arms:
+        anchors = [
+            m
+            for m in _TOP_LEVEL_WHERE.finditer(sanitized, arm_start, arm_end)
+            if depths[m.start()] == 0
+        ]
+        # No top-level WHERE in this arm means the arm spans the whole table.
+        if not anchors:
+            return False
+        # And every top-level WHERE it does have must carry its own depth-zero
+        # fragment, so a second WHERE cannot widen what the first pinned.
+        for index, anchor in enumerate(anchors):
+            segment_start = anchor.end()
+            segment_end = anchors[index + 1].start() if index + 1 < len(anchors) else arm_end
+            if not any(
+                depths[found.start()] == 0
+                for found in _MEMBER_EQUALITY_PREDICATE.finditer(
+                    sanitized, segment_start, segment_end
+                )
+            ):
+                return False
+    return True
 
 
 class _TenancyFindings(NamedTuple):
