@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -702,3 +703,664 @@ async def test_backfill_never_receives_syncs_high_water_mark_as_a_next_token(
     backfill_first_call = routes["recoveries"].calls[calls_before].request
     assert backfill_first_call.url.params.get("nextToken") is None
     conn.close()
+
+
+# -- issue #186: high-water mark poisoning by implausible future timestamps ---
+
+
+@respx.mock
+async def test_far_future_updated_at_does_not_poison_cursor(tmp_path: Path) -> None:
+    """Test 1: A record with a far-future updated_at (year 2099) does NOT
+    advance the cursor past the present. The record IS persisted, but does not
+    influence the high-water mark.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    # Record with year 2099 (far future, well beyond 5-minute skew allowance)
+    future_mark = "2099-12-31T23:59:59+00:00"
+    record = make_record("recoveries", 1, future_mark)
+    mock_collections({"recoveries": {"records": [record], "next_token": None}})
+
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    # Record is upserted despite cursor skip
+    recoveries = get_recoveries(conn, USER_ID)
+    assert len(recoveries) == 1, "record must be persisted despite cursor skip"
+    assert recoveries[0]["updated_at"] == future_mark
+
+    # Cursor is NOT the future timestamp (this fails on main)
+    state = get_sync_state(conn, USER_ID, _incremental_entity_key("recoveries"))
+    assert state is not None
+    assert state["outcome"] == "complete"
+    stored_cursor = state["cursor"]
+
+    # The stored cursor must not be the far-future value
+    # On main: cursor = "2099-12-31T23:59:59+00:00" (poisoned) -- FAILS this assertion
+    assert stored_cursor != future_mark, (
+        "cursor should not be the far-future timestamp; it should be clamped or None"
+    )
+    # And should not contain 2099 at all
+    assert "2099" not in str(stored_cursor), "cursor should not contain year 2099"
+
+    conn.close()
+
+
+@respx.mock
+async def test_following_run_after_implausible_record_fetches_normally(tmp_path: Path) -> None:
+    """Test 2: After a sync with an implausible record, the NEXT run still
+    fetches with a sane start parameter (not a future date). Inspect the
+    recorded request start parameter to verify.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    # First run: inject a far-future record
+    future_mark = "2099-06-15T12:00:00+00:00"
+    record = make_record("cycles", 1, future_mark)
+    routes = mock_collections({"cycles": {"records": [record], "next_token": None}})
+
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    # Second run: capture the start parameter
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["start"] = request.url.params.get("start")
+        return httpx.Response(200, json=EMPTY_PAGE)
+
+    routes["cycles"].side_effect = handler
+
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    # The start parameter in the second run must NOT be a future date
+    start_param = captured["start"]
+    assert start_param is not None, "start parameter must be present"
+
+    # Parse and verify it's not 2099 (or far in future)
+    start_dt = datetime.fromisoformat(start_param)
+    now = datetime.now(UTC)
+    # On main: start_param will contain "2099-..." because cursor is poisoned
+    # So this assertion will FAIL
+    assert start_dt < now + timedelta(hours=1), (
+        f"start parameter must be near-present, not future: {start_param}"
+    )
+    assert "2099" not in start_param, "start parameter should not reference year 2099"
+
+    conn.close()
+
+
+@respx.mock
+async def test_recovery_from_database_poisoned_cursor(tmp_path: Path) -> None:
+    """Test 3: When a sync_state cursor is ALREADY poisoned (future timestamp
+    pre-written to the database), the next run clamps it to present before use,
+    so the request's start parameter is sane and the cursor is corrected.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    key = _incremental_entity_key("sleeps")
+
+    # Pre-poison the database: write a far-future cursor
+    poisoned_mark = "2099-03-20T08:30:00+00:00"
+    set_sync_state(
+        conn,
+        USER_ID,
+        key,
+        cursor=poisoned_mark,
+        last_run_at=poisoned_mark,
+        outcome="complete",
+    )
+
+    # Run sync with a normal record
+    # Relative to now, not a hardcoded date: "an ordinary record" means one
+    # dated in the past, and a fixed literal silently becomes a *future*
+    # timestamp once the clock passes it -- which this guard then correctly
+    # refuses, failing the test for the opposite of the reason it exists.
+    normal_mark = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    record = make_record("sleeps", 1, normal_mark)
+    routes = mock_collections({"sleeps": {"records": [record], "next_token": None}})
+
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["start"] = request.url.params.get("start")
+        return httpx.Response(200, json={"records": [record], "next_token": None})
+
+    routes["sleeps"].side_effect = handler
+
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    # The start parameter must be clamped to present, not based on the poisoned cursor
+    start_param = captured["start"]
+    assert start_param is not None
+
+    # On main: the request start will still be based on poisoned cursor
+    # (2099 - 60 seconds), so this assertion FAILS
+    start_dt = datetime.fromisoformat(start_param)
+    now = datetime.now(UTC)
+    assert start_dt < now + timedelta(minutes=10), (
+        f"start parameter must be clamped to near-present after recovery: {start_param}"
+    )
+    assert "2099" not in start_param, "start must not reference poisoned year 2099"
+
+    # The cursor must no longer be the poisoned value
+    new_state = get_sync_state(conn, USER_ID, key)
+    assert new_state is not None
+    assert new_state["cursor"] != poisoned_mark, (
+        "cursor must be corrected, not stay at the poisoned far-future value"
+    )
+
+    conn.close()
+
+
+@respx.mock
+async def test_implausible_record_still_upserted_to_store(tmp_path: Path) -> None:
+    """Test 4: A record with an implausible (far-future) updated_at IS still
+    persisted to the store, even though its timestamp doesn't advance the
+    high-water mark. The row exists in the database afterwards.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    future_mark = "2099-11-11T00:00:00+00:00"
+    record = make_record("workouts", 42, future_mark)
+    mock_collections({"workouts": {"records": [record], "next_token": None}})
+
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    # The record is in the store
+    workouts = get_workouts(conn, USER_ID)
+    assert len(workouts) == 1, "implausible record must be upserted to store"
+    assert workouts[0]["id"] == 42
+    assert workouts[0]["updated_at"] == future_mark
+
+    # But the cursor did NOT advance to that future mark
+    state = get_sync_state(conn, USER_ID, _incremental_entity_key("workouts"))
+    assert state is not None
+    stored_cursor = state["cursor"]
+    # On main: stored_cursor == future_mark (poisoned), so this fails
+    assert stored_cursor != future_mark, (
+        "cursor must not advance to the implausible record's timestamp"
+    )
+
+    conn.close()
+
+
+@respx.mock
+async def test_skipped_implausible_field_is_nonzero_when_records_refused(tmp_path: Path) -> None:
+    """Test 5a: EntitySyncResult.skipped_implausible is non-zero when records
+    with implausible updated_at were refused as cursor candidates.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    future_mark = "2099-05-05T15:30:00+00:00"
+    record = make_record("cycles", 7, future_mark)
+    mock_collections({"cycles": {"records": [record], "next_token": None}})
+
+    async with WhoopClient(config, auth) as client:
+        result = await run_sync(conn, client, config, USER_ID)
+
+    # The result for cycles must have a skipped_implausible field
+    # On main: EntitySyncResult has no skipped_implausible field -- FAILS with AttributeError
+    cycle_result = result["cycles"]
+    assert hasattr(cycle_result, "skipped_implausible"), (
+        "EntitySyncResult must have skipped_implausible field"
+    )
+    assert cycle_result.skipped_implausible == 1, (
+        "skipped_implausible must be 1 for the rejected far-future record"
+    )
+
+    conn.close()
+
+
+@respx.mock
+async def test_skipped_implausible_surfaced_in_whoop_sync_tool_response(tmp_path: Path) -> None:
+    """Test 5b: The whoop_sync MCP tool response surfaces skipped_implausible
+    alongside count and cursor.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link_principal_to_member(
+        conn, client_id="__local__", issuer=None, subject=None, whoop_user_id=USER_ID
+    )
+
+    future_mark = "2099-01-01T00:00:00+00:00"
+    record = make_record("recoveries", 99, future_mark)
+    mock_collections({"recoveries": {"records": [record], "next_token": None}})
+
+    server = build_server()
+
+    async with WhoopClient(config, auth) as client:
+        app_context = AppContext(
+            config=config,
+            auth=auth,
+            client=client,
+            principal=Principal(user_id=USER_ID),
+            store_conn=conn,
+        )
+        result = await call_tool(server, "whoop_sync", {}, app_context)
+
+    assert result["synced"] is True
+    # On main: the response doesn't include skipped_implausible -- FAILS
+    assert "entities" in result
+    for entity_info in result["entities"].values():
+        assert "skipped_implausible" in entity_info, (
+            "whoop_sync response must include skipped_implausible per entity"
+        )
+    # recoveries should have skipped_implausible=1
+    assert result["entities"]["recoveries"]["skipped_implausible"] == 1, (
+        "recoveries entity must report 1 skipped implausible record"
+    )
+
+    conn.close()
+
+
+@respx.mock
+async def test_normal_record_with_reasonable_updated_at_still_advances_cursor(
+    tmp_path: Path,
+) -> None:
+    """Test 6a (regression): A record with a normal, reasonable updated_at
+    still advances the high-water mark exactly as before. No regression.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    # Relative to now -- see the note in the sibling test above.
+    normal_mark = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    record = make_record("recoveries", 5, normal_mark)
+    mock_collections({"recoveries": {"records": [record], "next_token": None}})
+
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    state = get_sync_state(conn, USER_ID, _incremental_entity_key("recoveries"))
+    assert state is not None
+    assert state["outcome"] == "complete"
+    # Cursor should be the normal timestamp
+    assert state["cursor"] == normal_mark, "normal record must still advance cursor as before"
+
+    conn.close()
+
+
+@respx.mock
+async def test_slightly_future_within_skew_allowance_is_still_accepted(tmp_path: Path) -> None:
+    """Test 6b (regression): A record with updated_at slightly in the future
+    but WITHIN the 5-minute clock-skew allowance is still accepted as a cursor
+    candidate. This is the whole point of the allowance.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    # 3 minutes in the future (within 5-minute allowance)
+    now = datetime.now(UTC)
+    slightly_future = (now + timedelta(minutes=3)).isoformat()
+    record = make_record("cycles", 11, slightly_future)
+    mock_collections({"cycles": {"records": [record], "next_token": None}})
+
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    state = get_sync_state(conn, USER_ID, _incremental_entity_key("cycles"))
+    assert state is not None
+    # Slightly-future record within allowance should be accepted
+    assert state["cursor"] == slightly_future, (
+        "records within 5-minute skew allowance must still advance the cursor"
+    )
+
+    conn.close()
+
+
+@respx.mock
+async def test_unparseable_updated_at_does_not_advance_cursor_and_does_not_crash(
+    tmp_path: Path,
+) -> None:
+    """Test 7: A record with an unparseable updated_at (e.g. malformed date
+    string, or None) does not advance the cursor and does not raise an
+    exception. The record IS still upserted.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    # Create a record with an unparseable updated_at
+    # (on main, get("updated_at") returns None if not present, so we use None)
+    bad_record = {
+        "id": 123,
+        "start": "2026-01-01T00:00:00Z",
+        "score_state": "SCORED",
+        "updated_at": "not-a-valid-iso-date",
+    }
+    mock_collections({"workouts": {"records": [bad_record], "next_token": None}})
+
+    # This must not raise, even with unparseable date
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    # Record is still upserted
+    workouts = get_workouts(conn, USER_ID)
+    assert len(workouts) == 1, "record with bad updated_at must still be upserted"
+    assert workouts[0]["id"] == 123
+
+    # But cursor must not advance (stays None, or fallback_mark if any)
+    state = get_sync_state(conn, USER_ID, _incremental_entity_key("workouts"))
+    assert state is not None
+    # On main: if high_water_seen stays None, cursor = fallback_mark = None
+    # or might crash with ValueError during datetime parsing
+    # The test verifies it doesn't crash and doesn't advance to the bad value
+    stored_cursor = state["cursor"]
+    assert stored_cursor != "not-a-valid-iso-date", (
+        "cursor must not be set to the unparseable string"
+    )
+
+    conn.close()
+
+
+@respx.mock
+async def test_multiple_records_only_implausible_ones_skip_cursor_advancement(
+    tmp_path: Path,
+) -> None:
+    """Bonus: In a page with multiple records, only implausible ones skip
+    cursor advancement; normal ones can still set the mark. Also, all are
+    upserted regardless.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    # Relative to now, not a hardcoded date: "an ordinary record" means one
+    # dated in the past, and a fixed literal silently becomes a *future*
+    # timestamp once the clock passes it -- which this guard then correctly
+    # refuses, failing the test for the opposite of the reason it exists.
+    normal_mark = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    future_mark = "2099-06-01T00:00:00+00:00"
+
+    normal_record = make_record("sleeps", 1, normal_mark)
+    future_record = make_record("sleeps", 2, future_mark)
+
+    mock_collections(
+        {
+            "sleeps": {
+                "records": [normal_record, future_record],
+                "next_token": None,
+            }
+        }
+    )
+
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    # Both records are upserted
+    sleeps = get_sleeps(conn, USER_ID)
+    assert len(sleeps) == 2, "both records must be upserted"
+
+    # Cursor is set to the normal record's timestamp, not the future one
+    state = get_sync_state(conn, USER_ID, _incremental_entity_key("sleeps"))
+    assert state is not None
+    # On main: cursor would be max of both = future_mark, so this fails
+    stored_cursor = state["cursor"]
+    assert stored_cursor == normal_mark, (
+        "cursor should be from the normal record, skipping the implausible one"
+    )
+
+    conn.close()
+
+
+@respx.mock
+async def test_poisoned_cursor_on_disk_heals_on_the_very_next_run(
+    tmp_path: Path,
+) -> None:
+    """The realizable recovery case: a poisoned cursor and an EMPTY page.
+
+    This is the steady state of a bitten installation, and the only shape that
+    matters. Every earlier recovery test fed the healed run a plausible record,
+    which overwrote the cursor via ``high_water_seen`` and so passed no matter
+    what happened to ``fallback_mark`` -- verified: clamping only ``since`` and
+    leaving ``fallback_mark`` at the raw stored value passed the entire suite
+    while the cursor stayed poisoned forever, i.e. #186 fully intact.
+
+    Such a run is also physically impossible: after clamping, ``since`` is
+    recent, so a real server returns nothing. An empty page is what actually
+    happens, and it is exactly the case in which the run must not write the
+    poison straight back.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    poisoned = "2099-01-01T00:00:00+00:00"
+    set_sync_state(
+        conn,
+        USER_ID,
+        "cycles:incremental",
+        cursor=poisoned,
+        last_run_at="2026-08-01T00:00:00+00:00",
+        outcome="complete",
+    )
+
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["start"] = request.url.params.get("start")
+        return httpx.Response(200, json=EMPTY_PAGE)
+
+    routes = mock_collections({})
+    routes["cycles"].side_effect = handler
+
+    async with WhoopClient(config, auth) as client:
+        result = await run_sync(conn, client, config, USER_ID)
+
+    # The poison must be gone from the cursor, not merely unused this run.
+    state = get_sync_state(conn, USER_ID, "cycles:incremental")
+    assert state is not None
+    assert state["cursor"] != poisoned, (
+        "an empty page must not write the poisoned mark back -- that is the loop "
+        "that made this permanent"
+    )
+    assert state["cursor"] is None, (
+        "a discarded mark means 'no mark', so the next run re-walks losslessly "
+        f"rather than skipping the poisoned window; got {state['cursor']!r}"
+    )
+    assert result["cycles"].high_water_mark is None
+
+    # And the request this run made was a sane window, not one starting in 2099.
+    assert captured["start"] is not None
+    assert datetime.fromisoformat(captured["start"]) < datetime.now(UTC) + timedelta(minutes=10)
+    conn.close()
+
+
+@respx.mock
+async def test_poisoned_value_inside_an_in_progress_cursor_also_heals(
+    tmp_path: Path,
+) -> None:
+    """An interrupted run's JSON cursor can carry the poison too (#186).
+
+    The resume branch reads ``since``/``high_water_seen``/``previous_mark`` out
+    of the stored JSON rather than from the bare cursor, so clamping only the
+    fresh branch left a resumed run requesting a future window and persisting
+    the poison again -- recovery took two runs, with the intervening one
+    rewriting what it was supposed to fix.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    set_sync_state(
+        conn,
+        USER_ID,
+        "cycles:incremental",
+        cursor=json.dumps(
+            {
+                "since": "2098-12-31T23:59:00+00:00",
+                "next_token": None,
+                "high_water_seen": "2099-01-01T00:00:00+00:00",
+                "previous_mark": "2099-01-01T00:00:00+00:00",
+            }
+        ),
+        last_run_at="2026-08-01T00:00:00+00:00",
+        outcome="in_progress",
+    )
+
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["start"] = request.url.params.get("start")
+        return httpx.Response(200, json=EMPTY_PAGE)
+
+    routes = mock_collections({})
+    routes["cycles"].side_effect = handler
+
+    async with WhoopClient(config, auth) as client:
+        await run_sync(conn, client, config, USER_ID)
+
+    assert captured["start"] is not None
+    assert "2098" not in captured["start"] and "2099" not in captured["start"], (
+        f"a resumed run must not request a future window; got {captured['start']}"
+    )
+    state = get_sync_state(conn, USER_ID, "cycles:incremental")
+    assert state is not None
+    assert state["cursor"] is None, (
+        f"the resumed run must not re-persist the poison; got {state['cursor']!r}"
+    )
+    conn.close()
+
+
+@respx.mock
+async def test_skew_allowance_is_bounded_near_its_edge(tmp_path: Path) -> None:
+    """Pin the allowance close to its value, not merely somewhere under a century.
+
+    Every other rejection test uses the year 2099, so the suite as written
+    accepted any allowance below roughly 72 years -- a 30-day allowance left
+    #186 fully exploitable and green. A record just past the edge is what makes
+    the constant mean something; the companion test just inside it is
+    ``test_slightly_future_within_skew_allowance_is_still_accepted``.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+
+    # An ABSOLUTE hour, not `_MAX_CLOCK_SKEW_SECONDS + 60`. Deriving the edge
+    # from the constant makes the test move with it, so a 30-day or 1-hour
+    # allowance still "rejects just past the edge" and #186 stays exploitable
+    # with the suite green -- verified: both of those mutants survived the
+    # relative version. Paired with the +3-minute acceptance test, this pins the
+    # allowance into (3 min, 1 h) rather than merely under a century.
+    just_past_edge = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    record = make_record("cycles", 1, just_past_edge)
+    mock_collections({"cycles": {"records": [record], "next_token": None}})
+
+    async with WhoopClient(config, auth) as client:
+        result = await run_sync(conn, client, config, USER_ID)
+
+    assert result["cycles"].high_water_mark != just_past_edge, (
+        "a record one minute past the allowance must not advance the mark"
+    )
+    assert result["cycles"].skipped_implausible == 1
+    conn.close()
+
+
+@respx.mock
+async def test_a_clean_run_reports_no_skips(tmp_path: Path) -> None:
+    """``skipped_implausible`` must be silent when nothing was refused.
+
+    A counter only ever asserted non-zero is not a signal: hard-coding it to 1
+    passed the whole suite. This is the other half.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    ordinary = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    mock_collections(
+        {"cycles": {"records": [make_record("cycles", 1, ordinary)], "next_token": None}}
+    )
+
+    async with WhoopClient(config, auth) as client:
+        result = await run_sync(conn, client, config, USER_ID)
+
+    assert result["cycles"].high_water_mark == ordinary
+    for name, entity in result.items():
+        assert entity.skipped_implausible == 0, f"{name} refused nothing but reported a skip"
+    conn.close()
+
+
+@respx.mock
+async def test_two_refused_records_are_counted_separately(tmp_path: Path) -> None:
+    """The counter counts, rather than saturating at one.
+
+    Verified necessary: replacing ``+= 1`` with ``= 1`` passed the whole suite,
+    because no test held more than one implausible record.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    mock_collections(
+        {
+            "cycles": {
+                "records": [
+                    make_record("cycles", 1, "2099-01-01T00:00:00+00:00"),
+                    make_record("cycles", 2, "2098-01-01T00:00:00+00:00"),
+                ],
+                "next_token": None,
+            }
+        }
+    )
+
+    async with WhoopClient(config, auth) as client:
+        result = await run_sync(conn, client, config, USER_ID)
+
+    assert result["cycles"].skipped_implausible == 2
+    assert result["cycles"].count == 2, "both records are still stored"
+    conn.close()
+
+
+@respx.mock
+async def test_a_naive_timestamp_is_read_as_utc(tmp_path: Path) -> None:
+    """A timestamp with no offset is treated as UTC, matching the repo convention.
+
+    ``server.py``'s ``_parse_iso`` documents the same rule. Pinned because three
+    mutually contradictory alternatives -- reject naive outright, read it as
+    ``+14:00``, treat it as always plausible -- each passed the whole suite.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    # Naive and in the past when read as UTC, so it must be accepted.
+    naive_past = (datetime.now(UTC) - timedelta(hours=3)).replace(tzinfo=None).isoformat()
+    mock_collections(
+        {"cycles": {"records": [make_record("cycles", 1, naive_past)], "next_token": None}}
+    )
+
+    async with WhoopClient(config, auth) as client:
+        result = await run_sync(conn, client, config, USER_ID)
+
+    assert result["cycles"].high_water_mark == naive_past
+    assert result["cycles"].skipped_implausible == 0
+
+    # A naive value only 6 hours ahead, which is what actually discriminates.
+    # 2099 is far-future under every offset, so it proved nothing: reading naive
+    # as `+14:00` passed the whole suite. Six hours ahead is future as UTC
+    # (refused) but *past* if misread as `+14:00` (accepted), so only the
+    # documented convention passes.
+    conn2 = open_store(":memory:")
+    naive_future = (datetime.now(UTC) + timedelta(hours=6)).replace(tzinfo=None).isoformat()
+    mock_collections(
+        {"cycles": {"records": [make_record("cycles", 2, naive_future)], "next_token": None}}
+    )
+    async with WhoopClient(config, auth) as client:
+        result2 = await run_sync(conn2, client, config, USER_ID)
+    assert result2["cycles"].high_water_mark != naive_future
+    assert result2["cycles"].skipped_implausible == 1
+    conn.close()
+    conn2.close()
