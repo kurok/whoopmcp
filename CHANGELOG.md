@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #173: the four `list_*` tools now reject a `limit` above 1000, matching
+  the bound every analysis path in the same module already applied. The default
+  is unchanged at 25, and the error is raised before any store query.
+
+  **Breaking** for a caller passing `limit > 1000`, which previously succeeded
+  and returned up to that many records in one response. Such a caller must now
+  page. That is the point: `limit` exists so callers page, and an unbounded one
+  with `include_raw=True` materialises a member's whole stored history into a
+  single response -- exactly what the `next_token` machinery avoids.
+
+  It also replaces an opaque failure with a clear one. The list tools pass
+  `limit + 1` to the store as pagination lookahead, so `limit = 2**63 - 1` -- a
+  value SQLite binds without complaint on its own -- became `2**63` and died
+  inside the driver's parameter binding with `OverflowError: Python int too
+  large to convert to SQLite INTEGER`.
+
 - Issue #175: reconciliation could permanently destroy a member's history on
   a WHOOP response that only *looked* successful. The fresh-listing diff ran
   unconditionally, so an empty-but-successful listing -- a 200 with an empty
