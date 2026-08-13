@@ -310,21 +310,26 @@ class EncryptedFileTokenStore:
             # once.
             try:
                 self.save(token)
-            except SealError:
-                # The current key is missing (e.g. a half-completed key
-                # rotation, or a misconfigured environment). The token we
-                # just decrypted is still valid -- availability wins here:
-                # serve it unrotated rather than raise, and try again on
-                # the next load. Contrast with `save` itself, which must
-                # keep raising for a direct caller (see its docstring).
+            except (SealError, OSError) as exc:
+                # Two ways this fails, and neither is a reason to deny the
+                # caller a token that just decrypted perfectly well:
+                # `SealError` when the current key is missing (a
+                # half-completed rotation, or a misconfigured environment),
+                # and `OSError` when the write itself cannot land -- a full
+                # disk, a read-only state directory, a permission change
+                # under us (issue #135). Availability wins: serve it
+                # unrotated and try again on the next load. Contrast with
+                # `save` itself, which must keep raising for a direct
+                # caller (see its docstring).
                 if not self._reseal_warned:
                     self._reseal_warned = True
                     logger.warning(
-                        "could not re-seal token at %s under key version %s: the current "
-                        "key is not available. Serving the existing token unrotated; "
-                        "supply the missing key to complete rotation.",
+                        "could not re-seal token at %s under key version %s (%s): "
+                        "serving the existing token unrotated. Supply the missing key, "
+                        "or make the state directory writable, to complete rotation.",
                         self._path,
                         self._current_version,
+                        type(exc).__name__,
                     )
 
         return token

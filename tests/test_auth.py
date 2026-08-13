@@ -2157,3 +2157,65 @@ def test_json_serialization_unaffected_by_repr_redaction() -> None:
     # Round-trip must work
     restored = Token.from_json(json_str)
     assert restored == token
+
+
+# -- lazy re-seal availability (issue #135) ------------------------------------
+#
+# #103 made a missing re-seal *key* serve the token unrotated instead of raising.
+# The guard it added caught only SealError, so a failure of the WRITE -- a full
+# disk, a read-only state dir -- still escaped, turning a token that decrypted
+# perfectly into a hard load() failure. Same outage, different exception.
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(OSError(28, "No space left on device"), id="disk-full"),
+        pytest.param(PermissionError(13, "Permission denied"), id="read-only-state-dir"),
+    ],
+)
+def test_reseal_write_failure_still_serves_the_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: OSError
+) -> None:
+    """A re-seal whose write fails must not deny the caller a valid token."""
+    key1, key2 = os.urandom(32), os.urandom(32)
+    path = tmp_path / "token.json"
+    EncryptedFileTokenStore(path, keys={1: key1}, current_version=1).save(
+        Token("acc", expires_at=time.time() + 3600, refresh_token="ref")
+    )
+
+    # Rotation pending and the target key IS present, so this is purely a
+    # write failure -- not #103's missing-key case.
+    store = EncryptedFileTokenStore(path, keys={1: key1, 2: key2}, current_version=2)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr("whoopmcp.auth.atomic_write_text", boom)
+
+    token = store.load()
+    assert token is not None, "a write failure must not turn a decryptable token into None"
+    assert token.access_token == "acc"
+
+
+def test_reseal_write_failure_leaves_the_stored_record_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The on-disk record survives a failed re-seal, still readable under its own key."""
+    key1, key2 = os.urandom(32), os.urandom(32)
+    path = tmp_path / "token.json"
+    EncryptedFileTokenStore(path, keys={1: key1}, current_version=1).save(
+        Token("acc", expires_at=time.time() + 3600, refresh_token="ref")
+    )
+    before = path.read_text()
+
+    store = EncryptedFileTokenStore(path, keys={1: key1, 2: key2}, current_version=2)
+    monkeypatch.setattr(
+        "whoopmcp.auth.atomic_write_text",
+        lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+    )
+    store.load()
+
+    assert path.read_text() == before, "a failed re-seal must not corrupt the stored record"
+    reread = EncryptedFileTokenStore(path, keys={1: key1}, current_version=1).load()
+    assert reread is not None and reread.access_token == "acc"
