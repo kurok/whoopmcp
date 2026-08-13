@@ -244,6 +244,13 @@ async def test_token_with_wrong_resource_rejected(monkeypatch: pytest.MonkeyPatc
         expires_at=VALID_EXPIRY,
         resource="https://other-server.example.com",  # Wrong resource!
         subject="user123",
+        # #163: a trusted `iss` is required for this test to reach the check it
+        # is named for. Without `claims`, `_issued_by_trusted_as` rejects the
+        # token first -- `claims=None` is not a dict -- so the test passed even
+        # with `_names_this_resource` stubbed to accept everything. Mirror image
+        # of the #102 note above, which explains the same trap for the
+        # resource-*acceptance* test.
+        claims={"iss": "https://auth.example.com"},
     )
     monkeypatch.setattr(verifier, "_resolve", AsyncMock(return_value=other_resource_token))
 
@@ -278,6 +285,13 @@ async def test_token_with_no_resource_rejected(monkeypatch: pytest.MonkeyPatch) 
         expires_at=VALID_EXPIRY,
         resource=None,  # No resource indicator
         subject="user123",
+        # #163: a trusted `iss` is required for this test to reach the check it
+        # is named for. Without `claims`, `_issued_by_trusted_as` rejects the
+        # token first -- `claims=None` is not a dict -- so the test passed even
+        # with `_names_this_resource` stubbed to accept everything. Mirror image
+        # of the #102 note above, which explains the same trap for the
+        # resource-*acceptance* test.
+        claims={"iss": "https://auth.example.com"},
     )
     monkeypatch.setattr(verifier, "_resolve", AsyncMock(return_value=token_no_resource))
 
@@ -316,6 +330,13 @@ async def test_token_with_empty_string_resource_rejected(monkeypatch: pytest.Mon
         expires_at=VALID_EXPIRY,
         resource="",  # Empty, not missing -- a different code path than None
         subject="user123",
+        # #163: a trusted `iss` is required for this test to reach the check it
+        # is named for. Without `claims`, `_issued_by_trusted_as` rejects the
+        # token first -- `claims=None` is not a dict -- so the test passed even
+        # with `_names_this_resource` stubbed to accept everything. Mirror image
+        # of the #102 note above, which explains the same trap for the
+        # resource-*acceptance* test.
+        claims={"iss": "https://auth.example.com"},
     )
     monkeypatch.setattr(verifier, "_resolve", AsyncMock(return_value=token_empty_resource))
 
