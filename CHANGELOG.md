@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #182: `extract_metric` promised to skip nulls and crashed on one.
+  `_filtered_records` -- the single SCORED-and-key-present filter every analysis
+  path shares -- skipped a record only when the metric key was *absent*. A
+  `SCORED` record carrying the key with an explicit `null` passed the guard and
+  reached `float(None)`, raising `TypeError` out of `summarize_period`,
+  `metric_trend`, `correlate_metrics`, `compare_periods`, `whoop_outliers` and
+  `whoop_streaks` alike. The one case the docstring named was the one case the
+  guard missed.
+
+  The conversion is now guarded, which covers nulls and every other unusable
+  value -- a dict, a list, a non-numeric string -- in one place. Numeric strings
+  still convert, so nothing that worked before stops working, and a record set
+  that is entirely null degrades to `InsufficientDataError` exactly as a
+  genuinely empty one already did.
+
+
 - Issue #190: the file-backed token stores let a raw `OSError` escape `load()`,
   breaking the `Token | None` or `AuthError` contract that `TokenStore`
   documents and that `KeyringTokenStore.load` was already fixed to honour

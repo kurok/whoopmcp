@@ -334,7 +334,28 @@ def _filtered_records(
         score = record.get("score")
         if not score or key not in score:
             continue
-        pairs.append((record, float(score[key])))
+        value = score[key]
+        # `not score` catches a missing or empty score dict and `key not in
+        # score` catches an absent key, but neither catches the key being
+        # present and null -- which is the one case `extract_metric`'s docstring
+        # names, and the one that reached `float(None)` and raised (#182).
+        #
+        # One guard, not two: `float(None)` raises `TypeError`, so the null the
+        # docstring promises to skip is handled by the same conversion guard
+        # that handles every other unusable value -- a dict, a list, a
+        # non-numeric string. An explicit `if value is None: continue` above
+        # this reads well but is unreachable in effect; nothing can tell the two
+        # versions apart, which is a good reason not to carry both.
+        #
+        # Skipping rather than raising keeps one malformed record from taking
+        # down a whole window's analysis, and raising `TypeError`/`ValueError`
+        # out of a filter every analysis path shares is the same opaque,
+        # low-level failure #173 and #179 removed elsewhere. Numeric strings
+        # still convert, so nothing that worked before stops working.
+        try:
+            pairs.append((record, float(value)))
+        except (TypeError, ValueError):
+            continue
     return pairs
 
 
