@@ -1058,6 +1058,20 @@ def _with_created_at_fallback(record: dict[str, Any]) -> dict[str, Any]:
     return {**record, "created_at": record.get("start")}
 
 
+#: Maximum value for a cursor offset. This is SQLite's own signed-64-bit parameter
+#: limit, not a product decision. Unlike ``limit`` (capped at 1000 because a response
+#: should stay pageable), an offset legitimately grows without bound as a member
+#: accumulates history, so there is no smaller defensible ceiling -- the only real
+#: constraint is what the driver can bind. Above it, ``sqlite3`` raises
+#: ``OverflowError: Python int too large to convert to SQLite INTEGER`` from inside
+#: parameter binding.
+_MAX_CURSOR_OFFSET = 2**63 - 1
+
+#: The single message every rejected cursor gets. A constant so the "identical
+#: for every case" property cannot drift as raise sites are added.
+_CURSOR_REJECTED = "next_token is not a valid pagination cursor"
+
+
 def _decode_store_cursor(next_token: str | None) -> tuple[int, str | None, str | None]:
     """This module's own opaque store-pagination cursor: ``(offset, start,
     end)``. Bounds are baked into the cursor at the page that created it,
@@ -1072,13 +1086,70 @@ def _decode_store_cursor(next_token: str | None) -> tuple[int, str | None, str |
     ``json.loads`` on any string argument whose field annotation is not
     exactly ``str`` -- a bare ``{"offset": ...}`` token would silently arrive
     at this function as an already-parsed ``dict``, not the string this
-    signature (and pydantic's own arg validation) expects. base64 text is
-    never valid JSON syntax, so it always survives that pre-parse untouched.
+    signature (and pydantic's own arg validation) expects. Realistic base64 is
+    not valid JSON, so a real cursor survives that pre-parse untouched.
+
+    "Not valid JSON" is very nearly true rather than exactly true, which is worth
+    stating precisely since the guarantee below is absolute. The bare literals
+    ``null``/``true`` and any digit-only string are both legal base64 text and
+    legal JSON, so the SDK does parse those: ``true`` and ``1234`` become a bool
+    and an int, which pydantic then rejects against ``str | None``, while
+    ``null`` becomes ``None`` and is read here as "no cursor", i.e. the first
+    page. Harmless in each case, and unreachable from a token this module
+    issues -- every real one is far longer than four characters.
+
+    Every malformed or out-of-range cursor raises one identical, caller-opaque
+    ``ValueError`` (#179). Identical because the distinctions a caller could draw
+    between "not base64", "missing key" and "offset too large" tell them only
+    about a token they forged themselves; and opaque because the token is
+    caller-controlled input, so neither it nor the underlying exception text is
+    reflected back into the message. The original is chained with ``raise ...
+    from exc``, which keeps it on the traceback for a developer without putting
+    it in front of a caller.
     """
     if next_token is None:
         return 0, None, None
-    payload = json.loads(base64.urlsafe_b64decode(next_token.encode("ascii")).decode("utf-8"))
-    return int(payload["offset"]), payload["start"], payload["end"]
+
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(next_token.encode("ascii")).decode("utf-8"))
+        offset, start, end = payload["offset"], payload["start"], payload["end"]
+    except (
+        # binascii.Error, UnicodeDecodeError and json.JSONDecodeError are all
+        # ValueError subclasses, so ValueError alone covers the whole decode.
+        # KeyError is a missing field; TypeError is indexing a payload that
+        # decoded to a list, string or number, which is why no isinstance check
+        # on the container is needed.
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError(_CURSOR_REJECTED) from exc
+
+    # Check the decoded types rather than coercing them. `int(payload["offset"])`
+    # looked equivalent and was not: `json.loads` accepts the non-standard
+    # literals `Infinity`/`-Infinity` and overflows any too-large float literal
+    # to `float("inf")`, and `int(float("inf"))` raises OverflowError -- which is
+    # an ArithmeticError, not a ValueError, so it sailed past the handler above
+    # and reached the caller as exactly the driver-level failure this function
+    # exists to prevent. Coercion also quietly accepted `"12"`, `2.9` and `true`.
+    #
+    # `start`/`end` are checked for the same reason: they are decoded from the
+    # same untrusted token and passed to the same query, where a dict or list
+    # raises `sqlite3.ProgrammingError: Error binding parameter`.
+    #
+    # bool is excluded explicitly because it is an int subclass, so `true` would
+    # otherwise satisfy the offset check as 1.
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise ValueError(_CURSOR_REJECTED)
+    if not 0 <= offset <= _MAX_CURSOR_OFFSET:
+        raise ValueError(_CURSOR_REJECTED)
+    if not all(bound is None or isinstance(bound, str) for bound in (start, end)):
+        raise ValueError(_CURSOR_REJECTED)
+
+    # Nothing here over-rejects a cursor this module issues: _encode_store_cursor
+    # emits exactly {"offset": int, "start": str|None, "end": str|None}, and JSON
+    # round-trips each of those to the same Python type.
+    return offset, start, end
 
 
 def _encode_store_cursor(offset: int, start: str | None, end: str | None) -> str:

@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #179: a forged `next_token` reached SQLite unchecked. `_decode_store_cursor`
+  base64-decoded a caller-supplied cursor, `int()`-ed its `offset` and passed the
+  result straight to a store query with no bounds and no error handling. Two
+  consequences, both verified:
+
+  - An offset above `2**63 - 1` died inside the driver's parameter binding with
+    `OverflowError: Python int too large to convert to SQLite INTEGER` -- the same
+    opaque failure #173 was filed to remove, reached by the sibling parameter.
+  - A *negative* offset was accepted silently. SQLite treats a negative `OFFSET`
+    as 0, so such a cursor re-served rows the caller had already been given
+    instead of failing.
+
+  Malformed cursors also surfaced whatever the decode happened to throw --
+  `binascii.Error`, `json.JSONDecodeError`, `KeyError`, `TypeError`, or a
+  `ValueError` from `int()` -- rather than a clear "that cursor is not valid".
+
+  The decoded fields are now type-checked rather than coerced. `int(offset)`
+  looked equivalent and was not: `json.loads` accepts the non-standard literals
+  `Infinity`/`-Infinity` and overflows a too-large float literal to
+  `float("inf")`, and `int(float("inf"))` raises `OverflowError` -- an
+  `ArithmeticError`, not a `ValueError`, so it escaped the decode handler and
+  reached the caller as the same driver-level failure. `start` and `end` are
+  checked too: they come from the same untrusted token and reach the same query,
+  where a dict or list raises `sqlite3.ProgrammingError: Error binding
+  parameter`.
+
+  All of these now raise one identical `ValueError`. The message deliberately
+  names nothing specific: the distinctions tell a caller only about a token they
+  forged themselves, and the token is caller-controlled input, so neither it nor
+  the underlying exception text is reflected back. The original is chained with
+  `raise ... from exc` so it stays on the traceback for a developer.
+
+  The ceiling is `2**63 - 1` because that is SQLite's own signed-64-bit binding
+  limit, not a product decision. Unlike `limit`, an offset legitimately grows
+  with a member's history, so there is no smaller defensible number.
+
+
 - Issue #173: the four `list_*` tools now reject a `limit` above 1000, matching
   the bound every analysis path in the same module already applied. The default
   is unchanged at 25, and the error is raised before any store query.
