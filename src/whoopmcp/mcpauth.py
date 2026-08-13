@@ -48,6 +48,7 @@ the authorization server's job, not this server's.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -179,6 +180,38 @@ def _issued_by_trusted_as(access_token: AccessToken, config: MCPAuthConfig) -> b
     )
 
 
+def _is_unexpired(access_token: AccessToken) -> bool:
+    """Whether `access_token` carries a bounded lifetime that has not ended.
+
+    False for an expired token **and** for one whose `expires_at` is `None` --
+    see `verify_token` for why absent is treated as invalid rather than as
+    unbounded-and-acceptable, and #121 for the decision.
+
+    Acceptance requires `expires_at > now`, so a token whose expiry is exactly
+    now is rejected: RFC 7519 requires the current time to be strictly *before*
+    `exp`, leaving such a token no lifetime at all.
+
+    `is None` is tested explicitly rather than relying on truthiness, because
+    `expires_at = 0` is a real value -- the epoch, comprehensively expired --
+    that a falsy check would read as "no expiry set" and wave through. The
+    SDK's own `BearerAuthBackend` has exactly that bug; this does not copy it.
+
+    The `int` shape is checked for the same reason `_issued_by_trusted_as`
+    checks `claims`: `model_construct` bypasses pydantic's validation and a
+    future non-pydantic resolver need not honour the declared type at all. A
+    `str` or a `datetime` here would raise `TypeError` out of a token verifier
+    -- surfacing as a 500 rather than a 401 -- and an object with a custom
+    `__gt__` could return True and be *accepted*. Rejecting an unreadable
+    expiry is the only safe reading. (`bool` is an `int` subclass and passes
+    the check, which is harmless: True and False are 1 and 0, both long
+    expired.)
+    """
+    expires_at = access_token.expires_at
+    if not isinstance(expires_at, int):
+        return False
+    return expires_at > int(time.time())
+
+
 def _without_one_trailing_slash(url: str) -> str:
     """`url` with a single trailing slash removed, if it has one.
 
@@ -221,11 +254,47 @@ class MCPTokenVerifier(TokenVerifier):
         validate an audience or issuer against), if the token cannot be
         resolved at all (see `_resolve`), if the resolved token's resource
         claim does not name this server (RFC 8707, `_names_this_resource`),
-        or if its issuer is not one of `self.config.authorization_servers`
-        (`_issued_by_trusted_as`). Both checks run unconditionally, in this
-        order, and neither passing lets the other be skipped -- an
-        audience-correct token from an untrusted issuer is exactly the
-        substitution this second check exists to close.
+        if its issuer is not one of `self.config.authorization_servers`
+        (`_issued_by_trusted_as`), or -- since #121 -- if it is expired or
+        carries no expiry at all. Every check runs unconditionally and none
+        passing lets another be skipped: an audience-correct token from an
+        untrusted issuer is exactly the substitution the issuer check exists to
+        close, and an unexpired-looking token from a trusted issuer is still
+        worthless if its lifetime has ended.
+
+        **Expiry was previously enforced by nobody.** This docstring used to
+        enumerate the rejection reasons and simply omit it, which is how the gap
+        survived. The SDK's `RequireAuthMiddleware` -- the layer that would
+        otherwise cover it -- has zero `expires_at` references (checked against
+        the installed SDK). `BearerAuthBackend.authenticate` does check, but as
+        `if auth_info.expires_at and auth_info.expires_at < int(time.time())`,
+        so `expires_at = 0` is falsy and read as *not expired*. The check here
+        is deliberately not a copy of that: `is None` is tested explicitly, the
+        value's `int` shape is verified so an unreadable expiry cannot raise out
+        of a verifier, and acceptance requires `expires_at > now` -- rejecting a
+        token expiring exactly now, because RFC 7519 requires the current time
+        to be strictly *before* `exp`.
+
+        **A token with no expiry is rejected, not accepted.** Recorded on #121
+        as a decision rather than left implicit. Every other branch here already
+        treats missing information as grounds for rejection -- no config, no
+        resolution, no matching resource -- so accepting an expiry-less token
+        would make it the one place where absent information reads as
+        permission. `AccessToken.expires_at` *defaults* to `None`, so a resolver
+        that simply forgets to populate it produces one, and the result would be
+        a permanent credential to a year of someone's physiological data. The
+        failure modes are asymmetric: rejecting fails loudly the first time a
+        real resolver is wired up, accepting fails silently forever.
+
+        No clock skew is allowed, deliberately. Adding leeway is a policy choice
+        this issue does not call for, and a resolver that wants it can adjust
+        `expires_at` itself, where the tolerance would be visible.
+
+        **No scope check here, on purpose.** `TokenVerifier.verify_token` takes
+        no `required_scopes`, so scopes cannot be checked against a caller's
+        requirement at this layer, and `RequireAuthMiddleware` already enforces
+        them (5 references, checked against the installed SDK). Adding one here
+        would be a second source of truth that could drift from the first.
         """
         if self.config is None:
             return None
@@ -236,6 +305,8 @@ class MCPTokenVerifier(TokenVerifier):
             return None
         if not _issued_by_trusted_as(access_token, self.config):
             return None
+        if not _is_unexpired(access_token):
+            return None
         return access_token
 
     async def _resolve(self, token: str) -> AccessToken | None:
@@ -244,9 +315,28 @@ class MCPTokenVerifier(TokenVerifier):
         Stub pending a real external-AS integration -- see the class
         docstring for why that choice is not this issue's to make. `token`
         is unused for now; the parameter stays so a real resolver's signature
-        doesn't need to change to plug in here. A future real resolver does
-        not need to re-check `claims["iss"]` itself: `verify_token` already
-        applies `_issued_by_trusted_as` to whatever this returns.
+        doesn't need to change to plug in here.
+
+        **What a real resolver inherits from `verify_token`, and what it does
+        not** (#121, the same shape of note #102 added for `iss`):
+
+        Inherited -- do not re-implement: the issuer check
+        (`_issued_by_trusted_as`), the audience check (`_names_this_resource`),
+        and the expiry check (`_is_unexpired`, which also rejects a token with
+        no `expires_at`). Populate `claims["iss"]`, `resource` and `expires_at`
+        faithfully and `verify_token` will enforce them.
+
+        **Not inherited, and not enforceable there: the cryptographic binding.**
+        By the time `verify_token` has an `AccessToken`, this method has already
+        decided the token is genuine; both checks above then read `resource` and
+        `claims["iss"]` as *data*. A resolver that decodes a JWT without
+        verifying its signature -- or accepts `alg: none` -- lets an attacker
+        forge an `iss` naming a trusted AS and a `resource` naming this server,
+        and every check downstream passes. Verifying the signature against the
+        AS's JWKS, or introspecting the token per RFC 7662, is this method's job
+        and cannot be moved without inverting the design. That obligation is
+        stated here because it is invisible from `verify_token`'s own code,
+        which is precisely how it would be missed.
         """
         del token
         return None

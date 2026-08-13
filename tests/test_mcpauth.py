@@ -8,11 +8,13 @@ implementation of mcpauth.py and assert on its module invariants.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from mcp.server.auth.provider import AccessToken
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.auth import ProtectedResourceMetadata
 from pydantic import AnyHttpUrl
@@ -25,6 +27,17 @@ from whoopmcp.mcpauth import (
     setup_mcp_auth,
 )
 from whoopmcp.server import build_server
+
+# #121: `verify_token` now rejects a token with no `expires_at`, so every
+# AccessToken built here needs one. The negative tests need it just as much as
+# the positive ones: a token meant to be rejected for its *resource* or *issuer*
+# must not start being rejected for a missing expiry instead, or the check it
+# was written to exercise stops being exercised at all. Same trap the #102 note
+# below describes for `iss`.
+# A day, not an hour: this is computed once at import, and an hour would make
+# every token here expire if the module were ever imported long before the
+# tests ran. The suite takes seconds, so this is belt-and-braces.
+VALID_EXPIRY = int(time.time()) + 86400
 
 
 @pytest.fixture
@@ -183,6 +196,7 @@ async def test_token_naming_this_resource_is_accepted(monkeypatch: pytest.Monkey
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",  # Matches resource_url exactly
         subject="user123",
         # issue #102: verify_token now also enforces the issuer, so this
@@ -227,6 +241,7 @@ async def test_token_with_wrong_resource_rejected(monkeypatch: pytest.MonkeyPatc
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://other-server.example.com",  # Wrong resource!
         subject="user123",
     )
@@ -260,6 +275,7 @@ async def test_token_with_no_resource_rejected(monkeypatch: pytest.MonkeyPatch) 
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource=None,  # No resource indicator
         subject="user123",
     )
@@ -297,6 +313,7 @@ async def test_token_with_empty_string_resource_rejected(monkeypatch: pytest.Mon
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="",  # Empty, not missing -- a different code path than None
         subject="user123",
     )
@@ -483,6 +500,7 @@ async def test_token_issued_by_untrusted_issuer_rejected_headline(
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",  # Correct resource
         subject="user123",
         claims={"iss": "https://attacker-as.com"},  # WRONG issuer
@@ -516,6 +534,7 @@ async def test_token_issued_by_trusted_issuer_accepted(
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": "https://trusted-as.example.com"},
@@ -551,6 +570,7 @@ async def test_token_with_no_claims_rejected(
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims=None,  # No claims, so no issuer information
@@ -584,6 +604,7 @@ async def test_token_with_claims_but_no_iss_rejected(
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"sub": "user123"},  # Claims present but iss missing
@@ -619,6 +640,7 @@ async def test_token_with_non_string_iss_rejected_no_exception(
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": 12345},  # int, not string
@@ -632,6 +654,7 @@ async def test_token_with_non_string_iss_rejected_no_exception(
         token="token456",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": ["https://example.com"]},  # list, not string
@@ -645,6 +668,7 @@ async def test_token_with_non_string_iss_rejected_no_exception(
         token="token789",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": None},  # Explicitly None in claims
@@ -685,6 +709,7 @@ async def test_trailing_slash_equivalence_both_directions(
         token="token1",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": "https://as.example.com"},
@@ -704,6 +729,7 @@ async def test_trailing_slash_equivalence_both_directions(
         token="token2",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": "https://as.example.com/"},
@@ -723,6 +749,7 @@ async def test_trailing_slash_equivalence_both_directions(
         token="token3",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": "https://as.example.com"},
@@ -742,6 +769,7 @@ async def test_trailing_slash_equivalence_both_directions(
         token="token4",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": "https://as.example.com/"},
@@ -782,6 +810,7 @@ async def test_issuer_near_misses_all_rejected(
         token="token1",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": "https://good-as.example.com.evil.com"},  # Evil domain
@@ -801,6 +830,7 @@ async def test_issuer_near_misses_all_rejected(
         token="token2",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": "https://good-as.example.com:8443"},  # Wrong port
@@ -820,6 +850,7 @@ async def test_issuer_near_misses_all_rejected(
         token="token3",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": "https://good-as.example.com/x"},  # Wrong path
@@ -856,6 +887,7 @@ async def test_multiple_trusted_issuers_second_one_accepted(
         token="token123",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",
         subject="user123",
         claims={"iss": "https://as2.example.com"},
@@ -893,6 +925,7 @@ async def test_both_issuer_and_resource_checks_must_pass(
         token="token1",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://other-server.example.com/mcp",  # WRONG resource
         subject="user123",
         claims={"iss": "https://trusted-as.example.com"},
@@ -912,6 +945,7 @@ async def test_both_issuer_and_resource_checks_must_pass(
         token="token2",
         client_id="client1",
         scopes=["read"],
+        expires_at=VALID_EXPIRY,
         resource="https://whoopmcp.example.com/mcp",  # Correct resource
         subject="user123",
         claims={"iss": "https://untrusted-as.example.com"},  # WRONG issuer
@@ -919,3 +953,197 @@ async def test_both_issuer_and_resource_checks_must_pass(
     monkeypatch.setattr(verifier2, "_resolve", AsyncMock(return_value=token2))
     result2 = await verifier2.verify_token(token2.token)
     assert result2 is None, "Untrusted issuer + correct resource must be rejected"
+
+
+# -- Token expiry (issue #121) -------------------------------------------------
+#
+# Before this, expiry was enforced by nobody. `verify_token` did not check it and
+# its docstring did not mention it; the SDK's `RequireAuthMiddleware` has zero
+# `expires_at` references. `BearerAuthBackend.authenticate` does check, so the
+# demo route was covered on the wire -- but any integration calling
+# `verify_token` directly inherited no expiry check at all.
+
+
+def _valid_token(expires_at: int | None) -> AccessToken:
+    """A token that passes every check except, possibly, expiry."""
+    return AccessToken(
+        token="token-expiry",
+        client_id="client1",
+        scopes=["read"],
+        expires_at=expires_at,
+        resource="https://whoopmcp.example.com/mcp",
+        subject="user123",
+        claims={"iss": "https://auth.example.com"},
+    )
+
+
+def _verifier_for_expiry(monkeypatch: pytest.MonkeyPatch, token: AccessToken) -> MCPTokenVerifier:
+    verifier = MCPTokenVerifier()
+    verifier.config = MCPAuthConfig(
+        resource_url=AnyHttpUrl("https://whoopmcp.example.com/mcp"),
+        authorization_servers=[AnyHttpUrl("https://auth.example.com")],
+    )
+    monkeypatch.setattr(verifier, "_resolve", AsyncMock(return_value=token))
+    return verifier
+
+
+async def test_expired_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token whose lifetime has ended is rejected, audience and issuer intact."""
+    token = _valid_token(int(time.time()) - 1)
+    verifier = _verifier_for_expiry(monkeypatch, token)
+    assert await verifier.verify_token(token.token) is None
+
+
+async def test_unexpired_token_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The companion positive case: without it, `_is_unexpired` could `return
+    False` and every expiry test here would still pass."""
+    token = _valid_token(int(time.time()) + 3600)
+    verifier = _verifier_for_expiry(monkeypatch, token)
+    assert await verifier.verify_token(token.token) is token
+
+
+async def test_token_with_no_expiry_is_rejected_as_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#121's one real decision, recorded on the issue and pinned here.
+
+    `expires_at` is `None` -- and `AccessToken` *defaults* it to `None`, so a
+    resolver that simply forgets to set it produces exactly this. Accepting it
+    would mean a permanent credential to a year of someone's physiological data,
+    granted silently. Every other branch in `verify_token` already treats
+    missing information as grounds for rejection; this one is no different.
+    """
+    token = _valid_token(None)
+    verifier = _verifier_for_expiry(monkeypatch, token)
+    assert await verifier.verify_token(token.token) is None
+
+
+async def test_epoch_expiry_is_rejected_not_read_as_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`expires_at = 0` is the epoch -- comprehensively expired -- not "unset".
+
+    The SDK's own `BearerAuthBackend` gets this wrong: it guards with
+    `if auth_info.expires_at and ...`, so a falsy 0 is read as "no expiry to
+    check" and waved through. `_is_unexpired` tests `is None` explicitly so the
+    two cases stay distinct. This test is what stops someone "simplifying" it
+    back into a truthiness check.
+    """
+    token = _valid_token(0)
+    verifier = _verifier_for_expiry(monkeypatch, token)
+    assert await verifier.verify_token(token.token) is None
+
+
+async def test_expiry_exactly_now_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RFC 7519 requires the current time to be strictly *before* `exp`, so a
+    token expiring exactly now has no lifetime left. Pins the `<=` boundary
+    against a future `<`."""
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: float(now))
+    token = _valid_token(now)
+    verifier = _verifier_for_expiry(monkeypatch, token)
+    assert await verifier.verify_token(token.token) is None
+
+
+async def test_expiry_is_checked_independently_of_resource_and_issuer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired token from a trusted issuer naming this resource is still
+    rejected -- no check passing lets another be skipped."""
+    token = AccessToken(
+        token="token-combo",
+        client_id="client1",
+        scopes=["read"],
+        expires_at=int(time.time()) - 3600,
+        resource="https://whoopmcp.example.com/mcp",
+        subject="user123",
+        claims={"iss": "https://auth.example.com"},
+    )
+    verifier = _verifier_for_expiry(monkeypatch, token)
+    assert await verifier.verify_token(token.token) is None
+
+
+def test_verify_token_cannot_check_scopes_against_a_callers_requirement() -> None:
+    """Scope enforcement stays one layer up, and this pins the structural reason.
+
+    `TokenVerifier.verify_token(self, token: str)` has no `required_scopes`
+    parameter, so it *cannot* check scopes against what a particular caller
+    requires -- it has no way to learn that. `RequireAuthMiddleware` takes
+    `required_scopes` and enforces them. A check here would be a second source
+    of truth, free to drift from the first.
+
+    This asserts only the part that is genuinely provable: the signature. An
+    earlier version of this test also scanned the function body for the string
+    `required_scopes`, which reads like a tripwire and is not one -- a scope
+    check spelled with a helper (`_scopes_sufficient(...)`, matching this
+    module's own idiom), or with a hardcoded scope name, passes it while doing
+    exactly the thing the test claims to prevent. Asserting the signature and
+    saying so is more honest than a scan that looks stronger than it is. The
+    docstring on `verify_token` is the real control here.
+    """
+    import inspect
+
+    signature = inspect.signature(MCPTokenVerifier.verify_token)
+    assert list(signature.parameters) == ["self", "token"], (
+        "verify_token grew a parameter -- if it is required_scopes, the reasoning "
+        "in its docstring and the division of labour with RequireAuthMiddleware "
+        "both need revisiting"
+    )
+
+
+async def test_unreadable_expiry_is_rejected_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An `expires_at` that is not an int must be rejected, never raise.
+
+    `_issued_by_trusted_as` already holds this standard, in its own words: a
+    future non-pydantic resolver "need not honour the type at all", so a
+    malformed value should be "rejected rather than raising ... out of a token
+    verifier". `_is_unexpired` was the one check in this module that did not
+    meet it, which review caught.
+
+    It matters because of where the exception would surface: nothing between
+    `verify_token` and Starlette catches it, so a `TypeError` here becomes a 500
+    rather than a 401 -- an unauthenticated caller crashing the auth boundary.
+    `model_construct` is how a malformed token is built, exactly as the
+    `claims` hardening above anticipates.
+    """
+    for label, bad in (("a string", "abc"), ("an object", object()), ("a float", 1.5)):
+        token = AccessToken.model_construct(
+            token="token-bad-expiry",
+            client_id="client1",
+            scopes=["read"],
+            expires_at=bad,
+            resource="https://whoopmcp.example.com/mcp",
+            subject="user123",
+            claims={"iss": "https://auth.example.com"},
+        )
+        verifier = _verifier_for_expiry(monkeypatch, token)
+        assert await verifier.verify_token(token.token) is None, f"{label} expiry was not rejected"
+
+
+async def test_expiry_with_a_hostile_comparison_cannot_buy_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sharper half of the same defect: an object whose `__gt__` returns
+    True was *accepted*, not merely a crash.
+
+    Rejecting on shape closes both. Kept separate from the TypeError cases
+    because this one is a false accept -- the direction that actually grants
+    access -- and would survive a fix that only wrapped the comparison in a
+    try/except.
+    """
+
+    class AlwaysNewer:
+        def __gt__(self, other: object) -> bool:
+            return True
+
+    token = AccessToken.model_construct(
+        token="token-hostile-expiry",
+        client_id="client1",
+        scopes=["read"],
+        expires_at=AlwaysNewer(),
+        resource="https://whoopmcp.example.com/mcp",
+        subject="user123",
+        claims={"iss": "https://auth.example.com"},
+    )
+    verifier = _verifier_for_expiry(monkeypatch, token)
+    assert await verifier.verify_token(token.token) is None
