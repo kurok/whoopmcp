@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -1342,3 +1343,311 @@ def test_genuine_decrypt_failure_still_raises_autherror(tmp_path: Path) -> None:
     # Must raise AuthError (decrypt failure), not SealError
     with pytest.raises(AuthError, match="failed to decrypt"):
         store.load()
+
+
+# -- logout() interlock with in-flight refresh (issue #123) --------------------
+#
+# When a refresh is in flight and logout() runs, the refresh must not
+# overwrite the now-empty store. Tests 1 and 2 MUST FAIL against current main
+# (before the epoch fix is implemented), confirming the credentials resurrect.
+
+
+async def test_logout_during_refresh_leaves_store_empty(config: Config) -> None:
+    """Test 1 (headline): Start a refresh, call logout() while in flight, assert
+    the store is still empty and self._token is None.
+
+    MUST FAIL against current main -- the resurrected token is expected to be
+    in the store and self._token after the refresh completes.
+    """
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    refresh_started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def slow_refresh(request: httpx.Request) -> httpx.Response:
+        refresh_started.set()
+        await proceed.wait()
+        await asyncio.sleep(0.01)
+        return _mock_new_token_response()
+
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(side_effect=slow_refresh)
+
+        auth = Authenticator(config)
+        # Start the refresh in a task
+        refresh_task = asyncio.create_task(auth.access_token())
+
+        # Wait for the refresh to start (POST is in flight)
+        await refresh_started.wait()
+
+        # Call logout() synchronously while refresh is in flight
+        auth.logout()
+
+        # Let the refresh complete
+        proceed.set()
+
+        # The refresh completes and returns a token to its own caller,
+        # but that token must NOT be persisted. It's also acceptable if
+        # logout causes a later error, but for now we expect the caller
+        # to get the token.
+        with contextlib.suppress(AuthError):
+            await refresh_task
+
+        # CRITICAL ASSERTION: the store must be empty
+        assert store.load() is None, (
+            f"store should be empty after logout during refresh, but contains {store.load()}"
+        )
+        assert auth._token is None, "auth._token should be None after logout"
+
+
+async def test_revoke_and_forget_during_refresh_leaves_store_empty(config: Config) -> None:
+    """Test 2: `revoke_and_forget()` must also not be undone by an in-flight refresh.
+
+    The interleaving matters and the obvious one does not test anything.
+    `revoke_and_forget` refreshes first when the stored token is expired, so a
+    refresh started beforehand simply *coalesces* onto the same task -- the
+    save then happens before the revoke, and the test passes on unfixed code
+    while proving nothing (this is exactly how the first version of this test
+    was vacuous).
+
+    So: hold the store's token LIVE (no refresh needed inside
+    `revoke_and_forget`), gate its DELETE, start a *separate* refresh while
+    that DELETE is in flight, then let the DELETE finish -- which runs
+    `logout()` and bumps the epoch -- and only then let the refresh complete.
+    The refresh must find the epoch changed and discard its result.
+    """
+    store = FileTokenStore(config.token_path)
+    live_token = Token("live-access", expires_at=time.time() + 3600, refresh_token="live-refresh")
+    store.save(live_token)
+
+    delete_started = asyncio.Event()
+    finish_delete = asyncio.Event()
+    finish_refresh = asyncio.Event()
+
+    async def gated_delete(request: httpx.Request) -> httpx.Response:
+        delete_started.set()
+        await finish_delete.wait()
+        return httpx.Response(204)
+
+    async def gated_refresh(request: httpx.Request) -> httpx.Response:
+        await finish_refresh.wait()
+        return _mock_new_token_response()
+
+    with respx.mock:
+        respx.delete(USER_ACCESS_URL).mock(side_effect=gated_delete)
+        respx.post(TOKEN_URL).mock(side_effect=gated_refresh)
+
+        auth = Authenticator(config)
+        revoke_task = asyncio.create_task(auth.revoke_and_forget())
+        await delete_started.wait()
+
+        # A refresh now in flight, started while the revoke is mid-DELETE.
+        refresh_task = asyncio.create_task(
+            auth.refresh(
+                Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+            )
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if auth._inflight_refresh is not None:
+                break
+
+        finish_delete.set()
+        with contextlib.suppress(AuthError):
+            await revoke_task
+        assert store.load() is None, "revoke_and_forget should have cleared the store"
+
+        finish_refresh.set()
+        with contextlib.suppress(AuthError):
+            await refresh_task
+
+        assert store.load() is None, (
+            "a refresh completing after revoke_and_forget must not repopulate the store, "
+            f"but it contains {store.load()}"
+        )
+        assert auth._token is None, "the discarded refresh must not become the session credential"
+
+
+async def test_refresh_without_logout_still_persists_normally(config: Config) -> None:
+    """Test 3: Regression test. A normal refresh with no interleaved logout
+    still persists the token and sets self._token exactly as before.
+
+    This ensures the fix doesn't break the happy path.
+    """
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(return_value=_mock_new_token_response())
+
+        auth = Authenticator(config)
+        result = await auth.access_token()
+
+    assert result == "new-access"
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.access_token == "new-access"
+    assert persisted.refresh_token == "new-refresh"
+    assert auth._token == persisted
+
+
+async def test_concurrent_refresh_still_coalesces_with_one_request(config: Config) -> None:
+    """Test 4: Coalescing still works. Two concurrent refresh() calls issue
+    exactly one token-endpoint request.
+
+    This ensures the epoch fix doesn't break the coalescing optimization.
+    """
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(return_value=_mock_new_token_response())
+
+        auth = Authenticator(config)
+        results = await asyncio.gather(
+            auth.refresh(expired),
+            auth.refresh(expired),
+        )
+
+    # CRITICAL ASSERTION: exactly one request, not two
+    assert route.call_count == 1, (
+        f"expected 1 token endpoint request for coalesced refresh, got {route.call_count}"
+    )
+    assert results[0] == results[1]
+    assert results[0].access_token == "new-access"
+
+
+async def test_logout_during_refresh_does_not_raise_out_of_caller(config: Config) -> None:
+    """Test 5: Logout during refresh does not crash the caller.
+
+    The tool call that triggered the refresh may finish with whatever token it
+    obtained. It must not crash due to the interleaved logout.
+    """
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    refresh_started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def slow_refresh(request: httpx.Request) -> httpx.Response:
+        refresh_started.set()
+        await proceed.wait()
+        await asyncio.sleep(0.01)
+        return _mock_new_token_response()
+
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(side_effect=slow_refresh)
+
+        auth = Authenticator(config)
+        refresh_task = asyncio.create_task(auth.refresh(expired))
+
+        await refresh_started.wait()
+        auth.logout()
+        proceed.set()
+
+        # The caller must not crash
+        result = await refresh_task
+
+        # The caller gets the token (it's not persisted, but the caller gets what they asked for)
+        assert result is not None
+        assert result.access_token == "new-access"
+
+
+async def test_refresh_after_logout_works_normally(config: Config) -> None:
+    """Test 6: A later, post-logout refresh works normally.
+
+    The epoch must not permanently wedge the store. After logout and a fresh
+    login, refresh should work normally again.
+    """
+    store = FileTokenStore(config.token_path)
+
+    # First: login, then logout, confirm store is empty
+    token = Token("old-access", expires_at=time.time() + 3600, refresh_token="old-refresh")
+    store.save(token)
+
+    auth = Authenticator(config)
+    auth.logout()
+
+    assert store.load() is None
+
+    # Now re-login (simulate exchange_code or direct store.save)
+    new_token = Token("access-2", expires_at=time.time() - 100, refresh_token="refresh-2")
+    store.save(new_token)
+
+    # Refresh should work normally
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(return_value=_mock_new_token_response())
+
+        result = await auth.refresh(new_token)
+
+    assert result.access_token == "new-access"
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.access_token == "new-access"
+    assert auth._token == persisted
+
+
+async def test_logout_before_refresh_task_starts_leaves_store_empty(config: Config) -> None:
+    """Regression test for review finding B1.
+
+    `refresh()` creates the `_do_refresh` task with `asyncio.ensure_future`
+    and then suspends awaiting it -- the task has not actually run a single
+    line yet at that point. If `logout()` happens to run in that same
+    window (any ready callback in the same event-loop tick, e.g. a sibling
+    `whoop_logout` tool call -- see fact #4), a naive fix that captures the
+    epoch as the first line *inside* `_do_refresh` captures the epoch
+    *after* the logout already bumped it, so the check at the end of
+    `_do_refresh` passes and the forgotten grant's rotated token gets
+    written back to disk anyway.
+
+    This must FAIL if the epoch is captured inside `_do_refresh` instead of
+    at the top of `refresh()` (i.e. it is the regression test for the fix
+    actually shipped, not just for the mid-flight case tests 1 and 2
+    already cover).
+    """
+    store = FileTokenStore(config.token_path)
+    expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
+    store.save(expired)
+
+    with respx.mock:
+        route = respx.post(TOKEN_URL).mock(return_value=_mock_new_token_response())
+
+        auth = Authenticator(config)
+        refresh_task = asyncio.create_task(auth.refresh(expired))
+
+        # Spin the loop just enough for refresh() to run up to the point
+        # where it has created (but not yet started running) the
+        # _do_refresh task, and confirm the POST genuinely has not fired
+        # yet -- otherwise this test would silently degenerate into test 1.
+        for _ in range(50):
+            if auth._inflight_refresh is not None:
+                break
+            await asyncio.sleep(0)
+        assert auth._inflight_refresh is not None, (
+            "refresh() should have registered its in-flight task by now"
+        )
+        assert route.call_count == 0, (
+            "the token-endpoint POST must not have started yet -- this test "
+            "only exercises the pre-request window if it hasn't"
+        )
+
+        # logout() runs synchronously, "before the request" from
+        # _do_refresh's point of view.
+        auth.logout()
+
+        result = await refresh_task
+
+        # The in-flight caller still gets its token back (D2) ...
+        assert result.access_token == "new-access"
+        # ... but it must never have been written back to disk or installed
+        # as the session credential -- that is the invariant this issue
+        # protects.
+        assert store.load() is None, (
+            f"store should be empty after a pre-request logout, but contains {store.load()}"
+        )
+        assert auth._token is None, "auth._token should be None after logout"
