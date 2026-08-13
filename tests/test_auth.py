@@ -2344,3 +2344,76 @@ async def test_exchange_code_persists_normally_when_save_succeeds(config: Config
     assert token.access_token == "new-access"
     stored = auth._store.load()
     assert stored is not None and stored.access_token == "new-access"
+
+
+# -- atomic_write_text durability (issue #136) ---------------------------------
+#
+# These assert the MECHANISM, not the property. Power loss cannot be simulated
+# in-process, so what is checked is that the syncs are requested at the right
+# points -- data before the rename, directory after it. That is the most a unit
+# test can honestly claim here, and pretending otherwise would be worse than
+# saying so.
+
+
+def test_atomic_write_syncs_data_before_the_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bytes must be on disk before the rename that publishes them.
+
+    Without this ordering the rename can land first, so a power loss leaves an
+    empty file exactly where a good token was -- the failure the write-then-
+    rename dance exists to prevent, arriving by a route it does not cover.
+    """
+    order: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def spy_fsync(fd: int) -> None:
+        order.append("fsync")
+        real_fsync(fd)
+
+    def spy_replace(src: object, dst: object) -> None:
+        order.append("replace")
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+
+    atomic_write_text(tmp_path / "token.json", "payload")
+
+    assert "fsync" in order, "the data was never synced"
+    assert order.index("fsync") < order.index("replace"), (
+        f"data must be synced before the rename, got {order}"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot open a directory for fsync")
+def test_atomic_write_syncs_the_directory_after_the_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rename itself must be made durable, not just the data."""
+    order: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(
+        os,
+        "replace",
+        lambda s, d: (order.append("replace"), real_replace(s, d))[1],  # type: ignore[arg-type]
+    )
+
+    atomic_write_text(tmp_path / "token.json", "payload")
+
+    assert order.count("fsync") == 2, f"expected a data sync and a directory sync, got {order}"
+    assert order[-1] == "fsync", f"the directory sync must follow the rename, got {order}"
+
+
+def test_atomic_write_still_writes_correctly_with_the_syncs(tmp_path: Path) -> None:
+    """The durability work must not disturb content, mode, or temp-file cleanup."""
+    target = tmp_path / "token.json"
+    atomic_write_text(target, "the-contents")
+
+    assert target.read_text() == "the-contents"
+    if os.name != "nt":
+        assert target.stat().st_mode & 0o777 == 0o600
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["token.json"], (
+        "a temp file was left behind"
+    )

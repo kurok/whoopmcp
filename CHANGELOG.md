@@ -632,6 +632,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #136 (#37 audit, P3): `atomic_write_text` now `fsync`s the data before
+  the rename and the parent directory after it. Write-then-rename is atomic
+  against a *process* crash on its own, but not against power loss: the rename
+  could reach disk before the bytes, leaving an empty or partial file exactly
+  where a good token had been -- the failure the dance exists to prevent,
+  arriving by a route it did not cover. The directory sync is POSIX-only, since
+  Windows cannot open a directory for `fsync`.
+
 - Issue #134 (#37 audit, P3): `Authenticator.exchange_code` now installs the
   token on the session *before* persisting it. By the time `save` runs WHOOP
   has already minted the grant, so a failed write -- a full disk, a read-only
