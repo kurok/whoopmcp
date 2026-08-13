@@ -632,6 +632,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #135 (#37 audit, P3): the lazy re-seal in `EncryptedFileTokenStore.load`
+  now tolerates a failed *write*, not just a missing key. #103 made a missing
+  re-seal key serve the token unrotated rather than raise, but its guard caught
+  only `SealError`, so an `OSError` -- a full disk, a read-only state
+  directory, a permission change -- still escaped and turned a token that had
+  decrypted perfectly into a hard `load()` failure. The same outage #103
+  existed to prevent, arriving by a different exception, and contradicting
+  `load()`'s own docstring promise that the re-seal "never raises out of
+  `load`". Both causes are now caught and logged with the exception type named
+  so they stay distinguishable. `save()` still raises for direct callers, and
+  the stored record is left untouched by a failed re-seal.
+
 - Issue #133 (#37 audit, P3): `repr(Token)` and `repr(Config)` no longer print
   the secrets they hold. `access_token` and `refresh_token` on `Token`, and
   `client_secret`, `token_encryption_keys`, `metrics_token`, and
