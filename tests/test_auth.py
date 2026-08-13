@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import stat
+import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -2417,3 +2419,213 @@ def test_atomic_write_still_writes_correctly_with_the_syncs(tmp_path: Path) -> N
     assert sorted(p.name for p in tmp_path.iterdir()) == ["token.json"], (
         "a temp file was left behind"
     )
+
+
+# -- #132: the lazy re-seal must not clobber a concurrent save ------------------
+#
+# #103 made `load` a writer, and gave it a way to lose data it never had before.
+# During a pending rotation every `load` re-seals, and `server.py`'s /ready poll
+# runs `load` in a thread while multi-worker streamable-http runs it in other
+# processes. Read X -> a refresh saves Y -> the re-seal writes X back, and the
+# store now holds a refresh token WHOOP already rotated away.
+
+
+def _rotating_store(tmp_path: Path) -> tuple[EncryptedFileTokenStore, Path, bytes, bytes]:
+    """A store mid-rotation: the file is sealed under v1, current version is 2."""
+    key_v1, key_v2 = os.urandom(32), os.urandom(32)
+    path = tmp_path / "token.json"
+    EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(
+        Token("access-X", expires_at=1234.0, refresh_token="refresh-X")
+    )
+    store = EncryptedFileTokenStore(path, keys={1: key_v1, 2: key_v2}, current_version=2)
+    return store, path, key_v1, key_v2
+
+
+def test_reseal_does_not_clobber_a_token_saved_during_the_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race, driven deterministically: a save lands between `load`'s read and
+    its re-seal, and the re-seal must not overwrite it.
+
+    The interleaving is injected at `Token.from_json`, which `load` calls after
+    it has the plaintext and before it decides to re-seal. That hook exists on
+    both the fixed and unfixed versions, which matters: an earlier draft of this
+    test hooked the compare's own re-read, a call that only the fixed version
+    makes -- so against unfixed code the concurrent save never happened and the
+    test failed for the wrong reason entirely, proving nothing.
+    """
+    store, path, _key_v1, key_v2 = _rotating_store(tmp_path)
+    rotated = Token("access-Y", expires_at=5678.0, refresh_token="refresh-Y")
+
+    original_from_json = Token.from_json
+    fired = {"done": False}
+
+    def from_json_then_save(payload: str) -> Token:
+        token = original_from_json(payload)
+        if not fired["done"]:
+            fired["done"] = True
+            # A refresh completes and saves the rotated token, exactly between
+            # this load's read and its re-seal.
+            EncryptedFileTokenStore(path, keys={2: key_v2}, current_version=2).save(rotated)
+        return token
+
+    monkeypatch.setattr(Token, "from_json", staticmethod(from_json_then_save))
+
+    served = store.load()
+
+    assert fired["done"], "the interleaving never happened -- this test proves nothing"
+
+    # `load` still returns the token it read: the caller is not denied.
+    assert served is not None
+    assert served.access_token == "access-X"
+
+    # ...and the newer token is still what is on disk.
+    monkeypatch.undo()
+    on_disk = EncryptedFileTokenStore(path, keys={2: key_v2}, current_version=2).load()
+    assert on_disk == rotated, (
+        "the lazy re-seal overwrote a token saved during the load -- the refresh "
+        "token WHOOP rotated to has been lost"
+    )
+
+
+def test_reseal_still_happens_when_nothing_changed(tmp_path: Path) -> None:
+    """The regression that would make the fix worthless: with no concurrent
+    writer, rotation must still occur, or the compare has simply disabled #103's
+    lazy rotation."""
+    store, path, _key_v1, key_v2 = _rotating_store(tmp_path)
+
+    assert json.loads(path.read_text(encoding="utf-8"))["v"] == 1
+    served = store.load()
+    assert served is not None and served.access_token == "access-X"
+    assert json.loads(path.read_text(encoding="utf-8"))["v"] == 2, (
+        "the record was not re-sealed under the current key version"
+    )
+
+    # And it is readable with the new key alone, i.e. genuinely migrated.
+    assert EncryptedFileTokenStore(path, keys={2: key_v2}, current_version=2).load() == Token(
+        "access-X", expires_at=1234.0, refresh_token="refresh-X"
+    )
+
+
+def test_reseal_skipped_when_the_file_was_deleted_during_the_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A logout during the load removes the file. The re-seal must not recreate
+    it -- resurrecting a credential the user explicitly forgot is worse than
+    skipping a rotation.
+
+    Hooked at `Token.from_json` for the same reason as the test above: it is a
+    call both versions make, at the right point.
+    """
+    store, path, _key_v1, _key_v2 = _rotating_store(tmp_path)
+
+    original_from_json = Token.from_json
+    fired = {"done": False}
+
+    def from_json_then_delete(payload: str) -> Token:
+        token = original_from_json(payload)
+        if not fired["done"]:
+            fired["done"] = True
+            path.unlink()
+        return token
+
+    monkeypatch.setattr(Token, "from_json", staticmethod(from_json_then_delete))
+
+    served = store.load()
+    assert fired["done"], "the interleaving never happened -- this test proves nothing"
+    assert served is not None and served.access_token == "access-X"
+
+    monkeypatch.undo()
+    assert not path.exists(), "the re-seal recreated a token file that was deleted"
+
+
+def test_non_utf8_rewrite_during_the_load_does_not_escape_as_unicodedecodeerror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compare must not introduce a new way for `load` to raise.
+
+    A first draft read the file back as *text* for the compare. If an external
+    writer replaced it with non-UTF-8 bytes inside the window, `read_text`
+    raised `UnicodeDecodeError` -- which is neither `SealError` nor `OSError`, so
+    the caller's except did not catch it, and a raw `ValueError` escaped `load`.
+    That breaks two promises at once: the `TokenStore.load` contract (a `Token`,
+    `None`, or `AuthError`) and the adjacent comment's own rule that a token
+    which just decrypted perfectly well is never denied to the caller.
+
+    Reading bytes fixes it structurally -- there is no decode to fail.
+    """
+    store, path, _key_v1, _key_v2 = _rotating_store(tmp_path)
+
+    original_from_json = Token.from_json
+    fired = {"done": False}
+
+    def from_json_then_corrupt(payload: str) -> Token:
+        token = original_from_json(payload)
+        if not fired["done"]:
+            fired["done"] = True
+            path.write_bytes(b"\xff\xfe\x00 not utf-8 at all")
+        return token
+
+    monkeypatch.setattr(Token, "from_json", staticmethod(from_json_then_corrupt))
+
+    served = store.load()
+
+    assert fired["done"], "the interleaving never happened -- this test proves nothing"
+    assert served is not None and served.access_token == "access-X", (
+        "load raised or returned None instead of serving the token it had already decrypted"
+    )
+
+
+def test_concurrent_save_and_reseal_in_threads_never_loses_the_newer_token(
+    tmp_path: Path,
+) -> None:
+    """The in-process race, run for real: threads, no monkeypatching.
+
+    What this does and does not prove, stated plainly because the distinction
+    matters. It asserts an *invariant*: after a concurrent load-with-reseal and
+    save, one of the two tokens must be on disk intact -- never a torn file,
+    never neither. `_TOKEN_PATH_LOCKS` is what guarantees that under threads.
+
+    It is **not** a regression test for #132, and it passes against the unfixed
+    code. The reason is worth recording: when the unfixed re-seal clobbers the
+    rotated token, what lands is the stale token re-sealed under the new key --
+    which still satisfies "one of the two, intact". Detecting the clobber needs
+    to know which write went last, and under natural scheduling this test does
+    not. The deterministic tests above, which inject the interleaving at a known
+    point, are the regression evidence; this one is a safety net that would catch
+    a deadlock, a torn write, or a lock that serialises the wrong section.
+
+    A short switch interval makes the threads actually interleave rather than
+    each running to completion.
+    """
+    key_v1, key_v2 = os.urandom(32), os.urandom(32)
+    path = tmp_path / "token.json"
+    stale = Token("access-X", expires_at=1234.0, refresh_token="refresh-X")
+    rotated = Token("access-Y", expires_at=5678.0, refresh_token="refresh-Y")
+
+    original_interval = sys.getswitchinterval()
+    sys.setswitchinterval(5e-6)
+    try:
+        for _ in range(40):
+            EncryptedFileTokenStore(path, keys={1: key_v1}, current_version=1).save(stale)
+            loader = EncryptedFileTokenStore(path, keys={1: key_v1, 2: key_v2}, current_version=2)
+            saver = EncryptedFileTokenStore(path, keys={2: key_v2}, current_version=2)
+
+            threads = [
+                threading.Thread(target=loader.load),
+                # `args=` rather than a closure: a lambda would capture the loop's
+                # `saver` by reference, so a later iteration could rebind it out
+                # from under a thread that had not started yet.
+                threading.Thread(target=saver.save, args=(rotated,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            on_disk = EncryptedFileTokenStore(
+                path, keys={1: key_v1, 2: key_v2}, current_version=2
+            ).load()
+            assert on_disk in (stale, rotated), f"neither token survived intact: {on_disk}"
+    finally:
+        sys.setswitchinterval(original_interval)

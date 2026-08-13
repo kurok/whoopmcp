@@ -18,6 +18,7 @@ import logging
 import os
 import secrets
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -244,6 +245,35 @@ class FileTokenStore:
         self._path.unlink(missing_ok=True)
 
 
+#: One re-entrant lock per token path, shared by every ``EncryptedFileTokenStore``
+#: instance addressing that path in this process (#132).
+#:
+#: ``load`` is a writer -- it re-seals a record found under an older key version
+#: -- and ``server.py`` runs ``load`` in a thread for every ``/ready`` poll while
+#: a refresh may be completing on the event loop. Without this, the two can
+#: interleave: the loader reads token X, the refresh saves Y, and the loader's
+#: re-seal writes X back over it.
+#:
+#: Re-entrant because ``_reseal_if_unchanged`` holds it across its compare and
+#: then calls ``save``, which takes it again.
+#:
+#: Keyed by ``Path``, whose equality is by path components, so two instances
+#: constructed with equal paths share one lock. The registry is never pruned; a
+#: process addresses a handful of token paths at most.
+_TOKEN_PATH_LOCKS: dict[Path, threading.RLock] = {}
+_TOKEN_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for_token_path(path: Path) -> threading.RLock:
+    """The lock guarding writes to ``path`` within this process."""
+    with _TOKEN_PATH_LOCKS_GUARD:
+        lock = _TOKEN_PATH_LOCKS.get(path)
+        if lock is None:
+            lock = threading.RLock()
+            _TOKEN_PATH_LOCKS[path] = lock
+        return lock
+
+
 class EncryptedFileTokenStore:
     """Like ``FileTokenStore``, but the token is sealed (AES-256-GCM, via
     ``crypto.seal``/``unseal``) before it touches disk, so what's actually
@@ -298,9 +328,18 @@ class EncryptedFileTokenStore:
         (see `save`'s own docstring note).
         """
         try:
-            raw = self._path.read_text(encoding="utf-8")
+            raw_bytes = self._path.read_bytes()
         except FileNotFoundError:
             return None
+
+        # Bytes, not text, and decoded explicitly here: the compare below needs
+        # the exact on-disk bytes to be byte-exact, and `read_text` would both
+        # translate newlines and raise `UnicodeDecodeError` -- which is not
+        # `AuthError`, so it would escape this class's documented contract.
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AuthError(f"token file at {self._path} is unreadable: {exc}") from exc
 
         try:
             envelope = json.loads(raw)
@@ -327,7 +366,7 @@ class EncryptedFileTokenStore:
             # remain in `keys` until every such record has been touched
             # once.
             try:
-                self.save(token)
+                self._reseal_if_unchanged(token, raw_bytes)
             except (SealError, OSError) as exc:
                 # Two ways this fails, and neither is a reason to deny the
                 # caller a token that just decrypted perfectly well:
@@ -351,6 +390,79 @@ class EncryptedFileTokenStore:
                     )
 
         return token
+
+    def _reseal_if_unchanged(self, token: Token, raw_at_read: bytes) -> None:
+        """Re-seal ``token`` only if the file still holds exactly the bytes
+        ``load`` read (#132).
+
+        ``load`` is a writer: during a pending rotation it re-seals whatever it
+        just read. ``server.py:448`` runs ``load`` in a thread for every
+        ``/ready`` poll, and ``whoop_auth_status``, ``doctor.py`` and
+        ``__main__.py`` load too. So a loader can read token X, a refresh can
+        complete X -> Y and save Y, and the loader's re-seal can then write X
+        back -- leaving a refresh token WHOOP has already rotated away, and an
+        ``invalid_grant`` on the next restart.
+
+        (That is older than it looks. The re-seal-on-load has been here since
+        tokens were first encrypted at rest, in the same commit that added
+        ``EncryptedFileTokenStore``; #103 only widened the ``except`` around it
+        so a missing key stops raising. #132's text -- and this docstring's
+        first draft -- both blamed #103 for introducing the failure mode. Git
+        history says otherwise, and a wrong attribution sends the next reader to
+        the wrong commit.)
+
+        Two mechanisms, because the two threat models are different:
+
+        **Within this process, a lock.** ``_TOKEN_PATH_LOCKS`` serialises the
+        compare-and-save here against every ``save`` on the same path, which
+        closes the interleaving above completely -- and that is the scenario the
+        issue actually describes, since ``/ready``'s thread and the refresh share
+        one process. A ``threading.Lock`` has none of the drawbacks a file lock
+        would: nothing platform-specific, nothing to leave behind on a crash,
+        no NFS semantics.
+
+        **Across processes, a byte-for-byte compare, which is best effort.** A
+        changed file means some other writer got there first and theirs is newer,
+        so this skips; the record it left behind gets re-sealed by a later load.
+        The compare and the ``os.replace`` inside ``save`` are not one atomic
+        step, so a *cross-process* write landing between them is still lost --
+        and the residual window is not small. Measured on this machine, roughly
+        two thirds of the span from ``load``'s read to the rename sits after the
+        compare, because ``seal``, ``mkstemp``, the write and the ``fsync`` are
+        all on that side of it; on a filesystem with honest ``fsync`` it is
+        milliseconds. Closing that needs cross-process locking, which this
+        module does not attempt anywhere -- multi-process refresh is already
+        documented as unsound (see ``RefreshLock`` and ``server.py``'s "Known
+        limitation"). Saying the compare narrows the window would be
+        overstating it: what the compare buys cross-process is that the common
+        sequential interleaving is caught, not that the race is gone.
+
+        The reason skipping is always safe: **a re-seal is never required for
+        correctness.** It migrates a record to the current key; the record was
+        already decryptable without it, and a later ``load`` migrates it just as
+        well. Deferring only extends how long the old key must stay in ``keys``,
+        which the class docstring already requires.
+        """
+        with _lock_for_token_path(self._path):
+            try:
+                current = self._path.read_bytes()
+            except FileNotFoundError:
+                # Deleted under us -- a logout, or an operator clearing state.
+                # Re-creating it here would resurrect exactly what they removed.
+                logger.debug(
+                    "skipping lazy re-seal at %s: the file is gone, so re-creating it "
+                    "would resurrect a credential something just removed",
+                    self._path,
+                )
+                return
+            if current != raw_at_read:
+                logger.debug(
+                    "skipping lazy re-seal at %s: file changed since it was read, "
+                    "so another writer's token is newer than the one in hand",
+                    self._path,
+                )
+                return
+            self.save(token)
 
     def save(self, token: Token) -> None:
         """Seal ``token`` and write it to disk.
@@ -378,7 +490,11 @@ class EncryptedFileTokenStore:
             current_version=self._current_version,
             associated_data=self._ASSOCIATED_DATA,
         )
-        atomic_write_text(self._path, json.dumps(envelope))
+        # Held across the write so a concurrent lazy re-seal in another thread
+        # cannot land between this save's compare-equivalent and its rename
+        # (#132). See `_TOKEN_PATH_LOCKS`.
+        with _lock_for_token_path(self._path):
+            atomic_write_text(self._path, json.dumps(envelope))
 
     def clear(self) -> None:
         self._path.unlink(missing_ok=True)
