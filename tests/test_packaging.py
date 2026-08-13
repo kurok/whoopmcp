@@ -401,7 +401,7 @@ def test_third_party_actions_in_write_privileged_jobs_are_sha_pinned(
 ) -> None:
     """Issue #119: a third-party action on a mutable tag inside a job that can
     write to this repository is a standing supply-chain exposure -- whoever
-    controls the tag gets `contents: write` on every release.
+    controls the tag gets that write scope on every run.
 
     Scoped deliberately to *non-GitHub* actions in *write-privileged* jobs,
     which is the audit's own framing: "the one non-GitHub floating-tag action
@@ -409,30 +409,47 @@ def test_third_party_actions_in_write_privileged_jobs_are_sha_pinned(
     `github/*`) still on tags are a separate, lower-severity concern (issue
     #124) and are not asserted here, so this test cannot quietly drift into
     being that one.
+
+    Scanned as text rather than parsed: PyYAML is not a declared dependency of
+    this project, and every other workflow assertion in this file works on the
+    raw content for the same reason.
     """
-    import yaml
-
+    job_re = re.compile(r"^  (?P<name>[A-Za-z_][\w-]*):\s*$")
+    uses_re = re.compile(r"^\s*-?\s*uses:\s*(?P<uses>\S+)")
+    write_re = re.compile(r"^\s+[\w-]+:\s*write\s*$")
     sha_pinned = re.compile(r"^[^@]+@[0-9a-f]{40}$")
-    violations: list[str] = []
 
+    violations: list[str] = []
     for path in sorted((project_root / ".github" / "workflows").glob("*.yml")):
-        workflow = yaml.safe_load(path.read_text())
-        top_level = workflow.get("permissions") or {}
-        for job_name, job in (workflow.get("jobs") or {}).items():
-            perms = job.get("permissions", top_level) or {}
-            if not isinstance(perms, dict):
+        blocks: dict[str, list[str]] = {}
+        current: str | None = None
+        in_jobs = False
+        for line in path.read_text().splitlines():
+            if line.startswith("jobs:"):
+                in_jobs = True
                 continue
-            writes = sorted(k for k, v in perms.items() if v == "write")
-            if not writes:
+            if not in_jobs:
                 continue
-            for step in job.get("steps") or []:
-                uses = step.get("uses")
-                if not uses or uses.startswith(("actions/", "github/")):
+            match = job_re.match(line)
+            if match:
+                current = match.group("name")
+                blocks[current] = []
+            elif current is not None:
+                blocks[current].append(line)
+
+        for job, body in blocks.items():
+            if not any(write_re.match(line) for line in body):
+                continue
+            for line in body:
+                found = uses_re.match(line)
+                if not found:
                     continue
-                if not sha_pinned.match(uses):
-                    violations.append(f"{path.name}:{job_name} {writes} -> {uses}")
+                uses = found.group("uses")
+                if uses.startswith(("actions/", "github/")) or sha_pinned.match(uses):
+                    continue
+                violations.append(f"{path.name}:{job} -> {uses}")
 
     assert violations == [], (
-        "third-party actions in write-privileged jobs must be pinned by commit SHA, "
+        "non-GitHub actions in write-privileged jobs must be pinned by commit SHA, "
         f"not a mutable tag: {violations}"
     )
