@@ -51,7 +51,7 @@ import respx
 from whoopmcp.auth import Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, RequestPriority, WhoopClient
 from whoopmcp.config import Config
-from whoopmcp.reconciliation import run_reconciliation
+from whoopmcp.reconciliation import EMPTY_LISTING_CLOSE_LIMIT, run_reconciliation
 from whoopmcp.store import (
     get_recoveries,
     get_sleeps,
@@ -470,3 +470,181 @@ async def test_reconciliation_never_soft_deletes_a_second_members_rows(tmp_path:
     assert get_workouts(conn, OTHER_USER_ID) == []
     assert get_recoveries(conn, OTHER_USER_ID) == []
     conn.close()
+
+
+# =============================================================================
+# #175: an empty listing must not be trusted to wipe a populated window, and a
+# row written *during* the fetch must not be deleted by that same run.
+#
+# Both tests assert on the rows that are still live afterwards, never on the
+# absence of an exception. Neither of these bugs raised anything -- they exited
+# 0 and printed a "finished" summary -- so a test that only checked for a clean
+# run would have passed against the broken code, which is exactly how the
+# analogous gap in #155 stayed hidden.
+# =============================================================================
+
+
+@respx.mock
+async def test_empty_listing_does_not_wipe_a_populated_window(tmp_path: Path) -> None:
+    """WHOOP answers 200 with an empty page while the store holds a full
+    window. An empty listing and a failed one are indistinguishable here, so
+    reconciliation declines to close rather than deleting everything.
+
+    This is not a recoverable mistake: nothing in the codebase ever sets
+    ``deleted_at`` back to NULL, and the upserts' ``ON CONFLICT`` clauses do
+    not touch it -- so re-syncing rewrites the row and leaves it invisible.
+    A wrong deletion here destroys the member's history permanently.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    held = []
+    for day in range(1, 8):  # 7 records -- above EMPTY_LISTING_CLOSE_LIMIT
+        start = now - timedelta(days=day)
+        record = {
+            "id": f"sleep-live-{day}",
+            "start": iso(start),
+            "end": iso(start + timedelta(hours=8)),
+            "score_state": "SCORED",
+        }
+        upsert_sleep(conn, USER_ID, record)
+        held.append(record)
+    assert len(get_sleeps(conn, USER_ID)) == 7
+
+    mock_empty_collections()
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    # The point of the test: every record is still live. Asserting on the
+    # survivors, not on a clean exit -- the broken version exited cleanly too.
+    survivors = get_sleeps(conn, USER_ID)
+    assert len(survivors) == 7
+    assert {r["id"] for r in survivors} == {r["id"] for r in held}
+
+    # And nothing was soft-deleted at the column level either.
+    wiped = conn.execute(
+        "SELECT COUNT(*) FROM sleeps WHERE whoop_user_id = ? AND deleted_at IS NOT NULL",
+        (USER_ID,),
+    ).fetchone()[0]
+    assert wiped == 0
+
+    # The refusal is reported, not silent: a run that declines to delete must
+    # not look identical to one that found nothing to delete.
+    assert results["sleeps"].closed == 0
+    assert results["sleeps"].withheld is not None
+    assert "declining to close" in results["sleeps"].withheld
+    conn.close()
+
+
+@respx.mock
+async def test_record_written_during_the_fetch_is_not_deleted(tmp_path: Path) -> None:
+    """The store is shared: the server process's webhook handler and a
+    concurrent ``whoop_sync`` both write to the same sqlite file while
+    ``reconcile-webhooks`` runs as a cron job. A record that arrives while
+    reconciliation is paginating cannot appear in the fresh listing that was
+    already in flight -- so reading the local set *after* the fetch soft-deleted
+    it at birth.
+
+    Here a webhook lands between page 1 and page 2. The new record must still
+    be live when the run finishes.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    old_start = now - timedelta(days=3)
+    old_record = {
+        "id": "sleep-known",
+        "start": iso(old_start),
+        "end": iso(old_start + timedelta(hours=8)),
+        "score_state": "SCORED",
+    }
+    upsert_sleep(conn, USER_ID, old_record)
+
+    # The record the webhook handler writes mid-fetch. WHOOP's listing was
+    # generated before it existed, so it is in no page of this response.
+    arrival_start = now - timedelta(days=1)
+    arrival = {
+        "id": "sleep-arrived-mid-fetch",
+        "start": iso(arrival_start),
+        "end": iso(arrival_start + timedelta(hours=7)),
+        "score_state": "SCORED",
+    }
+
+    pages = iter(
+        [
+            {"records": [old_record], "next_token": "page-2"},
+            {"records": [], "next_token": None},
+        ]
+    )
+
+    def paginate(request: httpx.Request) -> httpx.Response:
+        page = next(pages)
+        if page["next_token"] == "page-2":
+            # Between the two pages, a concurrent writer commits a new row.
+            upsert_sleep(conn, USER_ID, arrival)
+        return httpx.Response(200, json=page)
+
+    respx.get(f"{BASE_URL}{COLLECTION_PATHS['sleeps']}").mock(side_effect=paginate)
+    mock_empty_collections(except_for="sleeps")
+
+    async with WhoopClient(config, auth) as client:
+        await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    live = {record["id"] for record in get_sleeps(conn, USER_ID)}
+    assert "sleep-arrived-mid-fetch" in live, (
+        "a record written during the fetch must survive the run that could not have seen it"
+    )
+    assert "sleep-known" in live, "the record the listing confirmed must stay live too"
+    conn.close()
+
+
+@respx.mock
+async def test_empty_listing_still_closes_a_window_at_the_limit(tmp_path: Path) -> None:
+    """The guard above separates "a hole to close" from "a wipe to refuse" by
+    size, so the boundary is the whole contract: at
+    ``EMPTY_LISTING_CLOSE_LIMIT`` records an empty listing still closes them,
+    and one more refuses.
+
+    Pinned explicitly because both halves fail silently. Turning ``>`` into
+    ``>=`` would quietly narrow reconciliation by one record, and neither the
+    hole-closing test above (1 record) nor the wipe test (7) would notice.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+
+    async def closed_count(held: int) -> int:
+        conn = open_store(":memory:")
+        link(conn, USER_ID, "client-a")
+        now = datetime(2026, 8, 10, tzinfo=UTC)
+        for day in range(1, held + 1):
+            start = now - timedelta(days=day)
+            upsert_sleep(
+                conn,
+                USER_ID,
+                {
+                    "id": f"sleep-{day}",
+                    "start": iso(start),
+                    "end": iso(start + timedelta(hours=8)),
+                    "score_state": "SCORED",
+                },
+            )
+        async with WhoopClient(config, auth) as client:
+            results = await run_reconciliation(
+                conn, client, config, USER_ID, window_days=30, now=now
+            )
+        surviving = len(get_sleeps(conn, USER_ID))
+        conn.close()
+        assert surviving == held - results["sleeps"].closed
+        return int(results["sleeps"].closed)
+
+    mock_empty_collections()
+
+    assert await closed_count(EMPTY_LISTING_CLOSE_LIMIT) == EMPTY_LISTING_CLOSE_LIMIT
+    assert await closed_count(EMPTY_LISTING_CLOSE_LIMIT + 1) == 0
