@@ -632,6 +632,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #129 (#37 audit, P3, latent): `_statement_restricts_to_one_member`
+  matched the member predicate depth-blind. #109 required the
+  `whoop_user_id = ?` fragment to sit after the statement's first
+  parenthesis-depth-zero `WHERE`, but anchored only where the search
+  *started* -- never the depth of what it found. A fragment nested in a
+  subquery *after* a non-restrictive top-level predicate therefore satisfied
+  the check: `WHERE whoop_user_id != ? AND EXISTS (SELECT 1 FROM recoveries
+  r2 WHERE r2.whoop_user_id = ?)` reads the column (so the universal
+  authorizer check passes), spans every member but the caller, and had the
+  nested fragment accepted as its member restriction. Reproduced end to end
+  as a cross-member `UPDATE`, and in `INSERT ... SELECT` form as another
+  member's `raw_json` health payload copied into the caller's own partition,
+  where ordinary scoped getters then return it. The match must now sit at
+  depth zero as well. Latent, not exploitable: every caller of
+  `_execute_scoped` passes static in-repo SQL and no path routes
+  caller-supplied SQL through it -- and the universal authorizer check, which
+  is the load-bearing control, was never affected. Fixing it anyway because
+  #109's own documentation claimed this shape was caught, and a guard that
+  overstates its reach is what a future maintainer will trust. The
+  `CAUGHT`/`NOT CAUGHT` list above `_MEMBER_EQUALITY_PREDICATE` is corrected
+  in the same commit, including the one deliberate false positive the fix
+  introduces (`WHERE whoop_user_id IN (SELECT whoop_user_id FROM sleeps WHERE
+  whoop_user_id = ?)` does confine itself to one member and is rejected
+  anyway; no caller writes that shape). Verified non-breaking by running the
+  whole suite with both the old and the depth-checked form and comparing the
+  verdict on every statement that reached the check: zero divergences.
+
 - Issue #130 (#37 audit, P3): the comment justifying `webhook_events`'
   exclusion from `_TENANT_SCOPED_TABLES` said its `whoop_user_id` "is nullable
   pre-identity-resolution data". #105 made that column `NOT NULL`, so the
