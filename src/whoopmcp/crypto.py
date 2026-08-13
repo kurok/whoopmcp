@@ -43,7 +43,27 @@ class SealError(RuntimeError):
     """
 
 
-def _associated_data(version: int, extra: bytes) -> bytes:
+#: Associated-data layouts this module understands, newest first.
+#:
+#: Format 1 concatenated the key version and the caller's ``associated_data``
+#: with nothing between them, which is ambiguous: ``(version=1,
+#: extra=b"2whoopmcp.token")`` and ``(version=12, extra=b"whoopmcp.token")``
+#: both produce ``b"whoopmcp.seal.v12whoopmcp.token"``. With one caller and one
+#: fixed ``extra`` that is unexploitable, but this module advertises itself as a
+#: generic primitive, and a second caller whose ``extra`` collided across
+#: versions would silently void the version binding this AD exists to provide
+#: (#138).
+#:
+#: Format 2 puts a ``|`` after the version. That is sufficient rather than
+#: merely better: a key version is an integer, so it can never contain ``|``,
+#: and the first ``|`` therefore always terminates it no matter what the caller
+#: passes as ``extra``.
+_AD_FORMAT_DELIMITED = 2
+_AD_FORMAT_LEGACY_CONCATENATED = 1
+_AD_FORMAT_CURRENT = _AD_FORMAT_DELIMITED
+
+
+def _associated_data(version: int, extra: bytes, *, ad_format: int = _AD_FORMAT_CURRENT) -> bytes:
     """Bind the envelope's own claimed key version into the AEAD tag.
 
     Without this, an attacker could relabel a v1 envelope's "v" field as 2
@@ -53,8 +73,31 @@ def _associated_data(version: int, extra: bytes) -> bytes:
     associated data means the tag itself is only valid for the exact
     version it claims, so a relabeled envelope fails authentication rather
     than silently trying a different key.
+
+    ``ad_format`` selects the layout, because changing it changes the AEAD tag:
+    every envelope sealed under the old layout would stop authenticating, which
+    for the `encrypted-file` backend means an operator's stored token becomes
+    undecryptable and they have to log in again. That is too high a price for a
+    hardening fix with no reachable exploit, so the layout is recorded per
+    envelope instead and old records keep working. New seals always use the
+    current format; see `_AD_FORMAT_DELIMITED`.
+
+    A tampered format marker fails closed on its own, with no extra binding
+    needed: the two layouts produce different bytes, so flipping an envelope's
+    marker makes `unseal` compute an AD the tag was not made with, and
+    authentication fails.
     """
-    return f"whoopmcp.seal.v{version}".encode() + extra
+    # `int()` here, not just the type hint: `seal` receives `current_version`
+    # from a caller and `unseal` recomputes from `int(envelope["v"])`, so
+    # normalising in one place is what keeps the two symmetric. It also makes the
+    # delimiter argument above structurally true -- an int's decimal form cannot
+    # contain `|` -- rather than contingent on callers honouring the annotation.
+    normalised = int(version)
+    if ad_format == _AD_FORMAT_LEGACY_CONCATENATED:
+        return f"whoopmcp.seal.v{normalised}".encode() + extra
+    if ad_format != _AD_FORMAT_DELIMITED:
+        raise SealError(f"unsupported associated-data format {ad_format}")
+    return f"whoopmcp.seal.v{normalised}|".encode() + extra
 
 
 def seal(
@@ -66,10 +109,15 @@ def seal(
 ) -> dict[str, Any]:
     """Encrypt ``plaintext`` under ``keys[current_version]``.
 
-    Returns a JSON-serialisable envelope: ``{"v": <version>, "nonce":
-    <b64>, "ct": <b64>}``. ``ct`` is AESGCM's own output, which already
-    carries its 16-byte authentication tag -- no separate tag field, no
-    custom framing.
+    Returns a JSON-serialisable envelope: ``{"v": <key version>, "adv":
+    <associated-data format>, "nonce": <b64>, "ct": <b64>}``. ``ct`` is
+    AESGCM's own output, which already carries its 16-byte authentication tag
+    -- no separate tag field, no custom framing.
+
+    ``adv`` arrived with #138; an envelope without it predates that and is read
+    with the legacy associated-data layout. Readers must therefore treat the
+    field set as open rather than exact -- which nothing in this repository
+    relied on, checked before making the change.
     """
     try:
         key = keys[current_version]
@@ -82,6 +130,10 @@ def seal(
     )
     return {
         "v": current_version,
+        # Which associated-data layout the tag was computed over. Absent means
+        # format 1, the pre-#138 concatenation -- that is what makes envelopes
+        # written before this field existed still readable.
+        "adv": _AD_FORMAT_CURRENT,
         "nonce": base64.b64encode(nonce).decode("ascii"),
         "ct": base64.b64encode(ciphertext).decode("ascii"),
     }
@@ -104,6 +156,9 @@ def unseal(
     """
     try:
         version = int(envelope["v"])
+        # No "adv" means an envelope written before #138 added the field, which
+        # by definition used the legacy layout.
+        ad_format = int(envelope.get("adv", _AD_FORMAT_LEGACY_CONCATENATED))
         nonce = base64.b64decode(envelope["nonce"])
         ciphertext = base64.b64decode(envelope["ct"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -115,7 +170,9 @@ def unseal(
         raise SealError(f"no key available for version {version}") from exc
 
     try:
-        return AESGCM(key).decrypt(nonce, ciphertext, _associated_data(version, associated_data))
+        return AESGCM(key).decrypt(
+            nonce, ciphertext, _associated_data(version, associated_data, ad_format=ad_format)
+        )
     except InvalidTag as exc:
         raise SealError("authentication failed: ciphertext or nonce is not intact") from exc
 
