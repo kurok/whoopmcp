@@ -856,6 +856,13 @@ def _reconcile_webhooks(config: Config, whoop_user_id: int, window_days: int) ->
         f"(window_days={window_days}): {summary}",
         file=sys.stderr,
     )
+    # A run that *declined* to close records must not read as a run that found
+    # nothing to close (#175) -- both show `closed=0` in the summary above, and
+    # an operator who cannot tell them apart never learns their reconciliation
+    # has been refusing to do its job.
+    for resource, result in sorted(results.items()):
+        if result.withheld is not None:
+            print(f"whoopmcp: {resource}: {result.withheld}", file=sys.stderr)
     return 0
 
 

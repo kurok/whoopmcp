@@ -93,6 +93,27 @@ from whoopmcp.webhook_processor import set_deleted_at
 #: reasoning.
 DEFAULT_WINDOW_DAYS = 30
 
+#: How many locally-held records an *empty* WHOOP listing may close in one run.
+#:
+#: Reconciliation exists to close holes left by dropped ``*.deleted`` events, and
+#: a window whose last record was deleted upstream legitimately fetches zero --
+#: ``test_reconciliation_closes_a_hole_left_by_a_dropped_deleted_event`` pins
+#: exactly that. So refusing *every* empty listing, which is what #175's own
+#: acceptance criterion asked for, would disable the feature rather than fix it.
+#:
+#: What is not legitimate is an empty response wiping a populated window: an
+#: empty listing and a failed one are indistinguishable here, and a soft-delete
+#: is permanent (nothing ever clears ``deleted_at``; the upserts' ON CONFLICT
+#: clauses do not touch it). So the two cases are separated by size rather than
+#: by a signal the response does not carry.
+#:
+#: The number is a judgement, not a derivation: a dropped-event hole is a handful
+#: of records, a failed fetch strands the whole window. Set low enough that a
+#: wholesale wipe always trips it, high enough that ordinary hole-closing never
+#: does. Raising it weakens the guard; the operator can always rerun once WHOOP
+#: is answering again, which is the recoverable direction.
+EMPTY_LISTING_CLOSE_LIMIT = 5
+
 #: How much earlier than the reconciliation window the FRESH fetch's own
 #: ``start`` bound reaches -- absorbing the recovery/related-sleep timeframe
 #: skew this module's own docstring explains, so a real record already
@@ -115,6 +136,11 @@ class ReconciliationResult:
     resource: str
     fetched: int
     closed: int
+    #: Why this collection closed nothing, when the reason was a refusal rather
+    #: than "nothing to close" (#175). ``None`` on a normal run. Reported by the
+    #: CLI, because a run that declines to delete must not look identical to one
+    #: that found nothing to delete -- that is what made the original bug silent.
+    withheld: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +201,21 @@ async def _reconcile_entity(
     call, all of them at ``RequestPriority.BACKFILL``.
     """
     fetch = getattr(client, spec.list_method)
+
+    # Read the local set BEFORE the fresh fetch, not after (#175). Reading it
+    # afterwards meant a row written *during* the fetch -- by the webhook
+    # processor in the server process, or a concurrent `whoop_sync`, both of
+    # which share this sqlite file while `reconcile-webhooks` runs as a cron job
+    # -- appeared in `local_ids` but could not appear in `fresh_ids`, and was
+    # soft-deleted at birth. The race window was the whole pagination, minutes
+    # when the shared budget is contested.
+    #
+    # Reading first inverts the failure: a row that arrives mid-fetch is simply
+    # not considered this run, and is reconciled on the next one. Missing a
+    # deletion for one cycle is recoverable; a soft-delete is not (see below).
+    local_records = spec.get_local(conn, whoop_user_id, start=window_start, include_deleted=False)
+    local_ids = {str(record[spec.id_field]) for record in local_records}
+
     fresh_ids: set[str] = set()
     fetched = 0
     cursor: str | None = None
@@ -192,8 +233,30 @@ async def _reconcile_entity(
         if cursor is None:
             break
 
-    local_records = spec.get_local(conn, whoop_user_id, start=window_start, include_deleted=False)
-    local_ids = {str(record[spec.id_field]) for record in local_records}
+    # An empty listing is indistinguishable from a failed one, and treating the
+    # two alike is the whole bug (#175). Genuine errors and exhausted retries do
+    # raise before reaching here, so what is left is a response that *looks*
+    # successful: a 200 with an empty body, or a page whose `next_token` is
+    # wrongly absent, ending pagination early.
+    #
+    # This matters more than a normal false positive because a soft-delete is
+    # permanent by construction: nothing in store.py ever sets `deleted_at` back
+    # to NULL, and the upserts' ON CONFLICT clauses do not touch it -- so a
+    # later sync rewrites the row and leaves it invisible. There is no undelete
+    # to fall back on, which is why this fails closed rather than trusting the
+    # response.
+    if fetched == 0 and len(local_ids) > EMPTY_LISTING_CLOSE_LIMIT:
+        return ReconciliationResult(
+            resource=spec.entity,
+            fetched=0,
+            closed=0,
+            withheld=(
+                f"WHOOP returned no {spec.entity} for the window while {len(local_ids)} "
+                f"are held locally (more than {EMPTY_LISTING_CLOSE_LIMIT}); declining to "
+                "close them, since an empty listing and a failed one look identical here "
+                "and a soft-delete cannot be undone"
+            ),
+        )
 
     missing = local_ids - fresh_ids
     for resource_id in missing:

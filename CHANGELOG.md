@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Issue #175: reconciliation could permanently destroy a member's history on
+  a WHOOP response that only *looked* successful. The fresh-listing diff ran
+  unconditionally, so an empty-but-successful listing -- a 200 with an empty
+  body, or a page whose `next_token` was wrongly absent, ending pagination
+  early -- soft-deleted every locally-held record in the window, exiting 0
+  with a "finished" summary. There is no undelete: nothing in the codebase
+  ever sets `deleted_at` back to NULL, and the upserts' `ON CONFLICT` clauses
+  do not touch it, so a later sync rewrites the row and leaves it invisible.
+  An empty listing may now close at most `EMPTY_LISTING_CLOSE_LIMIT` (5)
+  records; above that it declines and says so on stderr.
+
+  Note this is deliberately narrower than the issue's own acceptance criterion,
+  which asked that an empty listing delete *nothing*. That would have disabled
+  the feature rather than fixed it: closing a hole left by a dropped
+  `*.deleted` event is exactly what reconciliation is for, and a window whose
+  last record was deleted upstream legitimately fetches zero -- an existing
+  test pins that case. The two are separated by size because the response
+  carries no signal that distinguishes them.
+
+- Issue #175: a record written *during* reconciliation's fetch was soft-deleted
+  by that same run. The local set was read after pagination finished, so a row
+  committed in between -- by the server process's webhook handler, or a
+  concurrent `whoop_sync`, both sharing the sqlite file while
+  `reconcile-webhooks` runs from cron -- was present locally but could not
+  appear in a listing already in flight, and was deleted at birth. The local
+  read now happens before the fetch, which inverts the failure: such a row is
+  simply not considered this run and is reconciled on the next one. Missing a
+  deletion for one cycle is recoverable; a soft-delete is not.
+
 ### Added
 
 - Issue #37 (automated-gates half): a `bandit -r src/` CI job, wired but
