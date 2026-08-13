@@ -394,3 +394,45 @@ class TestSecurityLinting:
             "pip-audit step must not have continue-on-error: true"
         )
         assert "|| true" not in context, "pip-audit step must not have '|| true' to allow failures"
+
+
+def test_third_party_actions_in_write_privileged_jobs_are_sha_pinned(
+    project_root: Path,
+) -> None:
+    """Issue #119: a third-party action on a mutable tag inside a job that can
+    write to this repository is a standing supply-chain exposure -- whoever
+    controls the tag gets `contents: write` on every release.
+
+    Scoped deliberately to *non-GitHub* actions in *write-privileged* jobs,
+    which is the audit's own framing: "the one non-GitHub floating-tag action
+    in the highest-privilege job". GitHub-owned actions (`actions/*`,
+    `github/*`) still on tags are a separate, lower-severity concern (issue
+    #124) and are not asserted here, so this test cannot quietly drift into
+    being that one.
+    """
+    import yaml
+
+    sha_pinned = re.compile(r"^[^@]+@[0-9a-f]{40}$")
+    violations: list[str] = []
+
+    for path in sorted((project_root / ".github" / "workflows").glob("*.yml")):
+        workflow = yaml.safe_load(path.read_text())
+        top_level = workflow.get("permissions") or {}
+        for job_name, job in (workflow.get("jobs") or {}).items():
+            perms = job.get("permissions", top_level) or {}
+            if not isinstance(perms, dict):
+                continue
+            writes = sorted(k for k, v in perms.items() if v == "write")
+            if not writes:
+                continue
+            for step in job.get("steps") or []:
+                uses = step.get("uses")
+                if not uses or uses.startswith(("actions/", "github/")):
+                    continue
+                if not sha_pinned.match(uses):
+                    violations.append(f"{path.name}:{job_name} {writes} -> {uses}")
+
+    assert violations == [], (
+        "third-party actions in write-privileged jobs must be pinned by commit SHA, "
+        f"not a mutable tag: {violations}"
+    )
