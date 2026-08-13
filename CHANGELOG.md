@@ -671,6 +671,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #132 (#37 audit, P3, latent): `EncryptedFileTokenStore.load` is a
+  *writer* -- during a pending key rotation it re-seals whatever it just read --
+  and `server.py:448` runs it in a thread for every `/ready` poll while a
+  refresh may be completing on the event loop. A loader could read token X, a
+  refresh save Y, and the loader's re-seal then write X back, leaving a refresh
+  token WHOOP had already rotated away and an `invalid_grant` on the next
+  restart. Reproduced end to end.
+
+  Closed in-process with a per-path re-entrant lock (`_TOKEN_PATH_LOCKS`)
+  serialising the re-seal's compare-and-save against every `save` on that path.
+  That is the scenario the issue actually describes -- `/ready`'s thread and the
+  refresh share one process -- and a `threading.Lock` has none of the drawbacks
+  a file lock would: nothing platform-specific, nothing left behind on a crash,
+  no NFS semantics. An earlier draft of this change rejected locking wholesale on
+  those grounds, which conflated kernel advisory locks with lock *files*; only
+  the latter go stale.
+
+  Across processes it is best effort: the re-seal now compares the file
+  byte-for-byte against what `load` read and skips if anything changed. Measured
+  rather than assumed, the residual window is *not* small -- roughly two thirds
+  of the span from read to rename sits after the compare, because `seal`,
+  `mkstemp`, the write and the `fsync` are all on that side. What the compare
+  buys cross-process is that the common sequential interleaving is caught, not
+  that the race is gone. Cross-process locking is out of scope: multi-process
+  refresh is already documented as unsound.
+
+  Safe because a re-seal is never required for correctness -- the record was
+  already decryptable, and a later `load` migrates it just as well, so skipping
+  only extends how long the old key must stay present.
+
+  Two things found along the way. The re-seal also *recreated a token file
+  deleted during the load*, resurrecting a credential a logout had just removed;
+  it now skips instead. And the compare's first draft read the file back as
+  text, so a non-UTF-8 rewrite inside the window raised `UnicodeDecodeError` out
+  of `load` -- neither `SealError` nor `OSError`, so uncaught, and not
+  `AuthError` either. Reading bytes removes the failure mode structurally.
+
+  One correction to the issue's own text: it attributes the failure mode to
+  #103. Git history says the re-seal-on-load arrived with
+  `EncryptedFileTokenStore` itself; #103 only widened the `except` around it.
+  `load` could lose data before #103 exactly as after.
+
 - Issue #121 (#37 audit, P2, latent): `verify_token` enforced audience and
   issuer but never expiry, and its docstring enumerated the rejection reasons
   while omitting it -- which is how the gap survived review. Nothing else
