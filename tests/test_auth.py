@@ -2274,3 +2274,73 @@ def test_keyring_corrupt_entry_error_does_not_echo_the_entry() -> None:
 def test_keyring_empty_entry_still_returns_none() -> None:
     """No stored token is not an error -- that distinction must survive the fix."""
     assert _keyring_store_with(None).load() is None
+
+
+# -- exchange_code save ordering (issue #134) ----------------------------------
+#
+# By the time `save` runs, WHOOP has already minted the grant. Persisting first
+# meant a failed write left the process holding nothing while a live,
+# refreshable credential existed upstream -- unusable and unrevokable from here.
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(OSError(28, "No space left on device"), id="disk-full"),
+        pytest.param(PermissionError(13, "Permission denied"), id="read-only-state-dir"),
+    ],
+)
+async def test_exchange_code_keeps_the_grant_when_persisting_fails(
+    config: Config, failure: OSError
+) -> None:
+    """A failed save must not lose the only local copy of a live grant."""
+    auth = Authenticator(config)
+    auth.start_login()
+    auth.verify_state(auth._pending_state)
+
+    def boom(_token: Token) -> None:
+        raise failure
+
+    monkeypatched = auth._store
+    monkeypatched.save = boom  # type: ignore[method-assign]
+
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(return_value=_mock_new_token_response())
+        with pytest.raises(type(failure)):
+            await auth.exchange_code("the-code")
+
+    assert auth._token is not None, (
+        "the grant is live upstream; losing the only local copy leaves it "
+        "unusable and unrevokable from here"
+    )
+    assert auth._token.access_token == "new-access"
+
+
+async def test_exchange_code_still_raises_so_the_caller_knows_it_was_not_written(
+    config: Config,
+) -> None:
+    """Retaining the token must not silently swallow the persistence failure."""
+    auth = Authenticator(config)
+    auth.start_login()
+    auth.verify_state(auth._pending_state)
+    auth._store.save = lambda _t: (_ for _ in ()).throw(OSError(28, "full"))  # type: ignore[method-assign]
+
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(return_value=_mock_new_token_response())
+        with pytest.raises(OSError):
+            await auth.exchange_code("the-code")
+
+
+async def test_exchange_code_persists_normally_when_save_succeeds(config: Config) -> None:
+    """The ordering change must not stop the token reaching the store."""
+    auth = Authenticator(config)
+    auth.start_login()
+    auth.verify_state(auth._pending_state)
+
+    with respx.mock:
+        respx.post(TOKEN_URL).mock(return_value=_mock_new_token_response())
+        token = await auth.exchange_code("the-code")
+
+    assert token.access_token == "new-access"
+    stored = auth._store.load()
+    assert stored is not None and stored.access_token == "new-access"

@@ -632,6 +632,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #134 (#37 audit, P3): `Authenticator.exchange_code` now installs the
+  token on the session *before* persisting it. By the time `save` runs WHOOP
+  has already minted the grant, so a failed write -- a full disk, a read-only
+  state directory, a `SealError` from a half-configured key set -- used to
+  leave the process holding nothing while a live, refreshable credential
+  existed upstream: unusable from here and unrevokable, with the user retrying
+  and minting a fresh grant each time. The exception still propagates, so the
+  caller knows the token was not written and will not survive a restart.
+
 - Issue #137 (#37 audit, P3): `KeyringTokenStore.load` now raises `AuthError`
   for a corrupt keychain entry instead of letting the raw
   `JSONDecodeError`/`KeyError`/`ValueError` escape. Both file-backed stores
