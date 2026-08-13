@@ -93,6 +93,10 @@ class EntitySyncResult:
     #: something must not read as a clean one: both otherwise show the same
     #: ``count`` and the same unchanged cursor.
     skipped_implausible: int = 0
+    #: Why this entity did not sync, or ``None`` if it did (#187). Set means
+    #: nothing was fetched and this entity's stored cursor is untouched, so the
+    #: next run retries it from exactly where it was.
+    error: str | None = None
 
 
 def _incremental_entity_key(name: str) -> str:
@@ -212,7 +216,26 @@ async def run_sync(
         )
     results: dict[str, EntitySyncResult] = {}
     for spec in BACKFILL_ENTITIES:
-        results[spec.name] = await _sync_entity(conn, client, whoop_user_id, spec)
+        try:
+            results[spec.name] = await _sync_entity(conn, client, whoop_user_id, spec)
+        except Exception as exc:
+            # Isolated per entity (#187). The four are independent walks over
+            # independent tables, so one failing says nothing about the others:
+            # before this, a single bad entity aborted the loop and denied sync
+            # to every entity after it in `BACKFILL_ENTITIES`, making the blast
+            # radius an accident of ordering rather than of the fault.
+            #
+            # Broad on purpose. What must not happen is a *new* failure mode
+            # taking down three healthy entities because it was not on a list,
+            # and a per-entity fault is data-scoped by construction -- the
+            # failing entity's own cursor is left untouched, so its next run
+            # retries from exactly where it was. `asyncio.CancelledError` is a
+            # BaseException and so still propagates: a cancelled run is not a
+            # partial success, and pretending otherwise would report a sync that
+            # never finished as one that did.
+            results[spec.name] = EntitySyncResult(
+                count=0, high_water_mark=None, error=f"{type(exc).__name__}: {exc}"
+            )
     return results
 
 

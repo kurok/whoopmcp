@@ -1741,12 +1741,18 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
         except SyncDisabledError as exc:
             return {"synced": False, "message": str(exc)}
 
-        return {
-            "synced": True,
+        failed = sorted(name for name, result in results.items() if result.error is not None)
+        response: dict[str, Any] = {
+            # False when ANY entity failed, not only when the whole run was
+            # refused (#187). A caller that checks just this flag must not be
+            # able to read a partial run as a clean one, which is the whole
+            # point of isolating the entities in the first place.
+            "synced": not failed,
             "entities": {
                 name: {
                     "count": result.count,
                     "cursor": result.high_water_mark,
+                    "error": result.error,
                     # Surfaced so a run that refused a record as a cursor
                     # candidate does not read as a clean one (#186) -- both
                     # otherwise show the same count and the same cursor.
@@ -1755,6 +1761,12 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 for name, result in results.items()
             },
         }
+        if failed:
+            response["message"] = (
+                f"{len(failed)} of {len(results)} entities failed to sync "
+                f"({', '.join(failed)}); the rest completed and their cursors advanced"
+            )
+        return response
 
 
 # -- analysis --------------------------------------------------------------
