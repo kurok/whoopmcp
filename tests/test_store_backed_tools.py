@@ -746,3 +746,113 @@ async def test_whoop_data_coverage_excludes_soft_deleted_from_the_window(
     result = await call_tool(server, "whoop_data_coverage", {}, app_context)
 
     assert result["recoveries"]["latest"] == "2026-08-01T06:30:00Z"
+
+
+# -- #174: a range bound is compared against stored timestamps as TEXT, so it
+# has to be canonicalised first -----------------------------------------------
+
+
+def _one_sleep_at(moment: str):
+    """A store holding exactly one sleep stamped `moment` (WHOOP's own form)."""
+    from whoopmcp import store
+
+    conn = store.open_store(":memory:")
+    store.upsert_sleep(conn, 1, {"id": "s1", "start": moment, "score_state": "SCORED"})
+    conn.commit()
+    return conn
+
+
+def test_offset_form_bound_at_the_same_instant_includes_the_record() -> None:
+    """The first direction #174 measured: a bound written with an explicit
+    `+00:00` offset excluded a record stamped at the very same instant.
+
+    `'+'` (0x2B) sorts below `'Z'` (0x5A), so byte-wise the stored
+    `...06:30:00.000Z` compared *greater* than the bound `...06:30:00+00:00`
+    and fell outside an inclusive `<=`. Nothing about the request was
+    ambiguous -- the two strings denote one instant.
+    """
+    from whoopmcp import store
+    from whoopmcp.server import _iso
+
+    conn = _one_sleep_at("2026-07-03T06:30:00.000Z")
+    try:
+        rows = store.get_sleeps(
+            conn, 1, start=_iso("2026-07-03T00:00:00+00:00"), end=_iso("2026-07-03T06:30:00+00:00")
+        )
+        assert len(rows) == 1, "a record at exactly the requested end instant was excluded"
+    finally:
+        conn.close()
+
+
+def test_offset_form_bound_earlier_than_the_record_excludes_it() -> None:
+    """The opposite direction, which matters more: `+03:00` made the window
+    look *wider* than it was.
+
+    `2026-07-03T09:00:00+03:00` is 06:00Z -- half an hour *before* the record.
+    Compared as text it sorted above `...06:30:00.000Z`, so the record was
+    pulled into a window that ended before it happened. Every mean, streak and
+    outlier flag downstream was then computed over data the caller did not ask
+    for.
+    """
+    from whoopmcp import store
+    from whoopmcp.server import _iso
+
+    conn = _one_sleep_at("2026-07-03T06:30:00.000Z")
+    try:
+        rows = store.get_sleeps(
+            conn, 1, start=_iso("2026-07-03T00:00:00Z"), end=_iso("2026-07-03T09:00:00+03:00")
+        )
+        assert rows == [], "a record after the requested end instant was included"
+    finally:
+        conn.close()
+
+
+def test_iso_canonicalises_every_accepted_bound_form() -> None:
+    """All the shapes a caller can send collapse to WHOOP's own stored form.
+
+    This is the property the whole fix rests on: text comparison agrees with
+    chronological order only when both sides share one format. `_iso`'s
+    docstring claimed this before #174 and the string branch did not do it.
+    """
+    from whoopmcp.server import _iso
+
+    canonical = "2026-07-03T06:30:00.000Z"
+    for equivalent in (
+        "2026-07-03T06:30:00Z",
+        "2026-07-03T06:30:00+00:00",
+        "2026-07-03T06:30:00.000000Z",
+        "2026-07-03T09:30:00+03:00",
+        "2026-07-03T01:30:00-05:00",
+        "2026-07-03T06:30:00",  # naive, documented as UTC
+    ):
+        assert _iso(equivalent) == canonical, f"{equivalent} did not canonicalise"
+
+    assert _iso(None) is None
+    assert _iso("2026-07-03") == "2026-07-03T00:00:00.000Z"
+
+
+def test_sub_second_precision_is_the_documented_residue() -> None:
+    """The limit of the fix, pinned rather than left to be rediscovered.
+
+    Canonicalising to WHOOP's millisecond form makes text comparison correct
+    *while WHOOP keeps emitting that form*. A stored value at a different
+    precision can still mis-sort exactly on a boundary -- `...00Z` against
+    `...00.000Z` differs at `Z` versus `.`. That is the same fragility #140
+    was filed about, now confined to sub-second boundaries instead of whole
+    hours.
+
+    If this test starts failing because stored precision changed, the fix
+    needs revisiting rather than the test relaxing.
+    """
+    from whoopmcp import store
+    from whoopmcp.server import _iso
+
+    conn = _one_sleep_at("2026-07-03T06:30:00Z")  # second precision, no millis
+    try:
+        rows = store.get_sleeps(conn, 1, start=None, end=_iso("2026-07-03T06:30:00Z"))
+        assert rows == [], (
+            "stored precision now matches the canonical form -- the residue documented "
+            "in _iso may be gone, and that docstring should be re-derived"
+        )
+    finally:
+        conn.close()

@@ -671,6 +671,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #174 (P2, reachable): the store compares range bounds against stored
+  timestamps **as text**, and `_iso` passed a caller's string through untouched,
+  so an offset-form bound was compared byte-wise against WHOOP's `Z` form. `+`
+  (0x2B) and `.` (0x2E) both sort below `Z` (0x5A), which is wrong in both
+  directions and by as much as the offset:
+
+  - `end = "2026-07-03T06:30:00+00:00"` **excluded** a record stamped
+    `2026-07-03T06:30:00.000Z` -- the same instant.
+  - `end = "2026-07-03T09:00:00+03:00"` (06:00Z, *before* the record)
+    **included** it.
+
+  Caller bounds are now converted to UTC and emitted in WHOOP's own millisecond
+  form, so the text comparison means what the caller asked for. `_iso`'s
+  docstring already claimed both its inputs became "one consistent string
+  shape"; that was simply not true of the string branch.
+
+  This is #140's bug in a second place, and worse: #140's inputs were WHOOP's own
+  uniformly-formatted values, so it was latent. These strings come from the
+  caller, so it is reachable today. Every aggregate -- means, rolling windows,
+  streaks, outlier flags, period comparisons -- was computed over the wrong slice,
+  and `range_coverage` could report a window as covered while the SQL had sliced
+  it lexicographically, so the reassurance and the data disagreed.
+
+  Honest limit, pinned by a test: the fix rests on stored timestamps being
+  uniformly WHOOP's millisecond `Z` form (verified). Against a stored value at a
+  different precision, a boundary record can still mis-sort -- `...00Z` versus
+  `...00.000Z` differ at `Z` against `.` -- and in that constructed case the new
+  behaviour *excludes* a record `main` happened to include. Not reachable with
+  real data, an hours-scale error traded for a sub-second one, and the real
+  long-term fix is comparing instants rather than text.
+
 - Issue #159 (found fixing #125, P3, latent): #125 pinned `build`, `twine` and
   `pip-audit` to exact versions, which fixed *which release of the named tool*
   executes and left each tool's dependency closure to be resolved against PyPI at
