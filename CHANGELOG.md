@@ -632,6 +632,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #137 (#37 audit, P3): `KeyringTokenStore.load` now raises `AuthError`
+  for a corrupt keychain entry instead of letting the raw
+  `JSONDecodeError`/`KeyError`/`ValueError` escape. Both file-backed stores
+  already wrapped the identical `Token.from_json` call; the keyring store
+  called it bare, breaking `TokenStore.load`'s `Token | None` or `AuthError`
+  contract and bypassing callers that catch `AuthError` to redact a failure,
+  such as `doctor`'s store check. The message names the exception type but
+  never the entry: unlike a file path, the keychain entry is itself the
+  credential. An empty entry still returns `None` -- no stored token is not an
+  error.
+
 - Issue #135 (#37 audit, P3): the lazy re-seal in `EncryptedFileTokenStore.load`
   now tolerates a failed *write*, not just a missing key. #103 made a missing
   re-seal key serve the token unrotated rather than raise, but its guard caught

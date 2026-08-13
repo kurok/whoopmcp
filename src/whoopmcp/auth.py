@@ -382,8 +382,27 @@ class KeyringTokenStore:
         self._keyring = keyring
 
     def load(self) -> Token | None:
+        """Return the stored token, or ``None`` if the keychain holds none.
+
+        A corrupt entry raises ``AuthError``, matching the file-backed stores
+        (issue #137). Without this the raw ``JSONDecodeError``/``KeyError``
+        escaped, breaking the ``TokenStore.load`` contract of ``Token | None``
+        or ``AuthError`` -- and callers that catch ``AuthError`` to redact a
+        failure, such as ``doctor``'s store check, never saw it.
+
+        The message deliberately does not include the offending value: unlike
+        a file path, the entry itself is the credential.
+        """
         raw = self._keyring.get_password(self.SERVICE, self.USERNAME)
-        return Token.from_json(raw) if raw else None
+        if not raw:
+            return None
+        try:
+            return Token.from_json(raw)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise AuthError(
+                f"the token in the {self.SERVICE} keychain entry is unreadable: "
+                f"{type(exc).__name__}"
+            ) from exc
 
     def save(self, token: Token) -> None:
         # No atomicity guarantee of our own here, unlike FileTokenStore's
