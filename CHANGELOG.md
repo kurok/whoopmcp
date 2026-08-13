@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #188: `export-member` could destroy an export it had already built.
+  `_export_member` reads the token store after assembling the full health
+  document, purely to name the granted scopes in a `consent` field. That read
+  was unguarded, and nothing upstream catches it, so an unreadable token store
+  killed the whole command: a traceback, exit 1, and no JSON written at all --
+  including the health data already read successfully. A convenience field was
+  denying the data-subject right the command exists to serve.
+
+  The read now degrades to the same scopes-unknown shape the ambiguous-member
+  case already used, and the export still writes in full.
+
+  `AuthError` alone was not enough. `FileTokenStore.load` guards only
+  `FileNotFoundError` around its `read_text`, so a token file that exists but
+  cannot be read still raised the raw OSError -- `PermissionError` from a state
+  directory restored under another uid, `IsADirectoryError`, or
+  `UnicodeDecodeError` from non-UTF-8 bytes. Each is "the token store cannot be
+  read" by any ordinary reading, and each destroyed the export. All three are
+  now handled. The underlying contract violation in `auth.py`, which `doctor.py`
+  shares, is filed separately.
+
+
 - Issue #181: `days_missing` understated coverage gaps by a day, hiding them.
   `_summarize_window` measured the window as `(end - start).days`, which
   truncates the trailing partial day, so the inclusive whole-day window a

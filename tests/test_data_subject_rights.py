@@ -1899,3 +1899,522 @@ def test_execute_scoped_docstring_false_claim_corrected() -> None:
     assert false_claim not in docstring, (
         f"_execute_scoped's docstring still contains the false claim: {false_claim!r}"
     )
+
+
+# =============================================================================
+# Issue #188: export-member graceful degradation when consent enrichment
+# fails. Build the complete health document first, then attempt to enrich
+# the consent field; if that fails, still write the export with a degraded
+# consent block. Two failure paths must both be covered:
+#   a. build_store() itself raises (backend unavailable)
+#   b. build_store().load() raises (token undecryptable)
+# =============================================================================
+
+MEMBER_ISSUE_188 = 930001  # disjoint from other test files' ranges
+
+
+def test_export_member_with_keyring_backend_unavailable_writes_complete_health_data_to_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #188 test 1a (backend unavailable, output to file): when the token
+    store backend is unavailable (keyring extra not installed), export-member
+    must still write the complete health document to the output file and exit 0.
+    The whole point is that the export succeeds even when consent enrichment fails."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    # Force keyring backend, which will fail on build_store() because the
+    # extra is not installed in this test environment.
+    monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "keyring")
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_188
+    )
+    # Seed health data so the export contains real records to verify
+    _seed_recovery(conn, MEMBER_ISSUE_188, "recovery-tag-188", cycle_id=1)
+    _seed_sleep(conn, MEMBER_ISSUE_188, "sleep-tag-188", sleep_id=f"sleep-{MEMBER_ISSUE_188}")
+    _seed_cycle(conn, MEMBER_ISSUE_188, "cycle-tag-188", cycle_id=MEMBER_ISSUE_188)
+    conn.close()
+
+    out_path = tmp_path / "export.json"
+    exit_code = main(
+        ["export-member", "--whoop-user-id", str(MEMBER_ISSUE_188), "--out", str(out_path)]
+    )
+
+    # Must exit 0, not raise or return a failure code
+    assert exit_code == 0
+
+    # File must exist and be valid JSON
+    assert out_path.exists()
+    import json as _json
+
+    document = _json.loads(out_path.read_text(encoding="utf-8"))
+
+    # Key assertion: the ACTUAL HEALTH RECORDS must be present in the export
+    assert document["whoop_user_id"] == MEMBER_ISSUE_188
+    assert len(document["recoveries"]) == 1, "recovery record must be in export"
+    assert document["recoveries"][0]["score"]["recovery_score"] == "recovery-tag-188"
+    assert len(document["sleeps"]) == 1, "sleep record must be in export"
+    assert document["sleeps"][0]["score"]["sleep_performance_percentage"] == "sleep-tag-188"
+    assert len(document["cycles"]) == 1, "cycle record must be in export"
+    assert document["cycles"][0]["score"]["strain"] == "cycle-tag-188"
+
+
+def test_export_member_with_keyring_backend_unavailable_consent_shows_scopes_undetermined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #188 test 2a (backend unavailable, check consent): when the token
+    store backend fails, the consent block must state plainly that scopes
+    could not be determined, using the exact structure from the ambiguous-member
+    case (None values with an explanatory note)."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "keyring")
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_188
+    )
+    conn.close()
+
+    out_path = tmp_path / "export.json"
+    exit_code = main(
+        ["export-member", "--whoop-user-id", str(MEMBER_ISSUE_188), "--out", str(out_path)]
+    )
+
+    assert exit_code == 0
+    import json as _json
+
+    document = _json.loads(out_path.read_text(encoding="utf-8"))
+
+    # Consent block must have the degraded shape
+    assert "consent" in document
+    consent = document["consent"]
+    assert consent["scopes"] is None, "scopes must be None when consent enrichment fails"
+    assert consent["token_present"] is None, (
+        "token_present must be None when consent enrichment fails"
+    )
+    assert "note" in consent, "must include explanatory note"
+    assert isinstance(consent["note"], str)
+    assert len(consent["note"]) > 0, "note must not be empty"
+
+
+def test_export_member_with_encrypted_file_wrong_key_writes_complete_health_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #188 test 1b (token undecryptable, output to file): when the token
+    was encrypted under a key that is no longer supplied, export-member must
+    still write the complete health document and exit 0. This tests the second
+    failure path: build_store() succeeds, but .load() raises."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+    from whoopmcp.crypto import seal
+
+    # Set up encrypted-file backend with key version 1
+    key_1 = os.urandom(32)
+    key_1_b64 = __import__("base64").b64encode(key_1).decode()
+    monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "encrypted-file")
+    monkeypatch.setenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_V1", key_1_b64)
+    monkeypatch.setenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION", "1")
+
+    config = ConfigCls.from_env()
+
+    # Save a token encrypted under key 1
+    token_obj = Token("access-123", expires_at=time.time() + 3600, refresh_token="refresh-456")
+    token_json = token_obj.to_json()
+    sealed = seal(
+        token_json.encode(),
+        keys={1: key_1},
+        current_version=1,
+        associated_data=b"whoopmcp.token",
+    )
+    config.token_path.parent.mkdir(parents=True, exist_ok=True)
+    config.token_path.write_text(__import__("json").dumps(sealed), encoding="utf-8")
+
+    # Now change the current key version to 2, and provide only key 2
+    # This simulates the "lazy rotation mistake" where the new key is
+    # current but the old key is missing
+    key_2 = os.urandom(32)
+    key_2_b64 = __import__("base64").b64encode(key_2).decode()
+    monkeypatch.setenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_V2", key_2_b64)
+    monkeypatch.setenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION", "2")
+    monkeypatch.delenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_V1")
+
+    # Reload config with the new key setup
+    config = ConfigCls.from_env()
+
+    # Seed the store with linked member and health data
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_188
+    )
+    _seed_recovery(conn, MEMBER_ISSUE_188, "recovery-tag-188", cycle_id=1)
+    _seed_sleep(conn, MEMBER_ISSUE_188, "sleep-tag-188", sleep_id=f"sleep-{MEMBER_ISSUE_188}")
+    conn.close()
+
+    out_path = tmp_path / "export.json"
+    exit_code = main(
+        ["export-member", "--whoop-user-id", str(MEMBER_ISSUE_188), "--out", str(out_path)]
+    )
+
+    # Must exit 0, not raise
+    assert exit_code == 0
+
+    # File must exist with complete health data
+    assert out_path.exists()
+    import json as _json
+
+    document = _json.loads(out_path.read_text(encoding="utf-8"))
+    assert document["whoop_user_id"] == MEMBER_ISSUE_188
+    assert len(document["recoveries"]) == 1, (
+        "recovery must be in export despite token decryption failure"
+    )
+    assert document["recoveries"][0]["score"]["recovery_score"] == "recovery-tag-188"
+    assert len(document["sleeps"]) == 1, "sleep must be in export despite token decryption failure"
+
+
+def test_export_member_with_encrypted_file_wrong_key_consent_shows_scopes_undetermined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #188 test 2b (token undecryptable, check consent): when the token
+    is undecryptable, the consent block must state scopes could not be determined."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+    from whoopmcp.crypto import seal
+
+    # Set up encrypted-file with key version 1, save a token
+    key_1 = os.urandom(32)
+    key_1_b64 = __import__("base64").b64encode(key_1).decode()
+    monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "encrypted-file")
+    monkeypatch.setenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_V1", key_1_b64)
+    monkeypatch.setenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION", "1")
+
+    config = ConfigCls.from_env()
+
+    token_obj = Token("access-123", expires_at=time.time() + 3600, refresh_token="refresh-456")
+    token_json = token_obj.to_json()
+    sealed = seal(
+        token_json.encode(),
+        keys={1: key_1},
+        current_version=1,
+        associated_data=b"whoopmcp.token",
+    )
+    config.token_path.parent.mkdir(parents=True, exist_ok=True)
+    config.token_path.write_text(__import__("json").dumps(sealed), encoding="utf-8")
+
+    # Switch to key version 2 (old key no longer available)
+    key_2 = os.urandom(32)
+    key_2_b64 = __import__("base64").b64encode(key_2).decode()
+    monkeypatch.setenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_V2", key_2_b64)
+    monkeypatch.setenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION", "2")
+    monkeypatch.delenv("WHOOPMCP_TOKEN_ENCRYPTION_KEY_V1")
+
+    config = ConfigCls.from_env()
+
+    # Seed store
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_188
+    )
+    conn.close()
+
+    out_path = tmp_path / "export.json"
+    exit_code = main(
+        ["export-member", "--whoop-user-id", str(MEMBER_ISSUE_188), "--out", str(out_path)]
+    )
+
+    assert exit_code == 0
+    import json as _json
+
+    document = _json.loads(out_path.read_text(encoding="utf-8"))
+
+    # Consent must show scopes undetermined
+    consent = document["consent"]
+    assert consent["scopes"] is None
+    assert consent["token_present"] is None
+    assert "note" in consent
+    assert isinstance(consent["note"], str)
+
+
+def test_export_member_with_unreadable_token_store_to_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #188 test 4b (stdout output path, backend-unavailable trigger): when
+    output is to stdout (no --out FILE), the export must still be printed
+    with the degraded consent block and exit 0."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "keyring")
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_188
+    )
+    _seed_recovery(conn, MEMBER_ISSUE_188, "recovery-tag-188", cycle_id=1)
+    conn.close()
+
+    # No --out, so export goes to stdout
+    exit_code = main(["export-member", "--whoop-user-id", str(MEMBER_ISSUE_188)])
+
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    import json as _json
+
+    document = _json.loads(captured.out)
+
+    # Verify health data is present
+    assert document["whoop_user_id"] == MEMBER_ISSUE_188
+    assert len(document["recoveries"]) == 1
+    assert document["recoveries"][0]["score"]["recovery_score"] == "recovery-tag-188"
+
+    # Verify consent is degraded
+    assert document["consent"]["scopes"] is None
+    assert document["consent"]["token_present"] is None
+    assert "note" in document["consent"]
+
+
+def test_export_member_normal_case_still_produces_real_scopes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #188 test 5 (regression): when the token store IS readable, the
+    normal export flow must still work: consent.scopes and token_present must
+    both reflect the real token."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    # Use default "file" backend, which will work fine
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    FileTokenStore(config.token_path).save(
+        Token(
+            "access-tok",
+            expires_at=time.time() + 3600,
+            refresh_token="refresh-tok",
+            scopes=("read:sleep", "offline"),
+        )
+    )
+
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_188
+    )
+    _seed_recovery(conn, MEMBER_ISSUE_188, "recovery-tag", cycle_id=1)
+    conn.close()
+
+    out_path = tmp_path / "export.json"
+    exit_code = main(
+        ["export-member", "--whoop-user-id", str(MEMBER_ISSUE_188), "--out", str(out_path)]
+    )
+
+    assert exit_code == 0
+    import json as _json
+
+    document = _json.loads(out_path.read_text(encoding="utf-8"))
+
+    # Consent must reflect the real token
+    assert document["consent"]["scopes"] == ["read:sleep", "offline"], "must have real scopes"
+    assert document["consent"]["token_present"] is True, "must report token as present"
+    assert "note" not in document["consent"], "no note when token is readable"
+
+    # Health data still present
+    assert len(document["recoveries"]) == 1
+
+
+def test_export_member_with_unreadable_token_store_error_text_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #188 test 6 (no secrets leaked): when consent enrichment fails,
+    the consent note and any stderr output must never include token values,
+    keys, or other sensitive material."""
+    _set_required_env_and_state_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "keyring")
+
+    from whoopmcp import store as store_module
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    conn = store_module.open_store(config.cache_path)
+    store_module.link_principal_to_member(
+        conn, client_id="local", issuer=None, subject=None, whoop_user_id=MEMBER_ISSUE_188
+    )
+    conn.close()
+
+    out_path = tmp_path / "export.json"
+    exit_code = main(
+        ["export-member", "--whoop-user-id", str(MEMBER_ISSUE_188), "--out", str(out_path)]
+    )
+
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    import json as _json
+
+    document = _json.loads(out_path.read_text(encoding="utf-8"))
+
+    # The note explains what happened; it must not relay what the internals said.
+    # Each fragment is checked on its own -- an `or` between two forbidden terms
+    # passes as soon as either is absent, which is no assertion at all.
+    note = document["consent"].get("note", "")
+    everything = " ".join(_walk_strings(document)) + captured.out + captured.err
+
+    for fragment in (
+        "pip install",
+        "whoopmcp[keyring]",
+        "requires the extra",
+        "No module named",
+        "failed to decrypt",
+        str(out_path.parent),  # the state dir, and so the token file's location
+    ):
+        assert fragment not in note, (
+            f"the consent note relayed internal detail {fragment!r}: {note!r}"
+        )
+
+    # The note must still say something useful rather than being empty.
+    assert "could not be" in note, f"the note must explain the degradation, got {note!r}"
+
+    # And no credential material anywhere in the emitted document or streams.
+    for secret_marker in ("access_token", "refresh_token", "Bearer ", "-----BEGIN"):
+        assert secret_marker not in everything, (
+            f"credential-shaped text {secret_marker!r} reached the export or the console"
+        )
+
+
+def _export_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member: int, backend: str | None = None
+) -> dict[str, Any]:
+    """Run ``export-member`` for ``member`` and return the JSON it wrote.
+
+    Seeds every entity table, so a caller can compare a degraded export against
+    a healthy one key-by-key rather than spot-checking the three collections a
+    test happened to think of.
+    """
+    state = tmp_path / f"state-{member}"
+    state.mkdir(parents=True, exist_ok=True)
+    _set_required_env_and_state_dir(monkeypatch, state)
+    if backend is not None:
+        monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", backend)
+
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    conn = store.open_store(config.cache_path)
+    try:
+        store.link_principal_to_member(
+            conn, client_id="local", issuer=None, subject=None, whoop_user_id=member
+        )
+        _seed_every_entity_table(conn, member, f"tag-{member}")
+    finally:
+        conn.close()
+
+    out = tmp_path / f"export-{member}.json"
+    assert main(["export-member", "--whoop-user-id", str(member), "--out", str(out)]) == 0
+    import json as _json
+
+    document: dict[str, Any] = _json.loads(out.read_text(encoding="utf-8"))
+    return document
+
+
+def test_degraded_export_holds_everything_the_healthy_one_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The degraded path must not quietly become a smaller export.
+
+    ``export_member_data`` returns 13 keys. A test that seeds and checks only
+    recoveries, sleeps and cycles passes just as happily against a degraded
+    branch that dropped profile, body measurements, workouts, webhook events and
+    the audit trail -- a partial version of exactly the loss #188 exists to
+    prevent. Verified: a mutation discarding 8 of the 13 keys passed the whole
+    suite before this test existed.
+
+    So the assertion is the comparison itself -- healthy and degraded must carry
+    the same keys -- rather than a hand-maintained list of entities.
+    """
+    healthy = _export_document(tmp_path, monkeypatch, 940001)
+    degraded = _export_document(tmp_path, monkeypatch, 940002, backend="keyring")
+
+    ignored = {"whoop_user_id", "exported_at", "consent"}
+    healthy_keys = {key for key in healthy if key not in ignored}
+    degraded_keys = {key for key in degraded if key not in ignored}
+    assert degraded_keys == healthy_keys, (
+        "the degraded export must carry every key the healthy one does; "
+        f"missing={healthy_keys - degraded_keys} extra={degraded_keys - healthy_keys}"
+    )
+    # Present-but-emptied would satisfy the key comparison, so check real rows.
+    assert degraded["profile"]["email"] == "tag-940002"
+    assert degraded["body_measurement"]["weight_kilogram"] == "tag-940002"
+    assert len(degraded["workouts"]) == 1
+    assert len(degraded["recoveries"]) == 1
+    assert degraded["consent"]["scopes"] is None
+
+
+def test_degraded_export_does_not_leak_a_stored_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seed a real token with sentinel values, then force the degraded path.
+
+    The other redaction test asserts the absence of ``access_token``/``Bearer``
+    in a scenario where no token was ever written -- unfalsifiable, and proven
+    so: a mutation dumping the plaintext token file into the consent note passed
+    the entire suite. A sentinel that genuinely exists on disk is what makes the
+    assertion mean anything.
+
+    It also covers the case the widened guard added: a token file that exists
+    and is full of secrets but cannot be read (mode 000), which raised
+    ``PermissionError`` straight out of the command before #188.
+    """
+    state = tmp_path / "state-leak"
+    state.mkdir(parents=True, exist_ok=True)
+    _set_required_env_and_state_dir(monkeypatch, state)
+
+    from whoopmcp.config import Config as ConfigCls
+
+    config = ConfigCls.from_env()
+    import json as _json
+
+    config.token_path.write_text(
+        _json.dumps(
+            {
+                "access_token": "SENTINEL-ACCESS-zzqq7788",
+                "refresh_token": "SENTINEL-REFRESH-vvmm3344",
+                "scopes": ["read:recovery"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.token_path.chmod(0o000)
+
+    conn = store.open_store(config.cache_path)
+    try:
+        store.link_principal_to_member(
+            conn, client_id="local", issuer=None, subject=None, whoop_user_id=940003
+        )
+        _seed_every_entity_table(conn, 940003, "tag-940003")
+    finally:
+        conn.close()
+
+    out = tmp_path / "export-leak.json"
+    try:
+        exit_code = main(["export-member", "--whoop-user-id", "940003", "--out", str(out)])
+    finally:
+        config.token_path.chmod(0o600)
+
+    assert exit_code == 0, "an unreadable-but-present token file must not deny the export"
+    written = out.read_text(encoding="utf-8")
+    assert "tag-940003" in written, "the health data must be there to leak from"
+    for sentinel in ("SENTINEL-ACCESS-zzqq7788", "SENTINEL-REFRESH-vvmm3344"):
+        assert sentinel not in written, f"{sentinel} reached the member's export document"

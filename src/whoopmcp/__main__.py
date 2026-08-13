@@ -445,6 +445,12 @@ def _delete_member(config: Config, whoop_user_id: int) -> int:
     being alive, nor does it revoke a token it cannot attribute to this
     member -- see ``_revoke_before_local_deletion`` (issue #65).
 
+    If the token store cannot be read at all -- backend extra missing, key
+    retired, file unreadable -- ``consent`` degrades to the same
+    scopes-unknown shape with its own note, and the export still writes in
+    full (#188). The document is the right being exercised; the consent field
+    describes it.
+
     Refuses -- before opening anything -- when the store is ephemeral and no
     file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101).
     """
@@ -506,7 +512,7 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
     Refuses -- before opening anything -- when the store is ephemeral and no
     file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101).
     """
-    from whoopmcp.auth import atomic_write_text, build_store
+    from whoopmcp.auth import AuthError, atomic_write_text, build_store
     from whoopmcp.store import (
         all_linked_whoop_user_ids,
         export_member_data,
@@ -532,11 +538,38 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
         conn.close()
 
     if linked_ids == {whoop_user_id}:
-        token = build_store(config).load()
-        document["consent"] = {
-            "scopes": list(token.scopes) if token is not None else [],
-            "token_present": token is not None,
-        }
+        try:
+            token = build_store(config).load()
+            document["consent"] = {
+                "scopes": list(token.scopes) if token is not None else [],
+                "token_present": token is not None,
+            }
+        except (AuthError, OSError, UnicodeDecodeError):
+            # Degrade rather than fail: `consent` is a convenience describing
+            # what was granted, while the document itself is the data-subject
+            # right being exercised. Letting the convenience deny the right is
+            # backwards, and that is precisely what happened before #188 -- an
+            # unreadable token store threw away a health export that had already
+            # been read successfully.
+            #
+            # `AuthError` alone is not enough. `FileTokenStore.load` guards only
+            # `FileNotFoundError` around its `read_text`, so a token file that
+            # exists but cannot be read still raises the raw OSError:
+            # `PermissionError` from a state directory restored under another
+            # uid, `IsADirectoryError`, or `UnicodeDecodeError` from non-UTF-8
+            # bytes. Each of those is "the token store cannot be read" by any
+            # ordinary reading, and each destroyed the export.
+            #
+            # The narrowness that matters is the try body, not the exception
+            # tuple: it holds only the token read and a dict literal, so nothing
+            # in scope here could fail in a way that ought to abort the export.
+            document["consent"] = {
+                "scopes": None,
+                "token_present": None,  # nosec B105 -- the literal None (unknown, not a credential value)
+                "note": (
+                    "the token store could not be read, so granted scopes could not be determined"
+                ),
+            }
     else:
         document["consent"] = {
             "scopes": None,
