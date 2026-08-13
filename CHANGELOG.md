@@ -632,6 +632,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #130 (#37 audit, P3): the comment justifying `webhook_events`'
+  exclusion from `_TENANT_SCOPED_TABLES` said its `whoop_user_id` "is nullable
+  pre-identity-resolution data". #105 made that column `NOT NULL`, so the
+  exclusion outlived its stated reason. The exclusion is still correct, but on
+  different grounds -- reachability: the table is read only by `trace_id` from
+  `webhook_processor`, or by a per-member reader that filters on
+  `whoop_user_id` itself for #32's export, so the boundary is enforced by the
+  callers rather than by that registry. It does hold member data, which is why
+  `_ERASURE_TABLES` includes it. A test now pins those facts, so the rationale
+  fails loudly if reality moves under it again.
+
 - Issue #136 (#37 audit, P3): `atomic_write_text` now `fsync`s the data before
   the rename and the parent directory after it. Write-then-rename is atomic
   against a *process* crash on its own, but not against power loss: the rename

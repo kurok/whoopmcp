@@ -2456,3 +2456,41 @@ def test_member_equality_not_caught_list_is_truthful() -> None:
             f"_MEMBER_EQUALITY_PREDICATE's comment still lists {shape!r} in its "
             "NOT-CAUGHT section; it should be moved to CAUGHT after the fix"
         )
+
+
+# -- exclusion rationale stays true (issue #130) -------------------------------
+
+
+def test_webhook_events_exclusion_rests_on_reachability_not_nullability() -> None:
+    """Pin the facts `webhook_events`'s exclusion rationale depends on.
+
+    The comment above `_TENANT_SCOPED_TABLES` used to justify the exclusion by
+    saying the column "is nullable pre-identity-resolution data". #105 made it
+    NOT NULL, so the exclusion outlived its stated reason -- a future reader
+    deciding whether the table belongs in the scoped set would have reasoned
+    from a false premise.
+
+    This asserts the reality the corrected comment describes, not its wording.
+    A test that greps prose would block a legitimate rewrite; one that pins
+    facts fails when the facts move, which is when the comment needs revisiting.
+    """
+    source = inspect.getsource(store)
+
+    # The old justification cannot be revived: the column is NOT NULL.
+    assert "whoop_user_id INTEGER NOT NULL" in source
+
+    # The exclusion itself, and the erasure coverage that must accompany it
+    # because the table does hold member data.
+    assert "webhook_events" not in store._TENANT_SCOPED_TABLES
+    assert "webhook_events" in store._ERASURE_TABLES
+
+    # The reachability the exclusion now rests on: one reader by trace_id, one
+    # that filters by member itself. A third reader that did neither would make
+    # the exclusion unsafe, and should fail here.
+    by_trace = inspect.getsource(store.get_webhook_event)
+    assert "WHERE trace_id = ?" in by_trace, "get_webhook_event must still be keyed by trace_id"
+
+    by_member = inspect.getsource(store.get_webhook_events_for_member)
+    assert "whoop_user_id = ?" in by_member, (
+        "the per-member reader must still filter by whoop_user_id itself"
+    )
