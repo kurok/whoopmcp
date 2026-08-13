@@ -363,8 +363,15 @@ _MIGRATIONS: dict[int, str] = {
 
 #: Tables filtered by ``whoop_user_id`` that ``_execute_scoped`` enforces a
 #: read of that column against, on every touch. Deliberately excludes:
-#: ``webhook_events`` (its ``whoop_user_id`` is nullable pre-identity-resolution
-#: data -- issue #18's own design, not a leak surface #29 is about), and
+#: ``webhook_events`` (server-internal delivery bookkeeping, reached only two
+#: ways: ``get_webhook_event`` by ``trace_id``, called by
+#: ``webhook_processor`` and never per-principal from an MCP tool, and
+#: ``get_webhook_events_for_member``, which filters by ``whoop_user_id``
+#: itself for #32's export. So the boundary is enforced by the callers rather
+#: than by this registry. The reason originally given here -- that the column
+#: was nullable pre-identity-resolution -- stopped being true when #105 made
+#: it ``NOT NULL``; the exclusion stands on reachability alone. It does hold
+#: member data, which is why ``_ERASURE_TABLES`` includes it), and
 #: ``principal_members``/``tool_call_audit`` (the identity/audit layer itself,
 #: not member data to filter by member). If a new tenant-scoped table is ever
 #: added here without a matching cross-read test case, ``tests/test_tenancy.py
