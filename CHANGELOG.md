@@ -671,6 +671,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #139 (#37 audit, P3, latent): a webhook payload's `id` was copied into
+  `WebhookEvent.resource_id` with no shape check and interpolated straight into
+  an outbound request path -- `client.get_sleep` builds
+  `f"/v2/activity/sleep/{sleep_id}"` -- so an `id` of
+  `../../v2/user/profile/basic` traverses to a different WHOOP endpoint, fetched
+  with the member's own bearer token. `_parse_event` now requires a standard
+  hyphenated UUID.
+
+  Reproduced against the unfixed code rather than argued: a stored hostile body
+  replayed through `replay_webhook_event` issues **five** real requests to
+  `https://api.prod.whoop.com/developer/v2/v2/user/profile/basic` -- the retry
+  loop, each attempt a genuine traversal out of the sleep endpoint. Note the
+  resolved path: `BASE_URL` ends in `/developer`, so the escape stays inside
+  WHOOP's API and cannot reach another host, which is why this is hardening
+  rather than an SSRF.
+
+  Still latent: a body only reaches the parser after `verify_webhook_request`'s
+  HMAC gate, so forging one needs the client secret. The other route in is
+  `replay_webhook_event` re-parsing an already-stored body, which is covered too,
+  because validation happens at parse time and both live delivery and replay go
+  through `_parse_event`. Rejection is placed before `insert_webhook_event`, so a
+  hostile id leaves no row behind for a later replay to pick up.
+
+  All three webhook resources are UUID-keyed, including `recovery`, whose events
+  carry the *sleep* UUID. `cycle` -- the one resource keyed by an integer -- is
+  deliberately not in `_WEBHOOK_RESOURCES`, and the integer `cycle_id` that
+  `_apply_event` does use comes from the store or from WHOOP's own response body,
+  never from the payload. So a single UUID rule is correct for everything the
+  payload can name.
+
+  Test ids in `test_webhook_processing.py` became real UUIDs via a deterministic
+  `uuid5` helper, which keeps the readable label in the source. Without that they
+  would have exercised the new rejection path instead of whatever each test is
+  about -- the same trap #121 hit with `expires_at`.
 - Issue #132 (#37 audit, P3, latent): `EncryptedFileTokenStore.load` is a
   *writer* -- during a pending key rotation it re-seals whatever it just read --
   and `server.py:448` runs it in a thread for every `/ready` poll while a
