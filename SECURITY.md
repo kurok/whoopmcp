@@ -57,9 +57,12 @@ Deliberate choices, so you can tell a decision from an oversight:
 
 - **No shared credentials.** Every user registers their own WHOOP app. There
   is no client secret in this repository and never should be.
-- **No write path.** The only mutating endpoint WHOOP exposes to an OAuth
-  client is `DELETE /v2/user/access`; it is not implemented, so a model
-  cannot revoke your grant. `whoop_logout` only deletes your local token.
+- **No write path reachable by a model.** The only mutating endpoint WHOOP
+  exposes to an OAuth client is `DELETE /v2/user/access`. It *is* implemented
+  (`auth.py`'s `revoke_upstream`, since #30) but is never registered as an MCP
+  tool, so no model can revoke your grant; it is reachable only from a
+  terminal, as the operator-run `whoopmcp delete-member`/`erase-member`.
+  `whoop_logout` only deletes your local token.
 - **Least privilege by scope.** `WHOOPMCP_SCOPES` lets you narrow what the
   server can read at the WHOOP authorisation boundary, which is stronger than
   any check this code could perform on itself.
@@ -71,5 +74,21 @@ Deliberate choices, so you can tell a decision from an oversight:
   [PRIVACY.md](PRIVACY.md) rather than treated as a vulnerability report.
 - **`state` is compared with `secrets.compare_digest`** against a
   `token_urlsafe(32)` value generated per login.
-- **Logs go to stderr,** never stdout: on stdio transport stdout carries the
-  JSON-RPC framing.
+- **This server's own logs go to stderr,** never stdout: on stdio transport
+  stdout carries the JSON-RPC framing. One caveat found by the #37 audit and
+  tracked in #126: under `streamable-http` the embedded uvicorn writes its
+  *access* log (including client IPs) to stdout with its default
+  configuration. That does not affect stdio, where the framing lives.
+
+## Audit history
+
+- **2026-08-13 — full security review (#37), against `5e30866`.** Five areas
+  audited independently (token storage and crypto, both OAuth boundaries,
+  tenancy/SQL/erasure, webhooks and SSRF, log leakage/dependencies/CI supply
+  chain/docs), then verified by an adversarial review pass that reproduced or
+  re-derived every accepted finding. 22 findings filed as #119-#140: five P2,
+  seventeen P3, no P0 or P1. `bandit` was wired into CI in #118 and is green
+  with every suppression justified inline. The threat model this produced is
+  [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
+- **Earlier scoped audit (#69)** of the hosted surface produced eight findings
+  (#98-#105), all since closed.
