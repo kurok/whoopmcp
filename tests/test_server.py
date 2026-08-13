@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import re
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 from whoopmcp.auth import TOKEN_URL, Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, WhoopClient
 from whoopmcp.config import Config
-from whoopmcp.server import AppContext, Principal, build_server, lifespan
+from whoopmcp.server import (
+    _MAX_LIST_LIMIT,
+    AppContext,
+    Principal,
+    build_server,
+    lifespan,
+)
 from whoopmcp.store import (
     link_principal_to_member,
     open_store,
@@ -966,6 +973,277 @@ async def test_list_recoveries_default_date_range(
     result = await call_tool(server, "list_recoveries", {}, app_context)
 
     assert {record["cycle_id"] for record in result["records"]} == {100}
+
+
+# -- issue #173: upper-bound limit validation for list tools ----------------
+
+
+@pytest.mark.parametrize(
+    "tool_name,fixture_fn,upsert_fn",
+    [
+        ("list_recoveries", recovery_fixture, upsert_recovery),
+        ("list_sleeps", sleep_fixture, upsert_sleep),
+        ("list_workouts", workout_fixture, upsert_workout),
+        ("list_cycles", cycle_fixture, upsert_cycle),
+    ],
+)
+async def test_list_tools_reject_limit_above_ceiling(
+    app_context: AppContext,
+    server: MCPServer[AppContext],
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    fixture_fn: Callable[..., dict[str, Any]],
+    upsert_fn: Callable[..., Any],
+) -> None:
+    """A limit above 1000 is rejected outright with a clear error naming the
+    ceiling, raised BEFORE any store call. This test wraps the relevant store
+    function to ensure it is never invoked when validation fails.
+
+    Validates the fix for issue #173: list tools must cap at _MAX_LIST_LIMIT
+    to avoid overflow when the tool adds +1 for pagination lookahead.
+    """
+    assert app_context.store_conn is not None
+    upsert_fn(app_context.store_conn, 12345, fixture_fn())
+
+    # Wrap the store's get_* function to track whether it's called
+    from whoopmcp import store
+
+    store_func_name = f"get_{tool_name.replace('list_', '')}"
+    original_func = getattr(store, store_func_name)
+    store_called = []
+
+    def wrapped_store_func(*args, **kwargs):
+        store_called.append(True)
+        return original_func(*args, **kwargs)
+
+    monkeypatch.setattr(store, store_func_name, wrapped_store_func)
+
+    # Test with a limit well above the ceiling
+    with pytest.raises(ToolError, match="1000"):
+        await call_tool(
+            server,
+            tool_name,
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "limit": 1001},
+            app_context,
+        )
+
+    # Verify the store function was never called
+    assert not store_called, f"{store_func_name} should not be called when limit is rejected"
+
+
+@pytest.mark.parametrize(
+    "tool_name,fixture_fn,upsert_fn",
+    [
+        ("list_recoveries", recovery_fixture, upsert_recovery),
+        ("list_sleeps", sleep_fixture, upsert_sleep),
+        ("list_workouts", workout_fixture, upsert_workout),
+        ("list_cycles", cycle_fixture, upsert_cycle),
+    ],
+)
+async def test_list_tools_reject_limit_of_max_int64(
+    app_context: AppContext,
+    server: MCPServer[AppContext],
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    fixture_fn: Callable[..., dict[str, Any]],
+    upsert_fn: Callable[..., Any],
+) -> None:
+    """limit = 2**63 - 1 produces a ValueError from _require_positive_limit,
+    not an OverflowError. Raw 2**63-1 binds fine in sqlite, but the tool adds
+    +1 for pagination lookahead, causing overflow. Validation must catch this
+    before reaching the store.
+
+    This test ensures the implementation's upper bound catches the overflow
+    case, raising the validation error early with a clear message.
+    """
+    assert app_context.store_conn is not None
+    upsert_fn(app_context.store_conn, 12345, fixture_fn())
+
+    from whoopmcp import store
+
+    store_func_name = f"get_{tool_name.replace('list_', '')}"
+    original_func = getattr(store, store_func_name)
+    store_called = []
+
+    def wrapped_store_func(*args, **kwargs):
+        store_called.append(True)
+        return original_func(*args, **kwargs)
+
+    monkeypatch.setattr(store, store_func_name, wrapped_store_func)
+
+    # Test with 2**63 - 1 (max int64)
+    with pytest.raises(ToolError) as exc_info:
+        await call_tool(
+            server,
+            tool_name,
+            {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z", "limit": 2**63 - 1},
+            app_context,
+        )
+
+    # Should have ValueError message, not OverflowError
+    assert "limit" in str(exc_info.value).lower()
+    assert not store_called, f"{store_func_name} should not be called when limit is rejected"
+
+
+@pytest.mark.parametrize(
+    "tool_name,make_record,upsert_fn,id_field",
+    [
+        (
+            "list_recoveries",
+            lambda i: recovery_fixture(cycle_id=100 + i, created_at=f"2026-08-0{i + 1}T06:30:00Z"),
+            upsert_recovery,
+            "cycle_id",
+        ),
+        (
+            "list_sleeps",
+            lambda i: sleep_fixture(
+                sleep_id=f"sleep-{i}", created_at=f"2026-08-0{i + 1}T22:00:00Z"
+            ),
+            upsert_sleep,
+            "id",
+        ),
+        (
+            "list_workouts",
+            lambda i: {
+                **workout_fixture(workout_id=f"workout-{i}"),
+                "start": f"2026-08-01T{i % 24:02d}:{i % 60:02d}:00Z",
+                "end": f"2026-08-01T{(i + 1) % 24:02d}:{(i + 1) % 60:02d}:00Z",
+            },
+            upsert_workout,
+            "id",
+        ),
+        (
+            "list_cycles",
+            lambda i: cycle_fixture(cycle_id=500 + i, created_at=f"2026-08-0{i + 1}T22:00:00Z"),
+            upsert_cycle,
+            "id",
+        ),
+    ],
+)
+async def test_paging_survives_the_ceiling_including_continuation(
+    app_context: AppContext,
+    server: MCPServer[AppContext],
+    tool_name: str,
+    make_record: Callable[[int], dict[str, Any]],
+    upsert_fn: Callable[..., Any],
+    id_field: str,
+) -> None:
+    """The ceiling must not disturb the pagination it exists to protect (#173).
+
+    Two distinct things, because a ceiling can break either one:
+
+    1. ``limit`` exactly at the ceiling is *accepted*. The bound is
+       inclusive-allow, so an off-by-one that rejects 1000 fails here.
+    2. A real multi-page walk still completes. ``_require_positive_limit`` runs
+       on the continuation request too, not just the first page, so a validator
+       that mishandled a resumed walk would strand a caller mid-history.
+
+    The walk is what makes this non-vacuous. A single call with ``limit=1000``
+    over a handful of records returns ``next_token=None`` and never exercises
+    continuation at all -- it would pass against a build whose cursor logic was
+    entirely broken.
+    """
+    assert app_context.store_conn is not None
+    total = 5
+    for i in range(total):
+        upsert_fn(app_context.store_conn, 12345, make_record(i))
+
+    window = {"start": "2026-08-01T00:00:00Z", "end": "2026-08-08T00:00:00Z"}
+
+    # 1. At and just below the ceiling: accepted, and every record comes back.
+    for limit in (_MAX_LIST_LIMIT, _MAX_LIST_LIMIT - 1):
+        result = await call_tool(server, tool_name, {**window, "limit": limit}, app_context)
+        assert len(result["records"]) == total, f"limit={limit} must still return every record"
+        assert result["next_token"] is None, f"limit={limit} covers all {total}, so no next page"
+
+    # 2. A genuine multi-page walk, two records at a time, driven by the cursor
+    #    the server itself returns. Collected as a list so a page repeating a
+    #    record it already served shows up as a duplicate rather than being
+    #    silently absorbed by a set.
+    seen: list[Any] = []
+    page = await call_tool(server, tool_name, {**window, "limit": 2}, app_context)
+    assert page["next_token"] is not None, "5 records at limit=2 must have a second page"
+    for _ in range(10):  # bounded: a cursor that never terminates fails below
+        seen.extend(record[id_field] for record in page["records"])
+        if page["next_token"] is None:
+            break
+        page = await call_tool(
+            server, tool_name, {"next_token": page["next_token"], "limit": 2}, app_context
+        )
+    else:
+        raise AssertionError("pagination never terminated")
+
+    assert len(seen) == total, f"the walk must serve every record exactly once, got {seen}"
+    assert len(set(seen)) == total, f"the walk must not repeat a record, got {seen}"
+    assert set(seen) == {record[id_field] for record in [make_record(i) for i in range(total)]}
+
+
+async def test_paging_at_the_ceiling_with_continuation(
+    app_context: AppContext,
+    server: MCPServer[AppContext],
+) -> None:
+    """A multi-page walk at the ceiling limit itself, exercising the real case the
+    ceiling logic must protect. Seeds _MAX_LIST_LIMIT + 5 records (1005) so that
+    a limit=_MAX_LIST_LIMIT request returns exactly _MAX_LIST_LIMIT records on page 1
+    plus a next_token, and the continuation returns the remaining 5 on page 2 with
+    no next_token.
+
+    This test is essential and non-vacuous: it fails if _require_positive_limit caps
+    (offset + limit) instead of just limit, which is a plausible misreading of the fix.
+    """
+    assert app_context.store_conn is not None
+    total = _MAX_LIST_LIMIT + 5
+    for i in range(total):
+        # A distinct `start` per record, set on the dict because sleep_fixture
+        # takes no `start` argument and hardcodes one. get_sleeps is
+        # `ORDER BY start` with no tiebreaker, so identical starts would leave
+        # the ordering of two separate LIMIT/OFFSET queries unspecified -- and
+        # every assertion below about serving each record exactly once would
+        # rest on a tie order SQLite never promised.
+        record = sleep_fixture(sleep_id=f"sleep-{i}")
+        moment = datetime(2026, 8, 1, tzinfo=UTC) + timedelta(minutes=i)
+        record["start"] = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+        record["end"] = (moment + timedelta(hours=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        record["created_at"] = record["start"]
+        upsert_sleep(app_context.store_conn, 12345, record)
+
+    window = {"start": "2026-08-01T00:00:00Z", "end": "2026-08-31T23:59:59Z"}
+
+    # 1. limit=_MAX_LIST_LIMIT returns exactly _MAX_LIST_LIMIT records plus next_token
+    page1 = await call_tool(
+        server, "list_sleeps", {**window, "limit": _MAX_LIST_LIMIT}, app_context
+    )
+    assert len(page1["records"]) == _MAX_LIST_LIMIT, (
+        f"limit={_MAX_LIST_LIMIT} must return exactly {_MAX_LIST_LIMIT} records"
+    )
+    assert page1["next_token"] is not None, "1005 records at limit=1000 must have a next page"
+
+    # 2. limit=_MAX_LIST_LIMIT - 1 also works (just below ceiling)
+    page_below = await call_tool(
+        server, "list_sleeps", {**window, "limit": _MAX_LIST_LIMIT - 1}, app_context
+    )
+    assert len(page_below["records"]) == _MAX_LIST_LIMIT - 1, (
+        f"limit={_MAX_LIST_LIMIT - 1} must return {_MAX_LIST_LIMIT - 1} records"
+    )
+    assert page_below["next_token"] is not None, "1005 records at limit=999 must have a next page"
+
+    # 3. Continue with next_token from page 1, get the remaining 5 records
+    page2 = await call_tool(
+        server,
+        "list_sleeps",
+        {"next_token": page1["next_token"], "limit": _MAX_LIST_LIMIT},
+        app_context,
+    )
+    assert len(page2["records"]) == 5, "page 2 must return the remaining 5 records"
+    assert page2["next_token"] is None, "page 2 must have no next_token"
+
+    # 4. Verify all records recovered exactly once, no duplicates
+    all_ids = [record["id"] for record in page1["records"]]
+    all_ids.extend(record["id"] for record in page2["records"])
+    assert len(all_ids) == total, f"must serve exactly {total} records"
+    assert len(set(all_ids)) == total, f"must not repeat any record, got {all_ids}"
+    expected_ids = {f"sleep-{i}" for i in range(total)}
+    assert set(all_ids) == expected_ids, "must serve exactly the seeded records"
 
 
 async def test_list_sleeps_pagination_continues_with_the_returned_cursor(

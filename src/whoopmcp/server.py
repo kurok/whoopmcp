@@ -1086,8 +1086,17 @@ def _encode_store_cursor(offset: int, start: str | None, end: str | None) -> str
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
 
 
+#: Ceiling on a list tool's ``limit``.
+#:
+#: Its own constant rather than a reuse of ``_ANALYSIS_MAX_RECORDS``, though both
+#: are 1000: they bound different things -- response size here, computation cost
+#: there -- and sharing one would let a future change to the analysis cap
+#: silently move the list-tool API with it.
+_MAX_LIST_LIMIT = 1000
+
+
 def _require_positive_limit(limit: int) -> None:
-    """Reject ``limit <= 0`` before it reaches a store query.
+    """Bound a list tool's ``limit`` at both ends before it reaches a store query.
 
     ``limit=0`` is not merely "return nothing": every list tool's
     ``next_token`` encodes ``offset + limit``, so a zero limit produces a
@@ -1095,9 +1104,28 @@ def _require_positive_limit(limit: int) -> None:
     continuation token loops back to itself forever, never resolving to
     "no more data." Raising here surfaces one clear error instead of a
     silent infinite-continuation trap.
+
+    The upper bound arrived later (#173). Until then this module bounded every
+    read it *computed* over -- ``_TIMESERIES_MAX_POINTS``,
+    ``_ANALYSIS_MAX_RECORDS``, ``_OUTLIERS_MAX_POINTS`` and ``_STREAKS_MAX_DAYS``
+    are all 1000 -- while the four tools that *return* history directly bounded
+    nothing, an asymmetry that reads as oversight rather than intent. An
+    unbounded ``limit`` also defeats the pagination the rest of the module is
+    built around: ``limit`` exists so a caller pages, and an unbounded one with
+    ``include_raw=True`` materialises a member's whole stored history into a
+    single response -- precisely what the ``next_token`` machinery avoids.
+
+    It also keeps this function's own promise. List tools pass ``limit + 1`` to
+    the store as pagination lookahead, so ``2**63 - 1`` -- a value sqlite binds
+    without complaint on its own -- becomes ``2**63`` and dies inside the
+    driver's parameter binding with ``OverflowError: Python int too large to
+    convert to SQLite INTEGER``. Surfacing a driver's overflow is the opposite
+    of the one clear error this function exists to give.
     """
     if limit <= 0:
         raise ValueError(f"limit must be a positive integer, got {limit}")
+    if limit > _MAX_LIST_LIMIT:
+        raise ValueError(f"limit must be at most {_MAX_LIST_LIMIT}, got {limit}")
 
 
 def _default_range(
@@ -1277,7 +1305,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             start: ISO 8601 start of the range, e.g. "2026-07-01T00:00:00Z".
                 Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
-            limit: Records to return per page.
+            limit: Records to return per page (default 25, capped at 1000).
             next_token: Cursor from a previous truncated response, to
                 continue that page.
             include_raw: When true, each record additionally carries a
@@ -1340,7 +1368,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             start: ISO 8601 start of the range.
                 Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
-            limit: Records to return per page.
+            limit: Records to return per page (default 25, capped at 1000).
             next_token: Cursor from a previous truncated response, to
                 continue that page.
             detail: "summary" (default) omits the per-stage sleep-duration
@@ -1411,7 +1439,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             start: ISO 8601 start of the range.
                 Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
-            limit: Records to return per page.
+            limit: Records to return per page (default 25, capped at 1000).
             next_token: Cursor from a previous truncated response, to
                 continue that page.
             include_raw: When true, each record additionally carries a
@@ -1473,7 +1501,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             start: ISO 8601 start of the range.
                 Defaults, with end, to the last 7 days when both are omitted.
             end: ISO 8601 end of the range.
-            limit: Records to return per page.
+            limit: Records to return per page (default 25, capped at 1000).
             next_token: Cursor from a previous truncated response, to
                 continue that page.
             detail: "summary" (default) omits the per-zone heart-rate
