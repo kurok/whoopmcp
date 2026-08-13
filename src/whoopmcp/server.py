@@ -1892,7 +1892,7 @@ def _actual_range(records: Sequence[dict[str, Any]]) -> tuple[str | None, str | 
 
 async def _summarize_window(
     conn: sqlite3.Connection, whoop_user_id: int, start: str, end: str
-) -> tuple[dict[str, Any], tuple[str | None, str | None], bool, int]:
+) -> tuple[dict[str, Any], tuple[str | None, str | None], bool, int, int]:
     """Read each of the 3 collections once from the store, then
     analysis.summarize per metric.
 
@@ -1908,7 +1908,34 @@ async def _summarize_window(
     every analysis.summarize call so each metric's ``days_missing`` reflects
     the requested window, not just what happened to come back.
     """
-    expected_days = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).days
+    # Count the distinct UTC calendar dates the window can hold a record on --
+    # the same unit `analysis.summarize` counts on the other side of the
+    # subtraction, where `unique_dates` is built from
+    # `datetime.fromisoformat(record["created_at"]).astimezone(UTC).date()`.
+    #
+    # Subtracting the timestamps and taking `.days` was neither (#181). It
+    # truncated the trailing partial day, so the inclusive whole-day window a
+    # caller naturally writes for "the last three days" --
+    # `T00:00:00Z`..`T23:59:59Z` -- measured 2. `days_missing` is clamped with
+    # `max(0, ...)`, so the undercount never surfaced as an error; it just
+    # reported better coverage than the member actually had, which is the one
+    # direction that hides a real gap from someone asking whether they missed a
+    # day. It also skipped the `astimezone(UTC)` that the other side applies, so
+    # a window expressed at a non-UTC offset counted dates in the caller's
+    # offset while the records counted theirs in UTC.
+    start_dt = datetime.fromisoformat(start).astimezone(UTC)
+    end_dt = datetime.fromisoformat(end).astimezone(UTC)
+    # Clamped because `expected_days` also divides the coverage ratios in
+    # `compare_periods`; an inverted window must reach them as 0 (falsy, and
+    # already special-cased there) rather than as a negative.
+    expected_days = max(0, (end_dt.date() - start_dt.date()).days + 1)
+    # Elapsed whole days, which is a different question and keeps its own name.
+    # `_period_length_note` asks whether a period spans whole *weeks*, to warn
+    # about weekday/weekend imbalance -- a duration, so a midnight-to-midnight
+    # Aug 1 -> Aug 8 window is 7 there while touching 8 calendar dates here.
+    # Feeding it dates-touched made every whole-week window look like a partial
+    # one and fired the warning on exactly the periods that are balanced.
+    span_days = max(0, (end_dt - start_dt).days)
     fetched = {
         collection: await _fetch_collection(conn, whoop_user_id, collection, start, end)
         for collection in ("recovery", "sleep", "cycle")
@@ -1933,7 +1960,7 @@ async def _summarize_window(
             "count": result.count,
         }
     all_records = [r for records in records_by_collection.values() for r in records]
-    return summaries, _actual_range(all_records), truncated, expected_days
+    return summaries, _actual_range(all_records), truncated, expected_days, span_days
 
 
 def _period_length_note(baseline_days: int, comparison_days: int) -> str | None:
@@ -2071,6 +2098,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             (range_start, range_end),
             truncated,
             _expected_days,
+            _span_days,
         ) = await _summarize_window(conn, whoop_user_id, start, end)
         result: dict[str, Any] = {
             "summaries": summaries,
@@ -2314,12 +2342,14 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             baseline_range,
             baseline_truncated,
             baseline_expected_days,
+            baseline_span_days,
         ) = await _summarize_window(conn, whoop_user_id, baseline_start, baseline_end)
         (
             comparison_summaries,
             comparison_range,
             comparison_truncated,
             comparison_expected_days,
+            comparison_span_days,
         ) = await _summarize_window(conn, whoop_user_id, comparison_start, comparison_end)
         truncated = baseline_truncated or comparison_truncated
         delta: dict[str, Any] = {}
@@ -2359,9 +2389,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             },
             "delta": delta,
             "truncated": truncated,
-            "period_length_note": _period_length_note(
-                baseline_expected_days, comparison_expected_days
-            ),
+            "period_length_note": _period_length_note(baseline_span_days, comparison_span_days),
         }
         if truncated:
             response["note"] = (
