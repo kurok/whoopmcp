@@ -2709,7 +2709,9 @@ def compact_database(conn: sqlite3.Connection) -> None:
     """Issue #100: compact the database file to reclaim freed pages.
 
     After a member erasure, deleted rows' bytes remain in the file's free
-    pages (since ``PRAGMA secure_delete`` is 0 by design -- see PRIVACY.md).
+    pages (since ``PRAGMA secure_delete`` is 0 by design -- see PRIVACY.md's
+    retention bullet, which spells out the row-versus-byte distinction; #128
+    added it, because this pointer previously cited text that did not exist).
     ``VACUUM`` rewrites the entire file and overwrites those freed pages,
     so deleted bytes are no longer recoverable.
 

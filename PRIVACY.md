@@ -152,6 +152,18 @@ plaintext file described above regardless of mode.
   operator schedules it (their own cron or systemd timer, since this project
   ships no scheduler of its own); it is a real, verified-at-the-database-level
   deletion when it runs, not merely a documented promise.
+- *Both modes:* retention deletes the **rows**, not their **bytes**. SQLite
+  leaves a deleted row's content in the database file's free pages until
+  something rewrites the file, and `PRAGMA secure_delete` is deliberately not
+  enabled — the cost of overwriting on every `DELETE` is paid instead by a
+  single `VACUUM` on the rare operator command that needs it, `erase-member`
+  ([see below](#5-deleting-your-data)). So after a retention run the rows are
+  gone from every query, and their bytes remain recoverable from the file
+  itself until the next `erase-member` compaction. That matters only to someone
+  holding the file — an operator's backup, or a stolen disk — and a local
+  same-user attacker is out of scope either way (see SECURITY.md). If you need
+  the bytes gone on a schedule, run `erase-member` for the affected member, or
+  compact the file yourself.
 
 **Backups.** This project takes no backups of its own and implements no
 backup mechanism, in either mode — there is no backup script, scheduled job,

@@ -671,6 +671,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #128 (#37 audit, P3, latent): `compact_database`'s docstring said
+  `PRAGMA secure_delete` is 0 "by design -- see PRIVACY.md", and PRIVACY.md said
+  nothing about `secure_delete` or residual bytes anywhere. A pointer to
+  documentation that does not exist is worse than no pointer: it reads as though
+  the trade-off was disclosed to users when it was disclosed only to whoever read
+  the source.
+
+  PRIVACY.md's retention section now carries the substance it was missing:
+  retention deletes the **rows**, not their **bytes**. SQLite leaves a deleted
+  row's content in free pages until something rewrites the file, so after a
+  retention run the rows are gone from every query while their bytes remain
+  recoverable from the file until the next `erase-member` compaction. That is the
+  gap #100 closed for erasure and left open for the deletion class that actually
+  runs on a schedule.
+
+  Deliberately **not** fixed by compacting after retention. The docstring records
+  that `VACUUM`-on-a-rare-operator-command rather than on every `DELETE` was the
+  repo owner's decision (#100 D1), and a full-file rewrite on a cron job is
+  exactly the cost that decision rejected. Overriding it would be inventing a
+  requirement; #128 explicitly offers the documentation option, so the docs are
+  what changed.
+
+  The retention CLI needed no change -- its help and summary already say "rows",
+  which is precisely what happens. Checked rather than assumed.
+
+  A test now pins the citation to actually resolving, scoped to PRIVACY.md's
+  *retention* section rather than the whole file: the erasure section already
+  mentioned `VACUUM`, so a file-wide substring check would have passed before this
+  change and proved nothing.
+
 - Issue #126 (#37 audit, P3, reachable in hosted mode): PRIVACY.md's storage table
   said logs go to "stderr only", which was false under
   `--transport streamable-http`. The SDK's `run_streamable_http_async` builds
