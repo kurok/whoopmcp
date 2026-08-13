@@ -632,6 +632,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #119 (#37 audit): `softprops/action-gh-release` in the release
+  workflow's `contents: write` job is now pinned by commit SHA rather than the
+  mutable `v3` tag. It was the one non-GitHub action still on a floating tag in
+  a write-privileged job, so whoever controlled that tag could have written to
+  this repository on every release -- while the sibling
+  `pypa/gh-action-pypi-publish` in the same workflow was already SHA-pinned.
+  `v3` and `v3.0.2` both resolve to commit `3d0d9888`, so the pin is
+  behaviour-neutral. A test now asserts the property for every non-GitHub
+  action in any write-privileged job across all workflows.
+
 - Issue #122 (#37 audit): `invalid_grant` from a token refresh no longer
   conflates "WHOOP rejected this refresh token" with "the user's grant is
   gone." WHOOP rotates refresh tokens on use, so a stale token failing
