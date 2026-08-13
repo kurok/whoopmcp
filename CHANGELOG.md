@@ -632,6 +632,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #122 (#37 audit): `invalid_grant` from a token refresh no longer
+  conflates "WHOOP rejected this refresh token" with "the user's grant is
+  gone." WHOOP rotates refresh tokens on use, so a stale token failing
+  usually means it was superseded by a rotation another process already
+  completed and saved -- treating that as "gone" both deleted the valid
+  rotated credential the other process had just written and, via
+  `GrantAlreadyGoneError` (which `__main__.py`'s `erase-member`/
+  `delete-member` catch as "revoke succeeded", issue #65), made the CLI
+  report a revoke that never happened while the grant was still live at
+  WHOOP. `refresh()` now refreshes the store's token, not the caller's
+  stale one, whenever `_supersedes` shows the store has moved on -- even
+  if that store token has itself expired, previously the short-circuit's
+  requirement that dropped it back to sending WHOOP the caller's already-
+  rotated-past token. `_do_refresh` now re-reads the store on
+  `invalid_grant` and only clears it and raises `GrantAlreadyGoneError`
+  when the store still holds the very token that failed; when the store
+  has already moved on it leaves the store untouched and raises a plain
+  `AuthError` instead, so the CLI treats it as a real failure rather than
+  revoke-step success.
 - Issue #123 (#37 audit): `logout()`/`revoke_and_forget()` no longer race a
   refresh already in flight. A refresh that completes after credentials were
   forgotten used to run straight through to `self._store.save(new_token)` /
