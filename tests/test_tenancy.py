@@ -2943,6 +2943,231 @@ def test_earlier_tenancy_exploits_stay_closed_after_the_154_restructure() -> Non
         )
 
 
+# -- #155: the rollback-before-raise safety net has a precondition, and it is
+# now enforced before anything executes. Python's sqlite3 auto-opens a
+# transaction only for INSERT/UPDATE/DELETE/REPLACE, so any other mutating
+# statement runs in autocommit and `conn.rollback()` is a no-op. -------------
+
+
+def test_with_prefixed_write_is_rejected_and_the_victims_rows_survive(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """#155's reproduction, asserting the part that actually matters.
+
+    Before the fix this statement WAS rejected -- correctly, by the
+    member-predicate check -- and member B's rows stayed deleted anyway, because
+    the rollback issued before raising had no transaction to undo. So a test
+    that only asserted `pytest.raises` passed while the data was gone. That is
+    precisely how the gap survived, and it is why this asserts on surviving rows.
+    """
+    conn = store_conn
+    for member, cycle in ((MEMBER_A, 1), (MEMBER_B, 2)):
+        store.upsert_recovery(conn, member, {"cycle_id": cycle, "score_state": "SCORED"})
+    conn.commit()
+
+    with pytest.raises(store.UnrollbackableStatementError):
+        store._execute_scoped(
+            conn,
+            "WITH x AS (SELECT 1) DELETE FROM recoveries "
+            "WHERE whoop_user_id != ? AND (SELECT 1 FROM x)",
+            (MEMBER_A,),
+        )
+
+    conn.commit()
+    survivors = sorted(
+        row[0] for row in conn.execute("SELECT whoop_user_id FROM recoveries ORDER BY 1")
+    )
+    assert survivors == sorted([MEMBER_A, MEMBER_B]), (
+        "the rejected statement still deleted another member's rows"
+    )
+
+
+def test_rejection_happens_before_the_statement_runs_at_all(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """The check must be a *precondition*, not another post-hoc rejection.
+
+    A `WITH`-prefixed write that is otherwise perfectly scoped -- restricted to
+    the caller's own member -- must also be refused, because the point is not
+    that this particular statement is unsafe but that the safety net does not
+    cover it. If the guard ran after execution it would be exactly as useless as
+    the rollback it protects.
+    """
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    conn.commit()
+
+    with pytest.raises(store.UnrollbackableStatementError):
+        store._execute_scoped(
+            conn,
+            "WITH x AS (SELECT 1) DELETE FROM recoveries "
+            "WHERE whoop_user_id = ? AND (SELECT 1 FROM x)",
+            (MEMBER_A,),
+        )
+
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM recoveries").fetchone()[0] == 1, (
+        "the statement ran before being rejected"
+    )
+
+
+def test_the_allowed_keywords_are_exactly_the_ones_the_driver_rolls_back() -> None:
+    """Pin the set against the interpreter, not against a docs claim.
+
+    The guard's whole justification is that these four leading tokens are the
+    ones Python's sqlite3 auto-opens a transaction for. If a future interpreter
+    changed that, the guard would still pass statements whose mutation a
+    rollback no longer undoes -- so this asserts the property directly, and is
+    the test that should fail if the premise ever stops holding.
+    """
+    mutating = {"INSERT", "UPDATE", "DELETE", "REPLACE"}
+    allowed = set(store._LEADING_KEYWORDS_THE_DRIVER_CAN_ROLL_BACK)
+    assert allowed == mutating | {"SELECT"}
+
+    for keyword in sorted(mutating):
+        probe = sqlite3.connect(":memory:")
+        probe.execute("CREATE TABLE t (a INTEGER)")
+        if keyword in {"UPDATE", "DELETE"}:
+            probe.execute("INSERT INTO t VALUES (1)")
+        probe.commit()
+        assert not probe.in_transaction, "setup left a transaction open"
+        statement = {
+            "INSERT": "INSERT INTO t VALUES (2)",
+            "REPLACE": "REPLACE INTO t VALUES (2)",
+            "UPDATE": "UPDATE t SET a = 2",
+            "DELETE": "DELETE FROM t",
+        }[keyword]
+        probe.execute(statement)
+        assert probe.in_transaction, (
+            f"sqlite3 no longer auto-opens a transaction for {keyword} -- the "
+            "premise behind _LEADING_KEYWORDS_THE_DRIVER_CAN_ROLL_BACK is gone"
+        )
+        probe.close()
+
+    # ...and the shape #155 was filed about really is outside that set.
+    probe = sqlite3.connect(":memory:")
+    probe.execute("CREATE TABLE t (a INTEGER)")
+    probe.execute("INSERT INTO t VALUES (1)")
+    probe.commit()
+    probe.execute("WITH x AS (SELECT 1) DELETE FROM t WHERE (SELECT 1 FROM x)")
+    assert not probe.in_transaction
+    probe.rollback()
+    assert probe.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0, (
+        "a WITH-prefixed DELETE is now rollback-able, so this guard needs revisiting"
+    )
+    probe.close()
+
+
+def test_bom_prefixed_write_is_rejected(store_conn: sqlite3.Connection) -> None:
+    """A second data-loss vector, found reviewing this fix and absent from #155.
+
+    sqlite's tokeniser skips a UTF-8 BOM; the driver's "is this DML" check does
+    not. So `\\ufeffDELETE FROM ...` executes as a write, runs in autocommit, and
+    the rows stay deleted after a rollback -- the same failure as the `WITH`
+    case by an entirely different route. Measured on this interpreter, not
+    inferred.
+
+    The guard refuses it because `_leading_keyword` stops at the first
+    non-whitespace, non-alphabetic byte. This test exists so that stays
+    deliberate: someone "fixing" the helper to skip a BOM would reopen the hole,
+    and would see this fail.
+    """
+    # First, the premise: sqlite really does execute it, unrollbackably.
+    probe = sqlite3.connect(":memory:")
+    probe.execute("CREATE TABLE t (a INTEGER)")
+    probe.execute("INSERT INTO t VALUES (1)")
+    probe.commit()
+    assert not probe.in_transaction
+    probe.execute("﻿DELETE FROM t")
+    assert not probe.in_transaction, "the driver now treats a BOM-prefixed DELETE as DML"
+    probe.rollback()
+    assert probe.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0, (
+        "a BOM-prefixed DELETE is now rollback-able, so this vector is closed upstream"
+    )
+    probe.close()
+
+    # Therefore the guard must refuse it, and the victim's rows must survive.
+    conn = store_conn
+    for member, cycle in ((MEMBER_A, 1), (MEMBER_B, 2)):
+        store.upsert_recovery(conn, member, {"cycle_id": cycle, "score_state": "SCORED"})
+    conn.commit()
+
+    with pytest.raises(store.UnrollbackableStatementError):
+        store._execute_scoped(conn, "﻿DELETE FROM recoveries WHERE whoop_user_id != ?", (MEMBER_A,))
+
+    conn.commit()
+    survivors = sorted(row[0] for row in conn.execute("SELECT whoop_user_id FROM recoveries"))
+    assert survivors == sorted([MEMBER_A, MEMBER_B])
+
+
+def test_read_only_cte_is_over_rejected_deliberately() -> None:
+    """The guard's accepted false positive, pinned so it stays a known cost.
+
+    A read-only `WITH ... SELECT` mutates nothing, so the rollback precondition
+    is as vacuous for it as for a plain `SELECT` -- and it is refused anyway,
+    together with `EXPLAIN` and a bare `VALUES`. Distinguishing a read-only CTE
+    from a writing one needs a SQL parser, which this module has declined four
+    times now, and sqlite's own `sqlite3_stmt_readonly` is not exposed by
+    Python's driver.
+
+    No caller writes these shapes today. If one ever needs to, this test is
+    where the decision gets revisited -- and the point of pinning it is that the
+    over-rejection is a choice on record, not a bug someone rediscovers.
+    """
+    for sql in (
+        "WITH x AS (SELECT 1) SELECT raw_json FROM recoveries WHERE whoop_user_id = ?",
+        "EXPLAIN QUERY PLAN SELECT raw_json FROM recoveries WHERE whoop_user_id = ?",
+        "VALUES (1)",
+    ):
+        with pytest.raises(store.UnrollbackableStatementError):
+            store._require_rollbackable_statement(sql)
+
+    # The error must not claim the statement mutated anything -- it cannot know.
+    try:
+        store._require_rollbackable_statement("WITH x AS (SELECT 1) SELECT 1")
+    except store.UnrollbackableStatementError as error:
+        assert "whether or not they actually write" in str(error), (
+            "the message asserts a mutation it cannot have observed"
+        )
+
+
+def test_leading_keyword_ignores_comments_and_whitespace() -> None:
+    """A comment before the keyword must not be mistaken for it, or the guard
+    would be bypassable by prefixing `/* SELECT */`."""
+    assert store._leading_keyword("  \n\t SELECT 1") == "SELECT"
+    assert store._leading_keyword("/* SELECT */ WITH x AS (SELECT 1) DELETE FROM t") == "WITH"
+    assert store._leading_keyword("-- SELECT\nWITH x AS (SELECT 1) DELETE FROM t") == "WITH"
+    assert store._leading_keyword("/* unterminated WITH") == ""
+    assert store._leading_keyword("") == ""
+    assert store._leading_keyword("   ") == ""
+
+
+def test_every_legitimate_writer_still_works_after_the_precondition(
+    store_conn: sqlite3.Connection,
+) -> None:
+    """The regression that would make this fix unacceptable: verified by
+    read-back, not by absence of an exception."""
+    conn = store_conn
+    store.upsert_recovery(conn, MEMBER_A, {"cycle_id": 1, "score_state": "SCORED"})
+    store.upsert_sleep(
+        conn,
+        MEMBER_A,
+        {"id": "sleep-155", "start": "2026-01-01T00:00:00Z", "score_state": "SCORED"},
+    )
+    store.upsert_profile(conn, MEMBER_A, {"user_id": MEMBER_A, "email": "a@example.test"})
+    conn.commit()
+
+    assert len(store.get_recoveries(conn, MEMBER_A)) == 1
+    assert len(store.get_sleeps(conn, MEMBER_A)) == 1
+
+    store.set_deleted_at(conn, "sleep", MEMBER_A, "sleep-155")
+    conn.commit()
+
+    store.erase_member_and_links_atomically(conn, MEMBER_A)
+    assert store.get_recoveries(conn, MEMBER_A) == []
+    assert store.get_sleeps(conn, MEMBER_A) == []
+
+
 # -- exclusion rationale stays true (issue #130) -------------------------------
 
 

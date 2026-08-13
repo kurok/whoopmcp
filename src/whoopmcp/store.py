@@ -809,6 +809,145 @@ class _TenancyFindings(NamedTuple):
     needs_member_predicate: frozenset[str]
 
 
+class UnrollbackableStatementError(RuntimeError):
+    """A statement was rejected before execution because a rejection *after*
+    execution could not have been undone.
+
+    Deliberately not an ``UnscopedQueryError``: nothing about tenancy scoping
+    is wrong with such a statement. What is wrong is that this module's
+    rollback-before-raise safety net would silently not work for it, so the
+    tenancy checks downstream would be able to detect a violation and not
+    reverse it. See ``_require_rollbackable_statement``.
+    """
+
+
+#: The leading keywords for which Python's ``sqlite3`` auto-opens a transaction,
+#: and therefore the only ones whose mutation ``conn.rollback()`` can undo.
+#: MEASURED on this interpreter rather than taken from the docs -- with a
+#: genuinely clean connection state, ``INSERT``/``REPLACE``/``UPDATE``/``DELETE``
+#: each leave ``conn.in_transaction`` True and are reversed by a rollback, while
+#: ``WITH x AS (...) DELETE ...`` leaves it False and the rows stay deleted.
+#: ``SELECT`` is included because it mutates nothing, so there is nothing to
+#: undo and the precondition is vacuous for it.
+_LEADING_KEYWORDS_THE_DRIVER_CAN_ROLL_BACK = frozenset(
+    {"SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE"}
+)
+
+_LEADING_KEYWORD = re.compile(r"[A-Za-z]+")
+
+
+def _leading_keyword(sql: str) -> str:
+    """``sql``'s first keyword, upper-cased, skipping leading whitespace and
+    comments. ``""`` if there is none.
+
+    Comments are skipped because ``/* c */ WITH ...`` leads with ``WITH`` as far
+    as sqlite is concerned, and a check that read the comment instead would be
+    trivially bypassed. This deliberately does not reuse
+    ``_statement_restricts_to_one_member``'s sanitiser: that one strips quoted
+    regions too, which is the wrong shape here (a leading quoted identifier is
+    not a keyword) and it is the most safety-critical function in the module,
+    so it is not worth generalising for this.
+
+    Nothing else is skipped, and that is the point. A UTF-8 BOM, a leading
+    ``(``, or any other non-alphabetic byte yields ``""`` -- which
+    ``_require_rollbackable_statement`` refuses. Do not add skips here to make
+    such statements "work": sqlite skips a BOM while the driver's DML detection
+    does not, so a BOM-prefixed ``DELETE`` executes in autocommit and survives a
+    rollback. Yielding ``""`` for it is a fix, not a limitation.
+
+    ``str.isspace()`` is broader than sqlite's whitespace set, so a statement
+    led by e.g. ``\\xa0`` is skipped here and reaches sqlite, which rejects it
+    outright -- no write, so no rollback to need. The divergence is safe in that
+    direction only, which is why it is left alone rather than narrowed.
+    """
+    index, length = 0, len(sql)
+    while index < length:
+        if sql[index].isspace():
+            index += 1
+            continue
+        if sql[index : index + 2] == "--":
+            newline = sql.find("\n", index)
+            index = length if newline == -1 else newline + 1
+            continue
+        if sql[index : index + 2] == "/*":
+            end = sql.find("*/", index + 2)
+            index = length if end == -1 else end + 2
+            continue
+        break
+    match = _LEADING_KEYWORD.match(sql, index)
+    return match.group(0).upper() if match else ""
+
+
+def _require_rollbackable_statement(sql: str) -> None:
+    """Fail closed on a statement whose mutation a rollback could not undo.
+
+    ``_execute_scoped`` documents that it rolls back before raising, because a
+    non-``SELECT`` statement has already run by the time a violation is
+    detected. That promise silently does not hold for a statement whose first
+    token is outside ``_LEADING_KEYWORDS_THE_DRIVER_CAN_ROLL_BACK``: Python's
+    ``sqlite3`` only auto-opens a transaction for those, so anything else runs
+    in autocommit and ``conn.rollback()`` is a no-op.
+
+    #155 was that gap, and it was reachable in the worst possible way: ``WITH x
+    AS (SELECT 1) DELETE FROM recoveries WHERE whoop_user_id != ? AND (SELECT 1
+    FROM x)`` is correctly *rejected* by the member-predicate check -- and the
+    other member's rows stay deleted anyway.
+
+    Enforcing the precondition, rather than making the rollback work in general,
+    is a deliberate choice recorded on #155. Every mutating statement in this
+    module is static SQL written here; after this check every one of them leads
+    with a token the driver opens a transaction for; so the documented guarantee
+    is true across the whole reachable set, and this is what keeps it true. The
+    alternatives -- ``isolation_level = None`` with explicit transactions
+    everywhere, or opening one inside ``_execute_scoped`` -- both change
+    transaction semantics for every write in the module to close a hole no
+    caller can currently reach, and can be revisited if a CTE write is ever
+    genuinely needed. Whoever needs one will land here, with the reason.
+
+    **It over-rejects, deliberately.** A read-only ``WITH ... SELECT`` mutates
+    nothing, so the precondition is as vacuous for it as it is for a plain
+    ``SELECT`` -- and it is rejected anyway, along with ``EXPLAIN`` and a bare
+    ``VALUES``. Telling a read-only CTE from a writing one means parsing the
+    statement, which is exactly what #99, #109, #129 and #154 each declined to
+    do here, and sqlite's own ``sqlite3_stmt_readonly`` is not exposed by
+    Python's driver. So this fails closed on every leading keyword outside the
+    set rather than guessing. No caller in this module writes any of those
+    shapes -- measured across the whole suite, every rejection comes from a test
+    deliberately feeding an out-of-set keyword, and no statement store.py itself
+    emits is refused. A future author who wants a CTE read gets an explicit
+    error pointing at this docstring, which is a better outcome than a silent
+    hole. That cost is pinned by
+    ``test_read_only_cte_is_over_rejected_deliberately``.
+
+    **A second vector, found reviewing this fix and not mentioned by #155.** A
+    UTF-8 BOM prefix is skipped by sqlite's tokeniser but *not* by the driver's
+    "is this DML" check, so ``﻿DELETE FROM ...`` executes as a write, runs
+    in autocommit, and survives a rollback -- the same data loss as the ``WITH``
+    case, by a different route. It is refused here because ``_leading_keyword``
+    stops at the first non-whitespace, non-alphabetic byte and yields ``""``.
+    That must stay deliberate rather than incidental: skipping a BOM "to be
+    helpful" would reopen the hole. ``test_bom_prefixed_write_is_rejected``
+    pins it.
+
+    **The premise this rests on.** ``open_store`` leaves the connection in the
+    driver's legacy mode (``isolation_level = ""``), which is what makes the
+    implicit-transaction behaviour above true. A connection opened in autocommit
+    mode would have no implicit transaction for *any* statement, so this guard
+    would pass statements whose mutation a rollback cannot undo. Nothing in
+    ``src/`` sets ``isolation_level``/``autocommit``, so it does not arise today;
+    it is recorded because the guard would still look correct if it changed.
+    """
+    keyword = _leading_keyword(sql)
+    if keyword not in _LEADING_KEYWORDS_THE_DRIVER_CAN_ROLL_BACK:
+        raise UnrollbackableStatementError(
+            f"statement leads with {keyword or '<no keyword>'!r}, outside the set Python's "
+            "sqlite3 auto-opens a transaction for, so a tenancy check that rejected it could "
+            "not undo any mutation it made. Statements outside that set are refused whether "
+            "or not they actually write, because telling those apart needs a SQL parser -- see "
+            f"_require_rollbackable_statement: {sql!r}"
+        )
+
+
 def _execute_with_tenancy_authorizer(
     conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]
 ) -> _TenancyFindings:
@@ -842,7 +981,13 @@ def _execute_with_tenancy_authorizer(
     already run by the time the authorizer's findings can be inspected. The
     reasoning, and why undoing it is safe, is written out once on
     ``_execute_scoped`` and not restated here.
+
+    That rollback has a precondition, and this function enforces it before
+    executing anything (#155) -- see ``_LEADING_KEYWORDS_THE_DRIVER_CAN_ROLL
+    _BACK`` and ``_require_rollbackable_statement``. Both entry points inherit
+    the check by construction, because both execute through here.
     """
+    _require_rollbackable_statement(sql)
     reads: dict[str, set[str]] = {}
     inserted: set[str] = set()
     mutated: set[str] = set()
