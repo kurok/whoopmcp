@@ -738,7 +738,19 @@ def trend(records: Sequence[dict[str, Any]], metric: str) -> Trend:
     xs = [day for day, _ in pairs]
     ys = [value for _, value in pairs]
     slope = linear_slope(xs, ys)
-    r_squared = pearson(xs, ys) ** 2
+    # A perfectly constant series is not exotic for bounded metrics --
+    # sleep_performance pinned at 100 for a good week, strain identical
+    # across rest days -- and it has a well-defined trend: the slope is
+    # exactly 0 (linear_slope already returns it; the covariance term is
+    # zero). Only the correlation coefficient is undefined, so calling
+    # pearson unguarded raised InsufficientDataError out of a function whose
+    # caller had plenty of observations, and metric_trend then reported
+    # "insufficient_data" with a message about correlation for a request
+    # about a trend (#199). r_squared is defined as 0.0 by convention: a
+    # flat line explains none of the variance because there is no variance
+    # to explain, and 0.0 maps to the honest "negligible" band rather than
+    # the r_squared -> 1 a "perfect fit" reading would imply.
+    r_squared = 0.0 if all(y == ys[0] for y in ys) else pearson(xs, ys) ** 2
 
     dated_values = [
         (datetime.fromisoformat(record["created_at"]).astimezone(UTC).date().isoformat(), value)
