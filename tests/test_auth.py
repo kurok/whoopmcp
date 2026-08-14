@@ -2263,6 +2263,21 @@ def _keyring_store_with(value: str | None) -> KeyringTokenStore:
     return store
 
 
+def test_keyring_store_without_the_extra_raises_autherror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`import keyring` failing must surface as AuthError naming the extra.
+
+    Stubbed via sys.modules rather than assumed from the environment (#198):
+    None there makes the import raise ImportError deterministically, so this
+    holds whether or not `whoopmcp[keyring]` is installed -- the same
+    technique test_data_subject_rights.py's degraded-export tests use.
+    """
+    monkeypatch.setitem(sys.modules, "keyring", None)
+    with pytest.raises(AuthError, match=r"whoopmcp\[keyring\]"):
+        KeyringTokenStore()
+
+
 @pytest.mark.parametrize(
     "payload",
     [

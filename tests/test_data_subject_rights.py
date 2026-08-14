@@ -1913,6 +1913,26 @@ def test_execute_scoped_docstring_false_claim_corrected() -> None:
 MEMBER_ISSUE_188 = 930001  # disjoint from other test files' ranges
 
 
+def _make_keyring_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``import keyring`` fail for this test, whatever is installed.
+
+    The degraded-export tests below need ``build_store()`` to raise -- the
+    "backend unavailable" trigger. They used to get that by assuming the
+    ``keyring`` extra was absent from the environment, which made the suite's
+    *correctness* depend on which optional extras happened to be installed:
+    with ``whoopmcp[keyring]`` present, ``KeyringTokenStore`` constructed
+    fine, ``load()`` read the developer's REAL OS keychain (the ``whoopmcp``
+    service entry), and four of these tests failed against a healthy export
+    (#198). Setting ``sys.modules["keyring"] = None`` makes the import raise
+    ``ImportError`` deterministically -- Python treats ``None`` in
+    ``sys.modules`` as "import halted" -- so the degraded path is chosen
+    explicitly rather than inherited from the environment, and no test can
+    reach a real keychain. ``tests/conftest.py``'s autouse guard backstops
+    the second half repo-wide.
+    """
+    monkeypatch.setitem(sys.modules, "keyring", None)
+
+
 def test_export_member_with_keyring_backend_unavailable_writes_complete_health_data_to_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1924,6 +1944,7 @@ def test_export_member_with_keyring_backend_unavailable_writes_complete_health_d
     # Force keyring backend, which will fail on build_store() because the
     # extra is not installed in this test environment.
     monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "keyring")
+    _make_keyring_unavailable(monkeypatch)
 
     from whoopmcp import store as store_module
     from whoopmcp.config import Config as ConfigCls
@@ -1972,6 +1993,7 @@ def test_export_member_with_keyring_backend_unavailable_consent_shows_scopes_und
     case (None values with an explanatory note)."""
     _set_required_env_and_state_dir(monkeypatch, tmp_path)
     monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "keyring")
+    _make_keyring_unavailable(monkeypatch)
 
     from whoopmcp import store as store_module
     from whoopmcp.config import Config as ConfigCls
@@ -2154,6 +2176,7 @@ def test_export_member_with_unreadable_token_store_to_stdout(
     with the degraded consent block and exit 0."""
     _set_required_env_and_state_dir(monkeypatch, tmp_path)
     monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "keyring")
+    _make_keyring_unavailable(monkeypatch)
 
     from whoopmcp import store as store_module
     from whoopmcp.config import Config as ConfigCls
@@ -2243,6 +2266,7 @@ def test_export_member_with_unreadable_token_store_error_text_redacted(
     keys, or other sensitive material."""
     _set_required_env_and_state_dir(monkeypatch, tmp_path)
     monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", "keyring")
+    _make_keyring_unavailable(monkeypatch)
 
     from whoopmcp import store as store_module
     from whoopmcp.config import Config as ConfigCls
@@ -2308,6 +2332,10 @@ def _export_document(
     _set_required_env_and_state_dir(monkeypatch, state)
     if backend is not None:
         monkeypatch.setenv("WHOOPMCP_TOKEN_BACKEND", backend)
+        if backend == "keyring":
+            # The degraded trigger must be explicit, never an accident of
+            # which extras are installed -- see _make_keyring_unavailable.
+            _make_keyring_unavailable(monkeypatch)
 
     from whoopmcp.config import Config as ConfigCls
 
