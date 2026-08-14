@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from whoopmcp.crypto import parse_key_env_value
 
@@ -248,6 +248,22 @@ class Config:
                     f"datetime, got {backfill_floor_date!r}"
                 ) from exc
 
+        # Parsed through _numeric_env so a malformed value is a ConfigError
+        # naming the variable, and range-checked where a bad value is worse
+        # than a startup failure -- see _require_positive for the outbound
+        # rate limits' silent-deadlock case (#200).
+        request_timeout = _numeric_env(src, "WHOOPMCP_TIMEOUT", "30", parse=float)
+        _require_positive("WHOOPMCP_TIMEOUT", request_timeout)
+        rate_limit_per_minute = _numeric_env(
+            src, "WHOOPMCP_RATE_LIMIT_PER_MINUTE", "100", parse=int
+        )
+        _require_positive("WHOOPMCP_RATE_LIMIT_PER_MINUTE", rate_limit_per_minute)
+        rate_limit_per_day = _numeric_env(src, "WHOOPMCP_RATE_LIMIT_PER_DAY", "10000", parse=int)
+        _require_positive("WHOOPMCP_RATE_LIMIT_PER_DAY", rate_limit_per_day)
+        http_port = _numeric_env(src, "WHOOPMCP_HTTP_PORT", "8000", parse=int)
+        if not 1 <= http_port <= 65535:
+            raise ConfigError(f"WHOOPMCP_HTTP_PORT must be between 1 and 65535, got {http_port}")
+
         return cls(
             client_id=src["WHOOP_CLIENT_ID"],
             client_secret=src["WHOOP_CLIENT_SECRET"],
@@ -256,18 +272,22 @@ class Config:
             token_backend=backend,  # type: ignore[arg-type]
             state_dir=state_dir,
             cache_enabled=_as_bool(src.get("WHOOPMCP_CACHE", "false")),
-            request_timeout=float(src.get("WHOOPMCP_TIMEOUT", "30")),
-            rate_limit_per_minute=int(src.get("WHOOPMCP_RATE_LIMIT_PER_MINUTE", "100")),
-            rate_limit_per_day=int(src.get("WHOOPMCP_RATE_LIMIT_PER_DAY", "10000")),
+            request_timeout=request_timeout,
+            rate_limit_per_minute=rate_limit_per_minute,
+            rate_limit_per_day=rate_limit_per_day,
             transport=transport,  # type: ignore[arg-type]
             http_host=src.get("WHOOPMCP_HTTP_HOST", "127.0.0.1"),
-            http_port=int(src.get("WHOOPMCP_HTTP_PORT", "8000")),
+            http_port=http_port,
             webhooks_enabled=_as_bool(src.get("WHOOPMCP_WEBHOOKS_ENABLED", "false")),
-            webhook_timestamp_skew_seconds=float(
-                src.get("WHOOPMCP_WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300")
+            # Malformed still fails loudly; the range is deliberately NOT
+            # checked on these two -- webhook_rate_limit_per_minute's own
+            # documented convention is "0 or negative disables inbound
+            # limiting", and the skew has no deadlock-shaped failure mode.
+            webhook_timestamp_skew_seconds=_numeric_env(
+                src, "WHOOPMCP_WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300", parse=float
             ),
-            webhook_rate_limit_per_minute=int(
-                src.get("WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "120")
+            webhook_rate_limit_per_minute=_numeric_env(
+                src, "WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "120", parse=int
             ),
             token_encryption_keys=token_encryption_keys,
             token_encryption_key_version=token_encryption_key_version,
@@ -279,6 +299,58 @@ class Config:
 
 def _as_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _numeric_env(
+    src: Mapping[str, str],
+    name: str,
+    default: str,
+    *,
+    parse: Callable[[str], float] | Callable[[str], int],
+) -> Any:
+    """Parse a numeric environment variable, or raise ``ConfigError`` naming it.
+
+    ``from_env``'s docstring has always promised ``ConfigError`` for a
+    malformed variable, and ``WHOOPMCP_BACKFILL_FLOOR_DATE`` set the precedent
+    of validating up front so a bad value fails at startup naming the
+    variable. The six numeric variables below didn't get that treatment: a
+    bare ``float()``/``int()`` escaped as a raw ``ValueError`` traceback that
+    names nothing, past every caller that degrades ``ConfigError`` gracefully
+    (``doctor``'s configuration check, the CLI's startup handling) (#200).
+
+    Safe for ``doctor`` to relay by construction: the message interpolates the
+    variable's name and its (non-secret) offending value -- every variable
+    routed through here is a timeout, port or rate number, never key material,
+    which keeps config.py's "no raise site quotes a secret" rule intact.
+    """
+    raw = src.get(name, default)
+    try:
+        return parse(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{name} must be a number, got {raw!r}. See "
+            "https://github.com/kurok/whoopmcp/blob/main/docs/SETUP.md"
+        ) from exc
+
+
+def _require_positive(name: str, value: float) -> None:
+    """Reject a non-positive numeric variable with a ``ConfigError`` naming it.
+
+    The sharp case is the outbound rate limits (#200): ``RateLimiter.acquire``
+    grants only while its counters are ``> 0``, so a limit of 0 -- accepted
+    without complaint before this -- built a limiter that can never grant and
+    every request hung forever, silently. The trap was baited by
+    ``webhook_rate_limit_per_minute``, whose documented convention is the
+    opposite ("0 or negative disables inbound limiting"); an operator who
+    learned that and set the *outbound* limit to 0 expecting "no limit" got a
+    server that deadlocks on its first WHOOP call. That variable therefore
+    deliberately does NOT come through here; the outbound limits, the timeout
+    and the port do, because for each of them a non-positive value has no
+    working interpretation -- a 0 timeout is not "no timeout" to httpx, and a
+    port must be 1-65535 (the port's upper bound is checked at its call site).
+    """
+    if value <= 0:
+        raise ConfigError(f"{name} must be greater than 0, got {value}")
 
 
 def _parse_token_encryption_keys(
