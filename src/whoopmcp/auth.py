@@ -523,7 +523,10 @@ class KeyringTokenStore:
     def __init__(self) -> None:
         try:
             import keyring
-        except ImportError as exc:  # pragma: no cover - depends on the extra
+        except ImportError as exc:
+            # Covered deterministically since #198: tests stub
+            # sys.modules["keyring"] to None, so this branch no longer
+            # depends on which extras the environment happens to lack.
             raise AuthError(
                 "WHOOPMCP_TOKEN_BACKEND=keyring requires the extra: pip install 'whoopmcp[keyring]'"
             ) from exc
