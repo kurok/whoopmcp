@@ -51,7 +51,7 @@ import respx
 from whoopmcp.auth import Authenticator, FileTokenStore, Token
 from whoopmcp.client import BASE_URL, RequestPriority, WhoopClient
 from whoopmcp.config import Config
-from whoopmcp.reconciliation import EMPTY_LISTING_CLOSE_LIMIT, run_reconciliation
+from whoopmcp.reconciliation import CLOSE_LIMIT_PER_RUN, run_reconciliation
 from whoopmcp.store import (
     get_cycles,
     get_recoveries,
@@ -510,7 +510,7 @@ async def test_empty_listing_does_not_wipe_a_populated_window(tmp_path: Path) ->
 
     now = datetime(2026, 8, 10, tzinfo=UTC)
     held = []
-    for day in range(1, 8):  # 7 records -- above EMPTY_LISTING_CLOSE_LIMIT
+    for day in range(1, 8):  # 7 records -- above CLOSE_LIMIT_PER_RUN
         start = now - timedelta(days=day)
         record = {
             "id": f"sleep-live-{day}",
@@ -617,7 +617,7 @@ async def test_record_written_during_the_fetch_is_not_deleted(tmp_path: Path) ->
 async def test_empty_listing_still_closes_a_window_at_the_limit(tmp_path: Path) -> None:
     """The guard above separates "a hole to close" from "a wipe to refuse" by
     size, so the boundary is the whole contract: at
-    ``EMPTY_LISTING_CLOSE_LIMIT`` records an empty listing still closes them,
+    ``CLOSE_LIMIT_PER_RUN`` records an empty listing still closes them,
     and one more refuses.
 
     Pinned explicitly because both halves fail silently. Turning ``>`` into
@@ -654,8 +654,110 @@ async def test_empty_listing_still_closes_a_window_at_the_limit(tmp_path: Path) 
 
     mock_empty_collections()
 
-    assert await closed_count(EMPTY_LISTING_CLOSE_LIMIT) == EMPTY_LISTING_CLOSE_LIMIT
-    assert await closed_count(EMPTY_LISTING_CLOSE_LIMIT + 1) == 0
+    assert await closed_count(CLOSE_LIMIT_PER_RUN) == CLOSE_LIMIT_PER_RUN
+    assert await closed_count(CLOSE_LIMIT_PER_RUN + 1) == 0
+
+
+@respx.mock
+async def test_truncated_listing_does_not_mass_soft_delete(tmp_path: Path) -> None:
+    """WHOOP answers one page of records whose ``next_token`` is wrongly
+    absent, ending pagination early -- the second looks-successful failure
+    this module's own docstring has named since #175, and the one its
+    ``fetched == 0`` guard could not see (#197): the run fetched *something*,
+    so it sailed past the empty-listing check and soft-deleted every
+    in-window record that didn't fit on the one page it got.
+
+    Like the empty-listing case, this is unrecoverable when it goes wrong:
+    nothing ever clears ``deleted_at``, so the close limit must bound what a
+    run closes, not merely whether it fetched anything at all.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    held = []
+    for day in range(1, 31):  # 30 records, a populated window
+        start = now - timedelta(days=day)
+        record = {
+            "id": f"sleep-live-{day}",
+            "start": iso(start),
+            "end": iso(start + timedelta(hours=8)),
+            "score_state": "SCORED",
+        }
+        upsert_sleep(conn, USER_ID, record)
+        held.append(record)
+
+    # The truncated listing: the first 5 held records come back, then the
+    # walk ends -- no next_token -- even though 25 more are genuinely live
+    # upstream. Indistinguishable from 25 real deletions, so it must be
+    # refused, not trusted.
+    respx.get(f"{BASE_URL}{COLLECTION_PATHS['sleeps']}").mock(
+        return_value=httpx.Response(200, json={"records": held[:5], "next_token": None})
+    )
+    mock_empty_collections(except_for="sleeps")
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    # Every record is still live -- asserting on the survivors, since the
+    # broken version exits cleanly too.
+    survivors = get_sleeps(conn, USER_ID)
+    assert len(survivors) == 30
+    assert {r["id"] for r in survivors} == {r["id"] for r in held}
+
+    # And the refusal is reported, not silent.
+    assert results["sleeps"].fetched == 5
+    assert results["sleeps"].closed == 0
+    assert results["sleeps"].withheld is not None
+    assert "declining to close" in results["sleeps"].withheld
+    conn.close()
+
+
+@respx.mock
+async def test_partial_listing_still_closes_within_the_limit(tmp_path: Path) -> None:
+    """The partial-listing half of the boundary contract: a non-empty,
+    complete listing that omits no more than ``CLOSE_LIMIT_PER_RUN``
+    locally-live records still closes them -- #197's guard bounds the wipe
+    case without disabling ordinary hole-closing alongside live records.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    held = []
+    for day in range(1, 11):  # 10 records held
+        start = now - timedelta(days=day)
+        record = {
+            "id": f"sleep-live-{day}",
+            "start": iso(start),
+            "end": iso(start + timedelta(hours=8)),
+            "score_state": "SCORED",
+        }
+        upsert_sleep(conn, USER_ID, record)
+        held.append(record)
+
+    # The fresh listing confirms all but CLOSE_LIMIT_PER_RUN of them -- a
+    # plausible burst of dropped *.deleted events, exactly what this module
+    # exists to backstop.
+    fresh = held[CLOSE_LIMIT_PER_RUN:]
+    respx.get(f"{BASE_URL}{COLLECTION_PATHS['sleeps']}").mock(
+        return_value=httpx.Response(200, json={"records": fresh, "next_token": None})
+    )
+    mock_empty_collections(except_for="sleeps")
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    assert results["sleeps"].fetched == len(fresh)
+    assert results["sleeps"].closed == CLOSE_LIMIT_PER_RUN
+    assert results["sleeps"].withheld is None
+    survivors = {r["id"] for r in get_sleeps(conn, USER_ID)}
+    assert survivors == {r["id"] for r in fresh}
+    conn.close()
 
 
 # =============================================================================

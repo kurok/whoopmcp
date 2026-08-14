@@ -102,7 +102,7 @@ from whoopmcp.webhook_processor import set_deleted_at
 #: reasoning.
 DEFAULT_WINDOW_DAYS = 30
 
-#: How many locally-held records an *empty* WHOOP listing may close in one run.
+#: How many locally-held records one reconciliation run may close.
 #:
 #: Reconciliation exists to close holes left by dropped ``*.deleted`` events, and
 #: a window whose last record was deleted upstream legitimately fetches zero --
@@ -110,18 +110,28 @@ DEFAULT_WINDOW_DAYS = 30
 #: exactly that. So refusing *every* empty listing, which is what #175's own
 #: acceptance criterion asked for, would disable the feature rather than fix it.
 #:
-#: What is not legitimate is an empty response wiping a populated window: an
-#: empty listing and a failed one are indistinguishable here, and a soft-delete
-#: is permanent (nothing ever clears ``deleted_at``; the upserts' ON CONFLICT
-#: clauses do not touch it). So the two cases are separated by size rather than
-#: by a signal the response does not carry.
+#: What is not legitimate is an incomplete response wiping a populated window,
+#: and #175's original ``fetched == 0`` guard only recognised one way a
+#: response can be incomplete. The other one -- named by this module's own
+#: docstring since #175, but unguarded until #197 -- is a listing whose
+#: pagination ends early because a ``next_token`` is wrongly absent: such a run
+#: has ``fetched > 0``, sailed past the empty-listing check, and soft-deleted
+#: every in-window record that didn't fit on the pages it did get. A failed
+#: fetch, an empty body and a truncated walk are all indistinguishable from a
+#: genuine deletion here, and a soft-delete is permanent (nothing ever clears
+#: ``deleted_at``; the upserts' ON CONFLICT clauses do not touch it). So the
+#: cases are separated by size rather than by a signal the response does not
+#: carry: the limit applies to what a run would *close* (``missing``), which
+#: for an empty listing is exactly the old "how many are held locally" count,
+#: so #175's boundary behaviour is unchanged.
 #:
 #: The number is a judgement, not a derivation: a dropped-event hole is a handful
-#: of records, a failed fetch strands the whole window. Set low enough that a
-#: wholesale wipe always trips it, high enough that ordinary hole-closing never
-#: does. Raising it weakens the guard; the operator can always rerun once WHOOP
-#: is answering again, which is the recoverable direction.
-EMPTY_LISTING_CLOSE_LIMIT = 5
+#: of records, a failed or truncated fetch strands most of the window. Set low
+#: enough that a wholesale wipe always trips it, high enough that ordinary
+#: hole-closing never does. Raising it weakens the guard; the operator can
+#: always rerun once WHOOP is answering fully again, which is the recoverable
+#: direction.
+CLOSE_LIMIT_PER_RUN = 5
 
 #: How much earlier than the reconciliation window the FRESH fetch's own
 #: ``start`` bound reaches -- absorbing the recovery/related-sleep timeframe
@@ -149,9 +159,10 @@ class ReconciliationResult:
     updated: int
     closed: int
     #: Why this collection closed nothing, when the reason was a refusal rather
-    #: than "nothing to close" (#175). ``None`` on a normal run. Reported by the
-    #: CLI, because a run that declines to delete must not look identical to one
-    #: that found nothing to delete -- that is what made the original bug silent.
+    #: than "nothing to close" (#175, #197). ``None`` on a normal run. Reported
+    #: by the CLI, because a run that declines to delete must not look identical
+    #: to one that found nothing to delete -- that is what made the original bug
+    #: silent.
     withheld: str | None = None
 
 
@@ -297,11 +308,13 @@ async def _reconcile_entity(
         if cursor is None:
             break
 
-    # An empty listing is indistinguishable from a failed one, and treating the
-    # two alike is the whole bug (#175). Genuine errors and exhausted retries do
-    # raise before reaching here, so what is left is a response that *looks*
-    # successful: a 200 with an empty body, or a page whose `next_token` is
-    # wrongly absent, ending pagination early.
+    # An incomplete listing is indistinguishable from a genuinely emptier one,
+    # and treating the two alike is the whole bug (#175, #197). Genuine errors
+    # and exhausted retries do raise before reaching here, so what is left is a
+    # response that *looks* successful: a 200 with an empty body, or a page
+    # whose `next_token` is wrongly absent, ending pagination early -- the
+    # second of which has `fetched > 0` and so sailed past #175's own
+    # empty-listing guard while still omitting most of the window (#197).
     #
     # This matters more than a normal false positive because a soft-delete is
     # permanent by construction: nothing in store.py ever sets `deleted_at` back
@@ -316,21 +329,27 @@ async def _reconcile_entity(
             resource=spec.entity, fetched=fetched, updated=updated, closed=0
         )
 
-    if fetched == 0 and len(local_ids) > EMPTY_LISTING_CLOSE_LIMIT:
+    # The limit is on what this run would CLOSE, not on whether the listing was
+    # empty: for an empty listing `missing == local_ids`, so this is exactly
+    # #175's original boundary, and for a truncated one it is the bound #175
+    # never had. See `CLOSE_LIMIT_PER_RUN` for why size is the only available
+    # separator and why closing nothing (rather than the first few) is the
+    # deliberate choice -- a partial close would pick survivors arbitrarily.
+    missing = local_ids - fresh_ids
+    if len(missing) > CLOSE_LIMIT_PER_RUN:
         return ReconciliationResult(
             resource=spec.entity,
-            fetched=0,
+            fetched=fetched,
             updated=updated,
             closed=0,
             withheld=(
-                f"WHOOP returned no {spec.entity} for the window while {len(local_ids)} "
-                f"are held locally (more than {EMPTY_LISTING_CLOSE_LIMIT}); declining to "
-                "close them, since an empty listing and a failed one look identical here "
-                "and a soft-delete cannot be undone"
+                f"the fresh listing omits {len(missing)} of {len(local_ids)} locally-live "
+                f"{spec.entity} for the window (more than {CLOSE_LIMIT_PER_RUN}); declining to "
+                "close them, since a truncated or empty listing and a failed one look "
+                "identical here and a soft-delete cannot be undone"
             ),
         )
 
-    missing = local_ids - fresh_ids
     for resource_id in missing:
         set_deleted_at(conn, spec.resource, whoop_user_id, resource_id)
 
