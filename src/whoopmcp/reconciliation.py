@@ -70,7 +70,7 @@ fetch's lower bound (never the local comparison window, and never the upper
 bound -- sorting/pagination already floor-anchored at ``start`` handles the
 extra records for free) so every record eligible for the local-side
 deletion check is guaranteed to fall inside the fresh listing's own bound
-too, regardless of this skew. Applied uniformly to all three resources for
+too, regardless of this skew. Applied uniformly to every walked resource for
 simplicity, even though sleeps/workouts key ``start``/``end`` on their own
 timeframe already and don't strictly need it.
 """
@@ -85,7 +85,16 @@ from typing import Any
 
 from whoopmcp.client import MAX_PAGE_SIZE, Page, RequestPriority, WhoopClient
 from whoopmcp.config import Config
-from whoopmcp.store import get_recoveries, get_sleeps, get_workouts
+from whoopmcp.store import (
+    get_cycles,
+    get_recoveries,
+    get_sleeps,
+    get_workouts,
+    upsert_cycle,
+    upsert_recovery,
+    upsert_sleep,
+    upsert_workout,
+)
 from whoopmcp.webhook_processor import set_deleted_at
 
 #: Comfortably exceeds any sane reconciliation schedule while keeping a full
@@ -135,6 +144,9 @@ class ReconciliationResult:
 
     resource: str
     fetched: int
+    #: Records whose stored copy was replaced because the fresh listing carried
+    #: a newer ``updated_at`` (#185).
+    updated: int
     closed: int
     #: Why this collection closed nothing, when the reason was a refusal rather
     #: than "nothing to close" (#175). ``None`` on a normal run. Reported by the
@@ -145,7 +157,7 @@ class ReconciliationResult:
 
 @dataclass(frozen=True, slots=True)
 class _ReconcileSpec:
-    """One of the three collections reconciliation walks.
+    """One collection reconciliation walks.
 
     ``entity`` doubles as the store's own table name and this module's
     result-dict key (matching ``_TABLE_BY_RESOURCE``'s plural table names);
@@ -160,13 +172,40 @@ class _ReconcileSpec:
     list_method: str
     get_local: Callable[..., list[dict[str, Any]]]
     id_field: str
+    #: Writes a fresh record back over the stored one, for update detection.
+    upsert: Callable[..., Any]
+    #: Whether a locally-live id missing from the fresh listing is soft-deleted.
+    #:
+    #: False for cycles, and that asymmetry is the point (#185). Update
+    #: detection has to cover all four entities sync covers, or a corrected
+    #: cycle -- which carries `strain`, one of the six analysed metrics -- has no
+    #: path back. Soft-deletion is a different matter: it is irreversible (see
+    #: `compact_database` and #175), and nothing here has validated how WHOOP
+    #: bounds a *cycle* listing. This module already documents that
+    #: `/v2/recovery` filters on the related sleep's timeframe rather than the
+    #: recovery's own, so assuming cycles behave like sleeps would be exactly the
+    #: kind of guess that deletes real records. Cycles therefore get corrections
+    #: without being enrolled in deletion.
+    soft_deletes: bool = True
 
 
-#: Exactly #18's webhook path's own set -- never cycles.
+#: The four entities sync covers, for update detection (#185). Deletion still
+#: applies only to #18's webhook set -- see `_ReconcileSpec.soft_deletes`.
+#:
+#: Adding cycles costs one extra listing per run against the shared per-app
+#: budget. That is the price of the correction path existing at all for them:
+#: WHOOP offers no way to query by modification time (verified against its
+#: published reference), so a re-listing of a bounded recent window is the only
+#: mechanism that can see a rescored record.
 _RECONCILE_SPECS: tuple[_ReconcileSpec, ...] = (
-    _ReconcileSpec("recoveries", "recovery", "list_recoveries", get_recoveries, "cycle_id"),
-    _ReconcileSpec("sleeps", "sleep", "list_sleeps", get_sleeps, "id"),
-    _ReconcileSpec("workouts", "workout", "list_workouts", get_workouts, "id"),
+    _ReconcileSpec(
+        "recoveries", "recovery", "list_recoveries", get_recoveries, "cycle_id", upsert_recovery
+    ),
+    _ReconcileSpec("sleeps", "sleep", "list_sleeps", get_sleeps, "id", upsert_sleep),
+    _ReconcileSpec("workouts", "workout", "list_workouts", get_workouts, "id", upsert_workout),
+    _ReconcileSpec(
+        "cycles", "cycle", "list_cycles", get_cycles, "id", upsert_cycle, soft_deletes=False
+    ),
 )
 
 
@@ -215,9 +254,15 @@ async def _reconcile_entity(
     # deletion for one cycle is recoverable; a soft-delete is not (see below).
     local_records = spec.get_local(conn, whoop_user_id, start=window_start, include_deleted=False)
     local_ids = {str(record[spec.id_field]) for record in local_records}
+    # The stored modification time per id, so a fresh record can be recognised
+    # as a *correction* rather than merely as present (#185).
+    local_updated_at = {
+        str(record[spec.id_field]): record.get("updated_at") for record in local_records
+    }
 
     fresh_ids: set[str] = set()
     fetched = 0
+    updated = 0
     cursor: str | None = None
     while True:
         page: Page = await fetch(
@@ -227,8 +272,27 @@ async def _reconcile_entity(
             priority=RequestPriority.BACKFILL,
         )
         for record in page.records:
-            fresh_ids.add(str(record[spec.id_field]))
+            resource_id = str(record[spec.id_field])
+            fresh_ids.add(resource_id)
             fetched += 1
+            # This re-listing is the only mechanism that can see a rescored
+            # record, because `sync.py`'s forward walk cannot: it advances a mark
+            # taken from `updated_at` but sends it as `start`, which WHOOP
+            # applies to *occurrence* time -- "Return recoveries that occurred
+            # after or during (inclusive) this time", and no parameter selects on
+            # modification time at all. Once a record's own date falls behind the
+            # mark it is unreachable forward, however often it is corrected.
+            #
+            # Strictly newer, and only for ids already held: an equal timestamp
+            # means nothing changed, and a fresh id we do not hold is a *new*
+            # record, which sync and backfill already find correctly by
+            # occurrence time. Writing those here would duplicate their job and
+            # make this walk's cost grow with history rather than with change.
+            stored = local_updated_at.get(resource_id)
+            incoming = record.get("updated_at")
+            if stored is not None and incoming is not None and str(incoming) > str(stored):
+                spec.upsert(conn, whoop_user_id, record)
+                updated += 1
         cursor = page.next_token
         if cursor is None:
             break
@@ -245,10 +309,18 @@ async def _reconcile_entity(
     # later sync rewrites the row and leaves it invisible. There is no undelete
     # to fall back on, which is why this fails closed rather than trusting the
     # response.
+    if not spec.soft_deletes:
+        # Cycles reach here: corrected above, never closed. See
+        # `_ReconcileSpec.soft_deletes` for why the two halves differ.
+        return ReconciliationResult(
+            resource=spec.entity, fetched=fetched, updated=updated, closed=0
+        )
+
     if fetched == 0 and len(local_ids) > EMPTY_LISTING_CLOSE_LIMIT:
         return ReconciliationResult(
             resource=spec.entity,
             fetched=0,
+            updated=updated,
             closed=0,
             withheld=(
                 f"WHOOP returned no {spec.entity} for the window while {len(local_ids)} "
@@ -262,7 +334,9 @@ async def _reconcile_entity(
     for resource_id in missing:
         set_deleted_at(conn, spec.resource, whoop_user_id, resource_id)
 
-    return ReconciliationResult(resource=spec.entity, fetched=fetched, closed=len(missing))
+    return ReconciliationResult(
+        resource=spec.entity, fetched=fetched, updated=updated, closed=len(missing)
+    )
 
 
 async def run_reconciliation(

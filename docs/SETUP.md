@@ -238,8 +238,22 @@ way `enforce-retention` documents:
 ```
 
 Run it alongside your existing `whoop_sync`/backfill schedule, not instead
-of it -- reconciliation only ever closes deletion holes; it does not pick up
-new or updated records the way #15's sync does.
+of it. Reconciliation closes deletion holes and, since #185, re-applies
+*corrections* to records it already holds — but it never inserts a record it
+has not seen before, which is what sync and backfill are for.
+
+Corrections need this path because they cannot come through sync. WHOOP's
+`start`/`end` parameters filter on when a record **occurred**, not when it was
+last modified, and no parameter selects on modification time — so once a
+record's own date falls behind sync's forward mark, no request can return it
+again however often WHOOP rescores it. Re-listing a bounded recent window is
+the only mechanism that can see such a change, which is why the reconciliation
+schedule matters even when webhooks are healthy.
+
+Corrections are detected for all four collections, including cycles.
+Deletions are still only closed for the three that webhooks cover — cycles are
+never soft-deleted here, because that step is irreversible and nothing has
+validated how WHOOP bounds a cycle listing.
 
 ### Per-user last-delivery time
 
