@@ -1733,3 +1733,188 @@ async def test_a_naive_timestamp_is_read_as_utc(tmp_path: Path) -> None:
     assert result2["cycles"].skipped_implausible == 1
     conn.close()
     conn2.close()
+
+
+# =============================================================================
+# Issue #201: a stored resume next_token WHOOP rejects must heal, not wedge.
+# Marks already recover on both the write and read side (#186); the WHOOP
+# cursor inside an in_progress resume blob is the one piece of resume state
+# whose validity this server does not control, and replaying it verbatim
+# after a persistent 4xx wedged that entity's sync forever -- there is no CLI
+# to clear a cursor, so recovery meant hand-editing sqlite.
+# =============================================================================
+
+
+def _seed_in_progress_resume(conn: Any, entity: str, token: str) -> str:
+    """Write an in_progress resume blob whose next_token is ``token``."""
+    key = _incremental_entity_key(entity)
+    since = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+    set_sync_state(
+        conn,
+        USER_ID,
+        key,
+        cursor=json.dumps(
+            {
+                "since": since,
+                "next_token": token,
+                "high_water_seen": None,
+                "previous_mark": since,
+            }
+        ),
+        last_run_at=since,
+        outcome="in_progress",
+    )
+    return key
+
+
+@respx.mock
+async def test_rejected_resume_token_falls_back_to_since_instead_of_wedging(
+    tmp_path: Path,
+) -> None:
+    """A stored resume token WHOOP persistently rejects (400) recovers within
+    ONE run: the walk restarts from the blob's own `since` without the token,
+    completes, and commits a valid mark -- reported via dropped_stale_cursor,
+    because a run that recovered from a dead cursor must not read as an
+    ordinary clean one. On main this reported an error and left the cursor
+    untouched, so every later run replayed the same dead token forever.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    key = _seed_in_progress_resume(conn, "sleeps", "DEAD-TOKEN")
+
+    normal_mark = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    record = make_record("sleeps", 1, normal_mark)
+    routes = mock_collections({})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("nextToken") is not None:
+            return httpx.Response(400, json={"error": "invalid nextToken"})
+        return httpx.Response(200, json={"records": [record], "next_token": None})
+
+    routes["sleeps"].side_effect = handler
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_sync(conn, client, config, USER_ID)
+
+    result = results["sleeps"]
+    assert result.error is None, f"the dead cursor must heal, not wedge: {result.error}"
+    assert result.count == 1
+    assert result.dropped_stale_cursor is True
+
+    state = get_sync_state(conn, USER_ID, key)
+    assert state is not None
+    assert state["outcome"] == "complete", "the healed run must commit a completed walk"
+    assert state["cursor"] == normal_mark
+    conn.close()
+
+
+@respx.mock
+async def test_rejected_token_minted_this_run_keeps_the_187_semantics(tmp_path: Path) -> None:
+    """A 4xx on a token WHOOP minted moments earlier in this same run is NOT
+    the dead-stored-cursor case: it is reported and the checkpoint is left for
+    a verbatim retry, exactly as #187 decided for transient faults.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    key = _incremental_entity_key("sleeps")
+
+    normal_mark = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    record = make_record("sleeps", 1, normal_mark)
+    routes = mock_collections({})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("nextToken") == "page-2":
+            return httpx.Response(400, json={"error": "who knows"})
+        return httpx.Response(200, json={"records": [record], "next_token": "page-2"})
+
+    routes["sleeps"].side_effect = handler
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_sync(conn, client, config, USER_ID)
+
+    result = results["sleeps"]
+    assert result.error is not None
+    assert result.dropped_stale_cursor is False
+
+    state = get_sync_state(conn, USER_ID, key)
+    assert state is not None
+    assert state["outcome"] == "in_progress", "the page-1 checkpoint must be left for a retry"
+    assert json.loads(state["cursor"])["next_token"] == "page-2"
+    conn.close()
+
+
+@respx.mock
+async def test_5xx_on_a_resume_token_is_not_read_as_a_dead_cursor(tmp_path: Path) -> None:
+    """A 5xx is WHOOP falling over, not a verdict on the token: the stored
+    resume cursor must survive untouched for a verbatim retry next run.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    key = _seed_in_progress_resume(conn, "sleeps", "MAYBE-FINE-TOKEN")
+
+    routes = mock_collections({})
+    routes["sleeps"].side_effect = lambda request: httpx.Response(500, json={"error": "oops"})
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_sync(conn, client, config, USER_ID)
+
+    result = results["sleeps"]
+    assert result.error is not None
+    assert result.dropped_stale_cursor is False
+
+    state = get_sync_state(conn, USER_ID, key)
+    assert state is not None
+    assert state["outcome"] == "in_progress"
+    assert json.loads(state["cursor"])["next_token"] == "MAYBE-FINE-TOKEN"
+    conn.close()
+
+
+@respx.mock
+async def test_dropped_stale_cursor_surfaced_in_whoop_sync_tool_response(tmp_path: Path) -> None:
+    """The tool response carries dropped_stale_cursor -- but only on the
+    entity that actually healed, the effect_size_note precedent: a `false` on
+    every entity of every response would spend whoop_sync's tight #25 ceiling
+    explaining nothing.
+    """
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link_principal_to_member(
+        conn, client_id="__local__", issuer=None, subject=None, whoop_user_id=USER_ID
+    )
+    _seed_in_progress_resume(conn, "sleeps", "DEAD-TOKEN")
+
+    normal_mark = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    record = make_record("sleeps", 1, normal_mark)
+    routes = mock_collections({})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("nextToken") is not None:
+            return httpx.Response(400, json={"error": "invalid nextToken"})
+        return httpx.Response(200, json={"records": [record], "next_token": None})
+
+    routes["sleeps"].side_effect = handler
+
+    server = build_server()
+
+    async with WhoopClient(config, auth) as client:
+        app_context = AppContext(
+            config=config,
+            auth=auth,
+            client=client,
+            principal=Principal(user_id=USER_ID),
+            store_conn=conn,
+        )
+        result = await call_tool(server, "whoop_sync", {}, app_context)
+
+    assert result["synced"] is True
+    assert result["entities"]["sleeps"]["dropped_stale_cursor"] is True
+    for name, entity_info in result["entities"].items():
+        if name != "sleeps":
+            assert "dropped_stale_cursor" not in entity_info, (
+                "the key's presence IS the signal; a false would spend the ceiling on nothing"
+            )
+    conn.close()
