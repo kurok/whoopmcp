@@ -38,6 +38,7 @@ from whoopmcp import metrics, store
 from whoopmcp.analysis import (
     _METRIC_PATHS,  # reused for whoop_timeseries (#20), not duplicated
     DEFAULT_LAG_SWEEP,
+    MIN_EFFECT_SAMPLES,
     InsufficientDataError,
     RollingPoint,
     context_window,
@@ -2378,12 +2379,37 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             if "error" in b or "error" in c:
                 delta[metric] = {"error": "insufficient_data"}
                 continue
-            try:
-                effect_size: float | None = standardized_effect_size(
-                    b["mean"], b["stdev"], b["count"], c["mean"], c["stdev"], c["count"]
-                )
-            except InsufficientDataError:
+            # The comparison itself survives a thin window; only the effect
+            # size is withheld (#183). Refusing the whole tool would remove the
+            # part that still works -- `delta_mean` is a difference of means and
+            # is interpretable at small n -- while Cohen's d divides by a pooled
+            # standard deviation that at two observations per group is nearly
+            # arbitrary. That is where the d = 16.26 came from, so the floor is
+            # applied to the unstable statistic rather than to the request.
+            effect_size_note: str | None = None
+            effect_size: float | None
+            if b["count"] < MIN_EFFECT_SAMPLES or c["count"] < MIN_EFFECT_SAMPLES:
+                # Checked here rather than by catching the error, so the note is
+                # attached to THIS refusal only. `standardized_effect_size` also
+                # refuses a zero pooled stdev, which is a different condition,
+                # predates #183, and already returned a bare `null` -- annotating
+                # it too would be scope creep, and measurably costly: the extra
+                # string on every such metric put this tool over #25's ceiling.
                 effect_size = None
+                # Carried explicitly because a bare `null` is indistinguishable
+                # from "this tool does not compute that", and the caller is a
+                # model that would otherwise have to guess which.
+                effect_size_note = (
+                    f"withheld: effect size needs at least {MIN_EFFECT_SAMPLES} "
+                    f"observations per period, got {b['count']} and {c['count']}"
+                )
+            else:
+                try:
+                    effect_size = standardized_effect_size(
+                        b["mean"], b["stdev"], b["count"], c["mean"], c["stdev"], c["count"]
+                    )
+                except InsufficientDataError:
+                    effect_size = None
             coverage_b = (
                 1 - b["days_missing"] / baseline_expected_days if baseline_expected_days else 0.0
             )
@@ -2397,6 +2423,13 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 "effect_size": effect_size,
                 "coverage_asymmetric": abs(coverage_b - coverage_c) > 0.5,
             }
+            # Only when there is something to say. Emitting `"effect_size_note":
+            # null` on every metric of every comparison costs context on every
+            # well-sampled call to explain nothing -- and measurably so: it put
+            # this tool over #25's own ceiling (1341 tokens against 1300). The
+            # key's presence is the machine-readable signal.
+            if effect_size_note is not None:
+                delta[metric]["effect_size_note"] = effect_size_note
         response: dict[str, Any] = {
             "baseline": {
                 "summary": baseline_summaries,

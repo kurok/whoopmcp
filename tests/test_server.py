@@ -1913,7 +1913,7 @@ async def test_compare_periods_happy_path(
             conn,
             12345,
             recovery_fixture(
-                cycle_id=200 + i, recovery_score=score, created_at=f"2026-08-{i + 8:02d}T06:00:00Z"
+                cycle_id=200 + i, recovery_score=score, created_at=f"2026-08-{i + 11:02d}T06:00:00Z"
             ),
         )
         upsert_sleep(
@@ -1925,7 +1925,7 @@ async def test_compare_periods_happy_path(
             conn,
             12345,
             cycle_fixture(
-                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-08-{i + 8:02d}T22:00:00Z"
+                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-08-{i + 11:02d}T22:00:00Z"
             ),
         )
 
@@ -1956,10 +1956,16 @@ async def test_compare_periods_happy_path(
 async def test_compare_periods_includes_effect_size(
     app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """Compare periods includes effect_size (Cohen's d) for each metric."""
+    """Compare periods includes effect_size (Cohen's d) for each metric.
+
+    Nine days per period rather than the three this originally used: #183 gave
+    the effect size a per-group floor of ``MIN_EFFECT_SAMPLES``, and three would
+    now be withheld -- so the test would have been asserting the absence of the
+    thing its name is about. The withheld case has its own test below.
+    """
     assert app_context.store_conn is not None
     conn = app_context.store_conn
-    for i, score in enumerate((55.0, 60.0, 65.0)):
+    for i, score in enumerate((55.0, 56.0, 57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0)):
         upsert_recovery(
             conn,
             12345,
@@ -1979,24 +1985,24 @@ async def test_compare_periods_includes_effect_size(
                 cycle_id=456 + i, strain=10.0 + i, created_at=f"2026-08-{i + 1:02d}T22:00:00Z"
             ),
         )
-    for i, score in enumerate((75.0, 80.0, 85.0)):
+    for i, score in enumerate((75.0, 76.0, 77.0, 78.0, 79.0, 80.0, 81.0, 82.0, 83.0)):
         upsert_recovery(
             conn,
             12345,
             recovery_fixture(
-                cycle_id=200 + i, recovery_score=score, created_at=f"2026-08-{i + 8:02d}T06:00:00Z"
+                cycle_id=200 + i, recovery_score=score, created_at=f"2026-08-{i + 11:02d}T06:00:00Z"
             ),
         )
         upsert_sleep(
             conn,
             12345,
-            sleep_fixture(sleep_id=f"sleep-c-{i}", created_at=f"2026-08-{i + 8:02d}T22:00:00Z"),
+            sleep_fixture(sleep_id=f"sleep-c-{i}", created_at=f"2026-08-{i + 11:02d}T22:00:00Z"),
         )
         upsert_cycle(
             conn,
             12345,
             cycle_fixture(
-                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-08-{i + 8:02d}T22:00:00Z"
+                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-08-{i + 11:02d}T22:00:00Z"
             ),
         )
 
@@ -2005,9 +2011,9 @@ async def test_compare_periods_includes_effect_size(
         "compare_periods",
         {
             "baseline_start": "2026-08-01T00:00:00Z",
-            "baseline_end": "2026-08-03T23:59:59Z",
-            "comparison_start": "2026-08-08T00:00:00Z",
-            "comparison_end": "2026-08-10T23:59:59Z",
+            "baseline_end": "2026-08-09T23:59:59Z",
+            "comparison_start": "2026-08-11T00:00:00Z",
+            "comparison_end": "2026-08-19T23:59:59Z",
         },
         app_context,
     )
@@ -2182,6 +2188,203 @@ async def test_compare_periods_period_length_note_both_multiples_of_7(
     )
 
     assert result["period_length_note"] is None
+
+
+# -- issue #183: effect size floor tests -----------------------------------
+
+
+async def test_compare_periods_effect_size_withheld_below_min_floor(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """Compare periods withholds effect_size when n < MIN_EFFECT_SAMPLES.
+
+    This test verifies the fix for issue #183: two observations per group
+    produce d=16.26, which is numerically correct but unstable. The tool now
+    checks MIN_EFFECT_SAMPLES (8) on BOTH groups and withholds effect_size
+    when either group is below the threshold, providing effect_size_note
+    to explain why. delta_mean and all other comparisons still work.
+    """
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+
+    # Baseline: 2 scored recovery/sleep/cycle days with varying scores
+    # This provides count=2 per group, which is the issue's exact scenario
+    for i in range(2):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i,
+                recovery_score=61.0 + i,
+                created_at=f"2026-08-{i + 1:02d}T06:00:00Z",
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-base-{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=456 + i, strain=10.0 + i, created_at=f"2026-08-{i + 1:02d}T22:00:00Z"
+            ),
+        )
+
+    # Comparison: 2 scored recovery/sleep/cycle days with higher scores
+    for i in range(2):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=200 + i,
+                recovery_score=84.0 + i,
+                created_at=f"2026-08-{i + 8:02d}T06:00:00Z",
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-comp-{i}", created_at=f"2026-08-{i + 11:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-08-{i + 8:02d}T22:00:00Z"
+            ),
+        )
+
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-02T23:59:59Z",
+            "comparison_start": "2026-08-08T00:00:00Z",
+            "comparison_end": "2026-08-09T23:59:59Z",
+        },
+        app_context,
+    )
+
+    # Verify effect_size is withheld (None) and effect_size_note explains why
+    recovery_delta = result["delta"]["recovery_score"]
+    assert recovery_delta["effect_size"] is None, "effect_size should be None when n < 8"
+    assert "effect_size_note" in recovery_delta, (
+        "effect_size_note key must be present when effect_size is withheld"
+    )
+    assert isinstance(recovery_delta["effect_size_note"], str), (
+        f"effect_size_note must be a string, got {type(recovery_delta['effect_size_note'])}"
+    )
+    # The note should mention the floor or the minimum sample count
+    note_lower = recovery_delta["effect_size_note"].lower()
+    assert "8" in note_lower or "min" in note_lower or "insufficient" in note_lower, (
+        f"effect_size_note should mention the floor (8), got: {recovery_delta['effect_size_note']}"
+    )
+
+    # Verify that delta_mean is STILL PRESENT (compare_periods doesn't refuse wholesale)
+    assert "delta_mean" in recovery_delta, (
+        "delta_mean must still be present even when effect_size is withheld"
+    )
+    assert isinstance(recovery_delta["delta_mean"], (int, float)), (
+        f"delta_mean should be numeric, got {type(recovery_delta['delta_mean'])}"
+    )
+
+    # Verify that the comparison still computed the delta correctly
+    # baseline: [61, 62] -> mean ~61.5, comparison: [84, 85] -> mean ~84.5
+    # delta_mean should be roughly 23
+    assert recovery_delta["delta_mean"] == pytest.approx(23.0, abs=0.5), (
+        f"delta_mean should be ~23, got {recovery_delta['delta_mean']}"
+    )
+
+
+async def test_compare_periods_effect_size_with_period_length_note_both_appear(
+    app_context: AppContext, server: MCPServer[AppContext]
+) -> None:
+    """Compare periods can have BOTH effect_size_note AND period_length_note independently.
+
+    This test verifies that issue #183's fix doesn't replace or interfere with
+    the existing period_length_note warning. When both conditions are true
+    (insufficient effect size samples AND non-multiple-of-7 periods), both
+    notes should appear.
+    """
+    assert app_context.store_conn is not None
+    conn = app_context.store_conn
+
+    # Seed only 2 scored days per period (insufficient for effect size)
+    for i in range(2):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=100 + i,
+                recovery_score=65.0 + i,
+                created_at=f"2026-08-{i + 1:02d}T06:00:00Z",
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-base-{i}", created_at=f"2026-08-{i + 1:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=456 + i, strain=12.0 + i, created_at=f"2026-08-{i + 1:02d}T22:00:00Z"
+            ),
+        )
+
+    for i in range(2):
+        upsert_recovery(
+            conn,
+            12345,
+            recovery_fixture(
+                cycle_id=200 + i,
+                recovery_score=75.0 + i,
+                created_at=f"2026-08-{i + 8:02d}T06:00:00Z",
+            ),
+        )
+        upsert_sleep(
+            conn,
+            12345,
+            sleep_fixture(sleep_id=f"sleep-comp-{i}", created_at=f"2026-08-{i + 8:02d}T22:00:00Z"),
+        )
+        upsert_cycle(
+            conn,
+            12345,
+            cycle_fixture(
+                cycle_id=556 + i, strain=14.0 + i, created_at=f"2026-08-{i + 8:02d}T22:00:00Z"
+            ),
+        )
+
+    # Use date ranges that are NOT multiples of 7 (so period_length_note fires)
+    # Baseline: Aug 1-6 (6 days, not a multiple of 7)
+    # Comparison: Aug 8-13 (6 days, not a multiple of 7)
+    result = await call_tool(
+        server,
+        "compare_periods",
+        {
+            "baseline_start": "2026-08-01T00:00:00Z",
+            "baseline_end": "2026-08-06T23:59:59Z",
+            "comparison_start": "2026-08-08T00:00:00Z",
+            "comparison_end": "2026-08-13T23:59:59Z",
+        },
+        app_context,
+    )
+
+    # Both notes should be present
+    assert result["period_length_note"] is not None, (
+        "period_length_note should fire for non-multiple-of-7 periods"
+    )
+    recovery_delta = result["delta"]["recovery_score"]
+    assert "effect_size_note" in recovery_delta, (
+        "effect_size_note should be present due to insufficient samples"
+    )
+    assert recovery_delta["effect_size"] is None, (
+        "effect_size should be None due to insufficient samples"
+    )
 
 
 async def test_summarize_period_includes_median_and_days_missing(
