@@ -53,7 +53,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from whoopmcp.backfill import BACKFILL_ENTITIES, _EntitySpec
-from whoopmcp.client import MAX_PAGE_SIZE, Page, RequestPriority, WhoopClient
+from whoopmcp.client import MAX_PAGE_SIZE, Page, RequestPriority, WhoopAPIError, WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.store import get_sync_state, set_sync_state
 
@@ -97,6 +97,11 @@ class EntitySyncResult:
     #: nothing was fetched and this entity's stored cursor is untouched, so the
     #: next run retries it from exactly where it was.
     error: str | None = None
+    #: Whether this run abandoned a stored resume ``next_token`` WHOOP rejected
+    #: and re-walked from its own ``since`` instead (#201). Reported for the
+    #: same reason ``skipped_implausible`` is: a run that recovered from a dead
+    #: cursor must not read as an ordinary clean one.
+    dropped_stale_cursor: bool = False
 
 
 def _incremental_entity_key(name: str) -> str:
@@ -313,13 +318,44 @@ async def _sync_entity(
     fetch = getattr(client, spec.list_method)
     count = 0
     skipped_implausible = 0
+    dropped_stale_cursor = False
+    # True only while the token in play is the STORED one -- i.e. on the first
+    # fetch of a resumed run. Every later token was minted by WHOOP moments
+    # earlier in this same run, and a failure there keeps #187's semantics
+    # (report, leave the checkpoint, retry verbatim next run).
+    token_is_stored_resume = next_token is not None
     while True:
-        page: Page = await fetch(
-            start=since,
-            limit=MAX_PAGE_SIZE,
-            next_token=next_token,
-            priority=RequestPriority.INTERACTIVE,
-        )
+        try:
+            page: Page = await fetch(
+                start=since,
+                limit=MAX_PAGE_SIZE,
+                next_token=next_token,
+                priority=RequestPriority.INTERACTIVE,
+            )
+        except WhoopAPIError as exc:
+            # The healing half of #201, the cursor counterpart of #186's mark
+            # recovery. A stored resume token is the one piece of resume state
+            # whose validity this server does not control: an interrupted run
+            # can sit idle for days before the next whoop_sync, and a token
+            # WHOOP has expired (or stopped understanding) is a persistent
+            # 4xx. Leaving the checkpoint untouched -- the right call for a
+            # transient fault -- replays the same dead token verbatim on
+            # every later run, forever, with no CLI to clear it: the entity's
+            # sync is wedged until someone hand-edits sqlite. So a 4xx on
+            # exactly that first, stored-token fetch drops the token and
+            # re-walks from this run's own `since` (already clamped plausible
+            # above), which is lossless for the reason the module docstring
+            # gives for a never-synced entity: idempotent upserts make a
+            # re-walk cost requests, not correctness. A 5xx is WHOOP falling
+            # over, not a verdict on the token -- still raised, still retried
+            # verbatim next run.
+            if token_is_stored_resume and 400 <= exc.status < 500:
+                token_is_stored_resume = False
+                next_token = None
+                dropped_stale_cursor = True
+                continue
+            raise
+        token_is_stored_resume = False
         for record in page.records:
             spec.upsert(conn, whoop_user_id, record)
             count += 1
@@ -362,5 +398,8 @@ async def _sync_entity(
             conn, whoop_user_id, key, cursor=final_mark, last_run_at=_now(), outcome="complete"
         )
         return EntitySyncResult(
-            count=count, high_water_mark=final_mark, skipped_implausible=skipped_implausible
+            count=count,
+            high_water_mark=final_mark,
+            skipped_implausible=skipped_implausible,
+            dropped_stale_cursor=dropped_stale_cursor,
         )

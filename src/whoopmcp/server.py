@@ -1743,24 +1743,31 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
             return {"synced": False, "message": str(exc)}
 
         failed = sorted(name for name, result in results.items() if result.error is not None)
+        entities: dict[str, Any] = {}
+        for name, result in results.items():
+            entities[name] = {
+                "count": result.count,
+                "cursor": result.high_water_mark,
+                "error": result.error,
+                # Surfaced so a run that refused a record as a cursor
+                # candidate does not read as a clean one (#186) -- both
+                # otherwise show the same count and the same cursor.
+                "skipped_implausible": result.skipped_implausible,
+            }
+            # Only when there is something to say, the effect_size_note
+            # precedent: a `false` on every entity of every response would
+            # spend this tool's tight #25 ceiling explaining nothing. The
+            # key's presence is the machine-readable signal that this run
+            # abandoned a WHOOP-rejected resume cursor and re-walked (#201).
+            if result.dropped_stale_cursor:
+                entities[name]["dropped_stale_cursor"] = True
         response: dict[str, Any] = {
             # False when ANY entity failed, not only when the whole run was
             # refused (#187). A caller that checks just this flag must not be
             # able to read a partial run as a clean one, which is the whole
             # point of isolating the entities in the first place.
             "synced": not failed,
-            "entities": {
-                name: {
-                    "count": result.count,
-                    "cursor": result.high_water_mark,
-                    "error": result.error,
-                    # Surfaced so a run that refused a record as a cursor
-                    # candidate does not read as a clean one (#186) -- both
-                    # otherwise show the same count and the same cursor.
-                    "skipped_implausible": result.skipped_implausible,
-                }
-                for name, result in results.items()
-            },
+            "entities": entities,
         }
         if failed:
             response["message"] = (
