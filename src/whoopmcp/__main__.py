@@ -881,7 +881,7 @@ def _reconcile_webhooks(config: Config, whoop_user_id: int, window_days: int) ->
         conn.close()
 
     summary = ", ".join(
-        f"{resource}=(fetched={result.fetched}, closed={result.closed})"
+        f"{resource}=(fetched={result.fetched}, updated={result.updated}, closed={result.closed})"
         for resource, result in sorted(results.items())
     )
     print(

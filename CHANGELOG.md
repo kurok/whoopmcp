@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #185: a correction WHOOP made to an older record could never reach the
+  store. `sync.py` advances a high-water mark taken from `updated_at` and sends
+  it as the `start` parameter, but WHOOP applies `start`/`end` to when a record
+  **occurred** -- "Return recoveries that occurred after or during (inclusive)
+  this time" -- and offers no parameter that selects on modification time
+  (verified against its published reference). So once a record's own date fell
+  behind the advancing mark it was unreachable by any forward request, however
+  often it was rescored, and `run_sync` reported success with `count=0`.
+
+  Reconciliation now detects corrections. It already re-lists a bounded recent
+  window and already held each full record while discarding all but the id, so a
+  fresh record whose `updated_at` is strictly newer than the stored one is
+  written back at no extra request cost. A fresh id that is not held locally is
+  left alone -- inserting new records is sync and backfill's job, and they do it
+  correctly by occurrence time.
+
+  **Cycles join the walk for corrections only.** Sync covers four entities and
+  reconciliation covered three, so without this a corrected cycle -- carrying
+  `strain`, one of the six analysed metrics -- had no path back. They are never
+  soft-deleted: that step is irreversible, and nothing has validated how WHOOP
+  bounds a cycle listing, so enrolling them in deletion would risk destroying
+  real records. Update detection and deletion are therefore decoupled: four
+  entities for the first, three for the second.
+
+  `ReconciliationResult.updated` reports the count, and `reconcile-webhooks`
+  prints it alongside `fetched` and `closed`. Adding cycles costs one extra
+  listing per run.
+
+
 - Issue #183: `compare_periods` reported a decisive-looking effect size from as
   few as 2 observations per period. `standardized_effect_size` required only the
   2 that `stdev()` structurally needs, while every sibling in the module already

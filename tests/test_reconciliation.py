@@ -53,23 +53,31 @@ from whoopmcp.client import BASE_URL, RequestPriority, WhoopClient
 from whoopmcp.config import Config
 from whoopmcp.reconciliation import EMPTY_LISTING_CLOSE_LIMIT, run_reconciliation
 from whoopmcp.store import (
+    get_cycles,
     get_recoveries,
     get_sleeps,
     get_workouts,
     link_principal_to_member,
     open_store,
+    upsert_cycle,
+    upsert_recovery,
     upsert_sleep,
 )
 
 USER_ID = 123
 OTHER_USER_ID = 456
 
-#: The three resources reconciliation covers -- exactly #18's webhook path's
-#: own set (``_TABLE_BY_RESOURCE``), never cycles.
+#: The collections reconciliation walks. Three of them are also #18's webhook
+#: set and can be soft-deleted; cycles are walked for update detection only
+#: (#185), so a corrected `strain` has a path back without cycles gaining a
+#: deletion path nothing has validated.
 COLLECTION_PATHS: dict[str, str] = {
     "recoveries": "/v2/recovery",
     "sleeps": "/v2/activity/sleep",
     "workouts": "/v2/activity/workout",
+    # Cycles joined the walk with #185, for update detection only -- they are
+    # never soft-deleted. See `_ReconcileSpec.soft_deletes`.
+    "cycles": "/v2/cycle",
 }
 
 EMPTY_PAGE: dict[str, Any] = {"records": [], "next_token": None}
@@ -648,3 +656,467 @@ async def test_empty_listing_still_closes_a_window_at_the_limit(tmp_path: Path) 
 
     assert await closed_count(EMPTY_LISTING_CLOSE_LIMIT) == EMPTY_LISTING_CLOSE_LIMIT
     assert await closed_count(EMPTY_LISTING_CLOSE_LIMIT + 1) == 0
+
+
+# =============================================================================
+# Issue #185: Update-detection for records rescored after the occurrence
+# window has passed the sync high-water mark.
+# =============================================================================
+
+
+@respx.mock
+async def test_reconciliation_detects_and_applies_recovery_updates(tmp_path: Path) -> None:
+    """TEST 1: A recovery is stored with an old `updated_at`. WHOOP's fresh
+    listing returns the SAME id with a NEWER `updated_at` and a changed score.
+    After reconciliation, the STORED record must hold the new score. This is
+    the test that justifies issue #185 -- the whole reason update-detection
+    exists."""
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    sleep_start = now - timedelta(days=2)
+
+    # Store a recovery with an old updated_at and a recovery_score.
+    old_recovery = {
+        "cycle_id": "cycle-1",
+        "created_at": iso(sleep_start),
+        "score_state": "SCORED",
+        "score": {"recovery_score": 50.0},
+        "updated_at": iso(now - timedelta(days=2)),
+    }
+    upsert_recovery(conn, USER_ID, old_recovery)
+    stored = get_recoveries(conn, USER_ID)
+    assert len(stored) == 1
+    assert stored[0]["score"]["recovery_score"] == 50.0, "baseline: old recovery_score is stored"
+
+    # WHOOP's fresh listing returns the SAME cycle_id with a NEWER updated_at
+    # and a CHANGED score.
+    fresh_recovery = {
+        "cycle_id": "cycle-1",
+        "created_at": iso(sleep_start),
+        "score_state": "SCORED",
+        "score": {"recovery_score": 75.0},
+        "updated_at": iso(now),  # Much newer
+    }
+
+    # Mock only the recoveries endpoint to return the fresh record.
+    respx.get(f"{BASE_URL}{COLLECTION_PATHS['recoveries']}").mock(
+        return_value=httpx.Response(200, json={"records": [fresh_recovery], "next_token": None})
+    )
+    mock_empty_collections(except_for="recoveries")
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    # After reconciliation, the stored recovery must reflect the new score.
+    updated = get_recoveries(conn, USER_ID)
+    assert len(updated) == 1
+    assert updated[0]["score"]["recovery_score"] == 75.0, (
+        "the stored recovery_score must be updated to the fresh value"
+    )
+
+    # ReconciliationResult must report the update.
+    assert results["recoveries"].updated == 1, (
+        "ReconciliationResult.updated must count this correction"
+    )
+    conn.close()
+
+
+@respx.mock
+async def test_reconciliation_does_not_upsert_unchanged_records(tmp_path: Path) -> None:
+    """TEST 2: A fresh record whose `updated_at` is UNCHANGED is not
+    re-upserted. This test pins 'strictly newer' -- an unconditional
+    upsert-everything would pass a naive test."""
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    sleep_start = now - timedelta(days=2)
+    unchanged_at = iso(now - timedelta(days=1))
+
+    # Store a recovery with a certain updated_at.
+    sleep_record = {
+        "cycle_id": "cycle-2",
+        "created_at": iso(sleep_start),
+        "score_state": "SCORED",
+        "score": {"recovery_score": 60.0},
+        "updated_at": unchanged_at,
+    }
+    upsert_recovery(conn, USER_ID, sleep_record)
+
+    # Fresh listing returns the exact same record (same updated_at, no changes).
+    fresh_record = {
+        "cycle_id": "cycle-2",
+        "created_at": iso(sleep_start),
+        "score_state": "SCORED",
+        "score": {"recovery_score": 60.0},
+        "updated_at": unchanged_at,  # Identical, not newer
+    }
+
+    # Asserted on the reported count, not on a patched upsert. Patching
+    # `store.upsert_recovery` does nothing here: `_RECONCILE_SPECS` captures the
+    # function object when reconciliation.py is imported, so `spec.upsert` still
+    # points at the original and the spy never fires -- the assertion passed
+    # unconditionally, including against a build that wrote on every equal
+    # timestamp. Verified by mutating `>` to `>=`, which the spy version did not
+    # catch and this does.
+    respx.get(f"{BASE_URL}{COLLECTION_PATHS['recoveries']}").mock(
+        return_value=httpx.Response(200, json={"records": [fresh_record], "next_token": None})
+    )
+    mock_empty_collections(except_for="recoveries")
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    assert results["recoveries"].updated == 0, (
+        "an unchanged `updated_at` is not a correction and must not be rewritten"
+    )
+    assert results["recoveries"].fetched == 1, "the record was still seen, just not rewritten"
+    conn.close()
+
+
+@respx.mock
+async def test_reconciliation_does_not_overwrite_with_older_records(tmp_path: Path) -> None:
+    """TEST 3: A fresh record with an OLDER `updated_at` than the stored one
+    does not overwrite the newer local copy. The stored value must still be
+    the newer one."""
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    sleep_start = now - timedelta(days=2)
+    older_at = iso(now - timedelta(days=2))
+    newer_at = iso(now - timedelta(days=1))
+
+    # Store a recovery with a NEWER updated_at and score 75.
+    stored_recovery = {
+        "cycle_id": "cycle-3",
+        "created_at": iso(sleep_start),
+        "score_state": "SCORED",
+        "score": {"recovery_score": 75.0},
+        "updated_at": newer_at,
+    }
+    upsert_recovery(conn, USER_ID, stored_recovery)
+
+    # Fresh listing returns the SAME cycle_id but with an OLDER updated_at
+    # and different (older?) score.
+    stale_recovery = {
+        "cycle_id": "cycle-3",
+        "created_at": iso(sleep_start),
+        "score_state": "SCORED",
+        "score": {"recovery_score": 50.0},  # Older score
+        "updated_at": older_at,  # Older timestamp
+    }
+
+    respx.get(f"{BASE_URL}{COLLECTION_PATHS['recoveries']}").mock(
+        return_value=httpx.Response(200, json={"records": [stale_recovery], "next_token": None})
+    )
+    mock_empty_collections(except_for="recoveries")
+
+    async with WhoopClient(config, auth) as client:
+        await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    # The stored recovery must still have the newer score.
+    updated = get_recoveries(conn, USER_ID)
+    assert len(updated) == 1
+    assert updated[0]["score"]["recovery_score"] == 75.0, (
+        "the stored recovery_score must NOT be overwritten by a stale update"
+    )
+    conn.close()
+
+
+@respx.mock
+async def test_reconciliation_detects_and_applies_cycle_updates(tmp_path: Path) -> None:
+    """TEST 4: CYCLES get updates. A cycle is stored with an old `updated_at`.
+    WHOOP's fresh listing returns the SAME id with a NEWER `updated_at` and a
+    changed `strain`. After reconciliation, the STORED cycle must hold the new
+    strain. This is the coverage gap the fix exists to close."""
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    cycle_start = now - timedelta(days=2)
+
+    # Store a cycle with an old updated_at and a strain value.
+    old_cycle = {
+        "id": "cycle-old-1",
+        "start": iso(cycle_start),
+        "end": iso(cycle_start + timedelta(hours=24)),
+        "score_state": "SCORED",
+        "score": {"strain": 4.5},
+        "updated_at": iso(now - timedelta(days=2)),
+    }
+    upsert_cycle(conn, USER_ID, old_cycle)
+    stored = get_cycles(conn, USER_ID)
+    assert len(stored) == 1
+    assert stored[0]["score"]["strain"] == 4.5, "baseline: old cycle strain is stored"
+
+    # WHOOP's fresh listing returns the SAME id with a NEWER updated_at
+    # and a CHANGED strain.
+    fresh_cycle = {
+        "id": "cycle-old-1",
+        "start": iso(cycle_start),
+        "end": iso(cycle_start + timedelta(hours=24)),
+        "score_state": "SCORED",
+        "score": {"strain": 6.2},  # Different strain
+        "updated_at": iso(now),  # Much newer
+    }
+
+    # `except_for="cycles"` matters: cycles joined COLLECTION_PATHS with #185, so
+    # an unqualified mock_empty_collections() would re-register /v2/cycle as
+    # empty and shadow the fresh listing this test is about.
+    mock_empty_collections(except_for="cycles")
+    respx.get(f"{BASE_URL}/v2/cycle").mock(
+        return_value=httpx.Response(200, json={"records": [fresh_cycle], "next_token": None})
+    )
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    # After reconciliation, the stored cycle must reflect the new strain.
+    updated = get_cycles(conn, USER_ID)
+    assert len(updated) == 1
+    assert updated[0]["score"]["strain"] == 6.2, (
+        "the stored cycle strain must be updated to the fresh value"
+    )
+
+    # ReconciliationResult must report the update for cycles.
+    assert results["cycles"].updated == 1, (
+        "ReconciliationResult.updated must count this cycle correction"
+    )
+    conn.close()
+
+
+@respx.mock
+async def test_reconciliation_never_soft_deletes_cycles(tmp_path: Path) -> None:
+    """TEST 5: CYCLES ARE NEVER SOFT-DELETED. A locally-held cycle absent from
+    the fresh listing must remain live (`deleted_at IS NULL`). This is the
+    safety property of the decoupled design -- if it regresses, cycles gain a
+    deletion path silently."""
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    cycle_start = now - timedelta(days=2)
+
+    # Store a cycle that will NOT appear in the fresh listing.
+    cycle_record = {
+        "id": "cycle-missing",
+        "start": iso(cycle_start),
+        "end": iso(cycle_start + timedelta(hours=24)),
+        "score_state": "SCORED",
+        "score": {"strain": 5.0},
+        "updated_at": iso(now - timedelta(days=1)),
+    }
+    upsert_cycle(conn, USER_ID, cycle_record)
+    assert len(get_cycles(conn, USER_ID)) == 1, "baseline: cycle is stored"
+
+    # Fresh listing returns nothing (empty page).
+    respx.get(f"{BASE_URL}/v2/cycle").mock(
+        return_value=httpx.Response(200, json={"records": [], "next_token": None})
+    )
+    # Also mock the other endpoints to be empty.
+    mock_empty_collections(except_for=None)
+
+    async with WhoopClient(config, auth) as client:
+        await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    # The cycle must still be live: raw SQL check.
+    row = conn.execute(
+        "SELECT deleted_at FROM cycles WHERE whoop_user_id = ? AND resource_id = ?",
+        (USER_ID, "cycle-missing"),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None, "cycles must NEVER be soft-deleted, even if absent from fresh listing"
+
+    # And get_cycles must still return it.
+    survivors = get_cycles(conn, USER_ID)
+    assert len(survivors) == 1, (
+        "get_cycles must still return the cycle (with include_deleted=False default)"
+    )
+    conn.close()
+
+
+@respx.mock
+async def test_reconciliation_deletion_and_update_coexist_in_single_run(tmp_path: Path) -> None:
+    """TEST 6: Deletion still works for the three that had it, and
+    update-detection coexists in a single run. One record is corrected, a
+    different one is closed."""
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    sleep_start = now - timedelta(days=2)
+
+    # Store two sleeps: one to be updated, one to be deleted.
+    updated_sleep = {
+        "id": "sleep-to-update",
+        "start": iso(sleep_start),
+        "end": iso(sleep_start + timedelta(hours=8)),
+        "score_state": "SCORED",
+        "sleep_performance_percentage": 80.0,
+        "updated_at": iso(now - timedelta(days=2)),
+    }
+    upsert_sleep(conn, USER_ID, updated_sleep)
+
+    deleted_sleep = {
+        "id": "sleep-to-delete",
+        "start": iso(sleep_start + timedelta(days=1)),
+        "end": iso(sleep_start + timedelta(days=1, hours=8)),
+        "score_state": "SCORED",
+        "sleep_performance_percentage": 85.0,
+        "updated_at": iso(now - timedelta(days=1)),
+    }
+    upsert_sleep(conn, USER_ID, deleted_sleep)
+
+    # Fresh listing returns only the updated sleep with a new score.
+    fresh_sleep = {
+        "id": "sleep-to-update",
+        "start": iso(sleep_start),
+        "end": iso(sleep_start + timedelta(hours=8)),
+        "score_state": "SCORED",
+        "sleep_performance_percentage": 92.0,  # Changed
+        "updated_at": iso(now),  # Newer
+    }
+
+    respx.get(f"{BASE_URL}{COLLECTION_PATHS['sleeps']}").mock(
+        return_value=httpx.Response(200, json={"records": [fresh_sleep], "next_token": None})
+    )
+    mock_empty_collections(except_for="sleeps")
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    # The updated sleep must have the new score.
+    survivors = get_sleeps(conn, USER_ID)
+    updated_survivors = [s for s in survivors if s["id"] == "sleep-to-update"]
+    assert len(updated_survivors) == 1
+    assert updated_survivors[0]["sleep_performance_percentage"] == 92.0, (
+        "the sleep must be updated with the new score"
+    )
+
+    # The deleted sleep must be gone.
+    deleted_survivors = [s for s in survivors if s["id"] == "sleep-to-delete"]
+    assert len(deleted_survivors) == 0, "the sleep not in fresh listing must be soft-deleted"
+
+    # Both operations reported.
+    assert results["sleeps"].updated == 1, "one sleep was updated"
+    assert results["sleeps"].closed == 1, "one sleep was deleted"
+    conn.close()
+
+
+@respx.mock
+async def test_reconciliation_result_updated_counts_corrections(tmp_path: Path) -> None:
+    """TEST 7: `ReconciliationResult.updated` counts corrections, and is 0 on a
+    run with none."""
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+
+    # Case 1: no corrections
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+
+    mock_empty_collections()
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    assert results["recoveries"].updated == 0, "no updates: updated must be 0"
+    assert results["sleeps"].updated == 0
+    assert results["workouts"].updated == 0
+    assert results["cycles"].updated == 0
+    conn.close()
+
+    # Case 2: multiple corrections
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+    sleep_start = now - timedelta(days=2)
+
+    # Store two recoveries to be updated.
+    for i in range(2):
+        rec = {
+            "cycle_id": f"cycle-{i}",
+            "created_at": iso(sleep_start),
+            "score_state": "SCORED",
+            "score": {"recovery_score": 50.0},
+            "updated_at": iso(now - timedelta(days=2)),
+        }
+        upsert_recovery(conn, USER_ID, rec)
+
+    # Fresh listing with newer versions.
+    fresh_records = [
+        {
+            "cycle_id": f"cycle-{i}",
+            "created_at": iso(sleep_start),
+            "score_state": "SCORED",
+            "score": {"recovery_score": 70.0},
+            "updated_at": iso(now),
+        }
+        for i in range(2)
+    ]
+
+    respx.get(f"{BASE_URL}{COLLECTION_PATHS['recoveries']}").mock(
+        return_value=httpx.Response(200, json={"records": fresh_records, "next_token": None})
+    )
+    mock_empty_collections(except_for="recoveries")
+
+    async with WhoopClient(config, auth) as client:
+        results = await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    assert results["recoveries"].updated == 2, (
+        "ReconciliationResult.updated must count all corrections"
+    )
+    conn.close()
+
+
+@respx.mock
+async def test_reconciliation_does_not_insert_fresh_unknown_ids(tmp_path: Path) -> None:
+    """TEST 8: A fresh id NOT held locally is not inserted (that is sync's job)
+    -- the store still lacks it after reconciliation. Reconciliation is only
+    for update-detection and deletion-detection, not insertion."""
+    config = make_config(tmp_path)
+    auth = make_auth(config)
+    conn = open_store(":memory:")
+    link(conn, USER_ID, "client-a")
+
+    now = datetime(2026, 8, 10, tzinfo=UTC)
+    sleep_start = now - timedelta(days=2)
+
+    # Fresh listing contains a sleep the store has never seen.
+    fresh_sleep = {
+        "id": "sleep-new-unknown",
+        "start": iso(sleep_start),
+        "end": iso(sleep_start + timedelta(hours=8)),
+        "score_state": "SCORED",
+        "sleep_performance_percentage": 85.0,
+        "updated_at": iso(now),
+    }
+
+    respx.get(f"{BASE_URL}{COLLECTION_PATHS['sleeps']}").mock(
+        return_value=httpx.Response(200, json={"records": [fresh_sleep], "next_token": None})
+    )
+    mock_empty_collections(except_for="sleeps")
+
+    async with WhoopClient(config, auth) as client:
+        await run_reconciliation(conn, client, config, USER_ID, window_days=30, now=now)
+
+    # The store must NOT contain this sleep: reconciliation never inserts.
+    sleeps = get_sleeps(conn, USER_ID)
+    assert len(sleeps) == 0, (
+        "reconciliation must NOT insert fresh ids the store hasn't seen; that is sync's job"
+    )
+    conn.close()
