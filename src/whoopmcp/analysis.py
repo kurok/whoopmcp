@@ -29,6 +29,19 @@ DEFAULT_LAG_SWEEP: tuple[int, ...] = tuple(range(-3, 4))
 #: "refuse below N" convention.
 MIN_TREND_SAMPLES = 8
 
+#: Below this many observations per group an effect size is not worth reporting
+#: (#183). The same 8 as its two siblings above, reused rather than newly
+#: invented: all three answer the same question -- how many observations before
+#: a coefficient describes the member instead of the sample -- and a third
+#: threshold would imply a distinction that does not exist.
+#:
+#: Cohen's d is the most misleading of the three when starved, which is why it
+#: needed a floor rather than only a caveat: it divides by a pooled standard
+#: deviation, and at two observations per group that denominator is nearly
+#: arbitrary. Two 2-point groups measured here produced d = 16.26, a number that
+#: reads as overwhelming evidence and is an artefact of the sample size.
+MIN_EFFECT_SAMPLES = 8
+
 #: Friendly metric name -> key within record["score"].
 _METRIC_PATHS: dict[str, str] = {
     "recovery_score": "recovery_score",
@@ -225,12 +238,19 @@ def standardized_effect_size(
     """Cohen's d between two groups, via pooled standard deviation.
 
     Raises:
-        InsufficientDataError: if either group has fewer than 2 observations,
-            or when the pooled standard deviation is exactly 0 (both groups
-            perfectly constant and identical -- undefined, not zero).
+        InsufficientDataError: if either group has fewer than
+            ``MIN_EFFECT_SAMPLES`` observations, or when the pooled standard
+            deviation is exactly 0 (both groups perfectly constant and
+            identical -- undefined, not zero).
+
+    Note the floor is checked per group, not on the total: 14 observations
+    split 13/1 tells you as little about the second group as 1/1 does, and a
+    check on the sum would let that through.
     """
-    if count_a < 2 or count_b < 2:
-        raise InsufficientDataError("effect size needs at least 2 observations per group")
+    if count_a < MIN_EFFECT_SAMPLES or count_b < MIN_EFFECT_SAMPLES:
+        raise InsufficientDataError(
+            f"effect size needs at least {MIN_EFFECT_SAMPLES} observations per group"
+        )
 
     pooled_variance = ((count_a - 1) * stdev_a**2 + (count_b - 1) * stdev_b**2) / (
         count_a + count_b - 2

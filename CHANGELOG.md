@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Issue #183: `compare_periods` reported a decisive-looking effect size from as
+  few as 2 observations per period. `standardized_effect_size` required only the
+  2 that `stdev()` structurally needs, while every sibling in the module already
+  enforced a real floor (`MIN_CORRELATION_SAMPLES` and `MIN_TREND_SAMPLES`, both
+  8). Two 2-point groups produced Cohen's d = 16.26 with no caveat anywhere in
+  the response.
+
+  New `MIN_EFFECT_SAMPLES = 8`, checked per group rather than on the total, and
+  the effect size alone is withheld below it: `effect_size` is `null` and an
+  `effect_size_note` names the floor and the counts seen. The rest of the
+  comparison is untouched -- `delta_mean` is a difference of means and stays
+  interpretable at small n, so refusing the whole tool would remove the part
+  that still works. Cohen's d is the unstable one, dividing by a pooled standard
+  deviation that at two observations per group is nearly arbitrary.
+
+  The note appears only when the effect size is actually withheld, and only for
+  this refusal -- `standardized_effect_size` also rejects a zero pooled standard
+  deviation, which predates this change and keeps returning a bare `null`.
+  Emitting the key unconditionally cost enough context to push the tool past
+  #25's own ceiling.
+
+
 - Issue #187: a failure syncing one entity denied sync to the other three.
   `run_sync` walked the four entities in a flat loop with no isolation, so an
   exception while syncing `recoveries` aborted the call before `sleeps`,

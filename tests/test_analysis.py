@@ -35,6 +35,10 @@ from whoopmcp.analysis import (
     trend,
 )
 
+#: Minimum sample count for effect size, matching the module's convention.
+#: This will be defined in analysis.py as MIN_EFFECT_SAMPLES = 8.
+_MIN_EFFECT_SAMPLES = 8
+
 
 def test_mean() -> None:
     assert mean([1.0, 2.0, 6.0]) == 3.0
@@ -79,19 +83,24 @@ def test_median_of_nothing_is_an_error() -> None:
 
 
 def test_standardized_effect_size_happy_path() -> None:
-    """Cohen's d between two normal distributions with known values."""
-    # Group A: [1, 2, 3, 4, 5] -> mean=3, stdev^2 = 2.5
-    # Group B: [5, 6, 7, 8, 9] -> mean=7, stdev^2 = 2.5
-    # pooled_variance = ((5-1)*2.5 + (5-1)*2.5) / (5+5-2) = (10 + 10) / 8 = 2.5
+    """Cohen's d between two normal distributions with known values.
+
+    Counts are 8 rather than the 5 this test originally used, because #183 gave
+    the function a per-group floor of ``MIN_EFFECT_SAMPLES``. The expected value
+    is untouched: with equal group sizes and equal standard deviations the
+    pooled variance is independent of n, so d stays 2.53.
+    """
+    # Both groups: stdev^2 = 2.5, means 3 and 7.
+    # pooled_variance = ((8-1)*2.5 + (8-1)*2.5) / (8+8-2) = 35 / 14 = 2.5
     # pooled_stdev = sqrt(2.5) ~ 1.581
     # d = (7 - 3) / 1.581 ~ 2.53
     result = standardized_effect_size(
         mean_a=3.0,
         stdev_a=math.sqrt(2.5),
-        count_a=5,
+        count_a=8,
         mean_b=7.0,
         stdev_b=math.sqrt(2.5),
-        count_b=5,
+        count_b=8,
     )
     assert result == pytest.approx(2.53, abs=0.01)
 
@@ -119,6 +128,100 @@ def test_standardized_effect_size_zero_pooled_stdev() -> None:
         standardized_effect_size(
             mean_a=5.0, stdev_a=0.0, count_a=5, mean_b=5.0, stdev_b=0.0, count_b=5
         )
+
+
+# -- issue #183: effect size floor tests -----------------------------------
+
+
+def test_standardized_effect_size_rejects_two_per_group() -> None:
+    """Cohen's d raises InsufficientDataError when count < MIN_EFFECT_SAMPLES per group.
+
+    This test covers the case from issue #183: two observations per group
+    produce a d = 16.26, which is numerically correct but unstable and
+    misleading without a floor. MIN_EFFECT_SAMPLES = 8 matches the module's
+    established convention (MIN_CORRELATION_SAMPLES, MIN_TREND_SAMPLES).
+    """
+    with pytest.raises(
+        InsufficientDataError, match="at least 8 observations per group"
+    ) as exc_info:
+        standardized_effect_size(
+            mean_a=61.0, stdev_a=1.41, count_a=2, mean_b=84.0, stdev_b=1.41, count_b=2
+        )
+    assert "8" in str(exc_info.value) or "MIN_EFFECT_SAMPLES" in str(exc_info.value)
+
+
+def test_standardized_effect_size_boundary_exactly_min_samples_per_group() -> None:
+    """Cohen's d succeeds when BOTH groups have exactly MIN_EFFECT_SAMPLES observations.
+
+    This is the lower boundary: exactly 8 observations per group should work,
+    as that is the minimum stable threshold the module accepts elsewhere.
+    """
+    result = standardized_effect_size(
+        mean_a=61.0,
+        stdev_a=1.5,
+        count_a=_MIN_EFFECT_SAMPLES,
+        mean_b=84.0,
+        stdev_b=1.5,
+        count_b=_MIN_EFFECT_SAMPLES,
+    )
+    assert isinstance(result, float)
+    assert not math.isnan(result)
+
+
+def test_standardized_effect_size_boundary_one_below_min_group_a() -> None:
+    """Cohen's d raises when group A has fewer than MIN_EFFECT_SAMPLES observations.
+
+    Asymmetric boundary check: a floor checked only on one group is a real bug.
+    This test verifies the floor is enforced on group A independently.
+    """
+    with pytest.raises(InsufficientDataError):
+        standardized_effect_size(
+            mean_a=61.0,
+            stdev_a=1.5,
+            count_a=_MIN_EFFECT_SAMPLES - 1,
+            mean_b=84.0,
+            stdev_b=1.5,
+            count_b=_MIN_EFFECT_SAMPLES,
+        )
+
+
+def test_standardized_effect_size_boundary_one_below_min_group_b() -> None:
+    """Cohen's d raises when group B has fewer than MIN_EFFECT_SAMPLES observations.
+
+    Asymmetric boundary check: a floor checked only on one group is a real bug.
+    This test verifies the floor is enforced on group B independently.
+    """
+    with pytest.raises(InsufficientDataError):
+        standardized_effect_size(
+            mean_a=61.0,
+            stdev_a=1.5,
+            count_a=_MIN_EFFECT_SAMPLES,
+            mean_b=84.0,
+            stdev_b=1.5,
+            count_b=_MIN_EFFECT_SAMPLES - 1,
+        )
+
+
+def test_standardized_effect_size_no_regression_above_floor() -> None:
+    """Cohen's d still works correctly for reasonable sample sizes above the floor.
+
+    Regression test: ensure that adding the MIN_EFFECT_SAMPLES floor does not
+    change the computed value for sizes that pass the floor (n=10 per group).
+    This uses a known pair of distributions to verify the coefficient is stable.
+    """
+    # Group A: mean=3, stdev=sqrt(2.5) (matches test_standardized_effect_size_happy_path)
+    # Group B: mean=7, stdev=sqrt(2.5)
+    # With n=10 per group, should compute the same d as the existing test
+    result = standardized_effect_size(
+        mean_a=3.0,
+        stdev_a=math.sqrt(2.5),
+        count_a=10,
+        mean_b=7.0,
+        stdev_b=math.sqrt(2.5),
+        count_b=10,
+    )
+    # d = (7 - 3) / sqrt(2.5) ~ 2.53 (pooled stdev is sqrt(2.5) when n >> 1)
+    assert result == pytest.approx(2.53, abs=0.01)
 
 
 def test_pearson_detects_a_perfect_positive_relationship() -> None:
