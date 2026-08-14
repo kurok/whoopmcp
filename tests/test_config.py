@@ -293,3 +293,74 @@ def test_every_secret_field_has_repr_false() -> None:
                     f"It should have repr=False. If this is not actually a secret, "
                     f"add it to allowed_exceptions in the test."
                 )
+
+
+# -- numeric variable validation (#200) ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("WHOOPMCP_TIMEOUT", "abc"),
+        ("WHOOPMCP_RATE_LIMIT_PER_MINUTE", "1,00"),
+        ("WHOOPMCP_RATE_LIMIT_PER_DAY", "many"),
+        ("WHOOPMCP_HTTP_PORT", "8000x"),
+        ("WHOOPMCP_WEBHOOK_TIMESTAMP_SKEW_SECONDS", "5m"),
+        ("WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE", "x"),
+    ],
+)
+def test_malformed_numeric_variable_is_a_configerror_naming_it(variable: str, value: str) -> None:
+    """from_env's docstring has always promised ConfigError for a malformed
+    variable, and the backfill-floor precedent is that it names WHICH one --
+    these six escaped as raw ValueError tracebacks that name nothing (#200),
+    past every caller that degrades ConfigError gracefully (doctor, the CLI).
+    """
+    with pytest.raises(ConfigError, match=variable):
+        Config.from_env(VALID_ENV | {variable: value})
+
+
+@pytest.mark.parametrize(
+    "variable", ["WHOOPMCP_RATE_LIMIT_PER_MINUTE", "WHOOPMCP_RATE_LIMIT_PER_DAY"]
+)
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_non_positive_outbound_rate_limit_is_rejected(variable: str, value: str) -> None:
+    """A 0 outbound limit built a RateLimiter whose acquire() can never grant
+    (its counters must be > 0), so every request hung forever with no error
+    (#200). The trap was baited: the INBOUND webhook limiter documents "0 or
+    negative disables", so an operator carrying that convention over got a
+    silent deadlock instead of "no limit". Rejected at startup, by name.
+    """
+    with pytest.raises(ConfigError, match=variable):
+        Config.from_env(VALID_ENV | {variable: value})
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_non_positive_timeout_is_rejected(value: str) -> None:
+    """A 0 timeout is not "no timeout" to httpx -- it times out immediately."""
+    with pytest.raises(ConfigError, match="WHOOPMCP_TIMEOUT"):
+        Config.from_env(VALID_ENV | {"WHOOPMCP_TIMEOUT": value})
+
+
+@pytest.mark.parametrize("value", ["0", "65536", "-1"])
+def test_out_of_range_http_port_is_rejected(value: str) -> None:
+    with pytest.raises(ConfigError, match="WHOOPMCP_HTTP_PORT"):
+        Config.from_env(VALID_ENV | {"WHOOPMCP_HTTP_PORT": value})
+
+
+def test_zero_webhook_rate_limit_still_means_disabled() -> None:
+    """The inbound limiter's documented opt-out must keep working: 0 (and
+    negative) mean "no inbound limit" there, so range validation must not
+    reach this variable -- only the malformed-value check does."""
+    config = Config.from_env(VALID_ENV | {"WHOOPMCP_WEBHOOK_RATE_LIMIT_PER_MINUTE": "0"})
+    assert config.webhook_rate_limit_per_minute == 0
+
+
+def test_numeric_defaults_survive_the_validation() -> None:
+    """The defaults themselves must parse and pass every range check."""
+    config = Config.from_env(VALID_ENV)
+    assert config.request_timeout == 30.0
+    assert config.rate_limit_per_minute == 100
+    assert config.rate_limit_per_day == 10_000
+    assert config.http_port == 8000
+    assert config.webhook_timestamp_skew_seconds == 300.0
+    assert config.webhook_rate_limit_per_minute == 120
