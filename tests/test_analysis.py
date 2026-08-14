@@ -1427,6 +1427,39 @@ def test_trend_r_squared_is_low_on_pure_noise() -> None:
     assert result.fit_quality == "negligible"
 
 
+def test_trend_of_a_constant_series_reports_zero_slope_not_a_refusal() -> None:
+    """A perfectly constant series is a flat trend, not insufficient data.
+
+    Ten nights at exactly 100% sleep performance is a plausible input for a
+    metric capped at 100 -- and there are ten observations, well past
+    MIN_TREND_SAMPLES. Before #199 this raised InsufficientDataError out of
+    pearson ("correlation is undefined when a series is constant"), which
+    metric_trend then relayed as an "insufficient_data" refusal about
+    correlation for a request about a trend. Only the correlation
+    coefficient is undefined here; the slope is exactly 0, and r_squared is
+    0.0 by the convention documented at the guard -- a flat line explains
+    none of the (nonexistent) variance, banding to "negligible" rather than
+    to a "perfect fit".
+    """
+    base_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = [
+        scored_record(
+            (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+            recovery_score=100.0,
+        )
+        for i in range(10)
+    ]
+    result = trend(records, "recovery_score")
+    assert result.count == 10
+    assert result.slope_per_day == 0.0
+    assert result.r_squared == 0.0
+    assert result.fit_quality == "negligible"
+    assert result.first == 100.0
+    assert result.last == 100.0
+    # The rolling series never touched pearson and must still be present.
+    assert result.rolling_7d, "rolling_7d must still be computed for a constant series"
+
+
 def test_trend_fit_quality_describes_r_squared_in_words() -> None:
     """fit_quality bands r_squared into a word, per the issue's explicit
     "describe the fit in words in the response" scope bullet -- r_squared
@@ -1569,15 +1602,16 @@ def test_trend_below_min_samples_raises_insufficient_data_error() -> None:
     assert "7" in str(exc_info.value)
 
 
-def test_trend_constant_value_series_raises_insufficient_data_error() -> None:
-    """A constant-value metric series (all values identical) raises InsufficientDataError.
-
-    Even with 10 SCORED records, if they all have the same metric value,
-    pearson() will raise InsufficientDataError because the y series is constant.
-    This is intentional: a flat metric has undefined r_squared.
+def test_trend_constant_value_series_no_longer_raises() -> None:
+    """The old contract inverted: a constant series used to be pinned as
+    raising InsufficientDataError, on the claim that "a flat metric has
+    undefined r_squared". #199 overrules that: only the correlation
+    coefficient is undefined; the trend itself is a well-defined flat line,
+    and refusing 10 good observations as "insufficient data" was the bug.
+    Kept alongside the fuller assertion test above so the reversal is
+    explicit in the history rather than a silently-deleted pin.
     """
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
-    # All records have recovery_score = 65.0 (constant)
     records = [
         scored_record(
             (base_date + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
@@ -1585,8 +1619,9 @@ def test_trend_constant_value_series_raises_insufficient_data_error() -> None:
         )
         for i in range(10)  # Plenty of records, but constant values
     ]
-    with pytest.raises(InsufficientDataError, match=r"constant|insufficient"):
-        trend(records, "recovery_score")
+    result = trend(records, "recovery_score")  # must not raise
+    assert result.slope_per_day == 0.0
+    assert result.r_squared == 0.0
 
 
 # ===========================================================================

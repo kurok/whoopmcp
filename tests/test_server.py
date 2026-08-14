@@ -1539,10 +1539,17 @@ async def test_metric_trend_cycle_sourced_metric(
     assert result["period"]["end"] is not None
 
 
-async def test_metric_trend_constant_value_returns_error_shape(
+async def test_metric_trend_constant_value_returns_a_flat_trend(
     app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """metric_trend on a constant-value series returns the error shape."""
+    """metric_trend on a constant-value series reports a flat trend (#199).
+
+    This used to pin the error shape: eight identical scores made pearson
+    raise and the tool answered "insufficient_data" -- a refusal about
+    correlation for a request about a trend, with plenty of observations.
+    The trend of a constant series is well-defined (slope 0), so the tool
+    must now answer normally, with r_squared 0.0 banding to "negligible".
+    """
     assert app_context.store_conn is not None
     for i in range(8):
         upsert_recovery(
@@ -1564,10 +1571,11 @@ async def test_metric_trend_constant_value_returns_error_shape(
         app_context,
     )
 
-    assert result["error"] == "insufficient_data"
-    assert "message" in result
-    assert "slope_per_day" not in result
-    assert "r_squared" not in result
+    assert "error" not in result
+    assert result["slope_per_day"] == 0.0
+    assert result["r_squared"] == 0.0
+    assert result["fit_quality"] == "negligible"
+    assert result["count"] == 8
 
 
 async def test_metric_trend_includes_r_squared_and_rolling_windows(
