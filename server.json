@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.kurok/whoopmcp",
-  "description": "Read-only MCP server for the WHOOP API v2 -- recovery, sleep, strain, workouts",
+  "description": "Read-only MCP server for WHOOP API v2: query and analyse your recovery, sleep, strain and workouts",
   "version": "0.1.0",
   "repository": {
     "url": "https://github.com/kurok/whoopmcp",

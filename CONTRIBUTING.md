@@ -20,7 +20,7 @@ pre-commit install     # optional, runs the checks below on commit
 
 ## The checks
 
-CI runs exactly these, so run them before pushing:
+CI runs six checks. The four to run before every push:
 
 ```bash
 pytest
@@ -29,7 +29,10 @@ ruff format --check .
 mypy
 ```
 
-`mypy` is strict on `src/`. Tests are not type-checked.
+CI additionally runs `bandit -r src/` (static security scan) and
+`pip-audit .` (dependency audit), plus a build/`twine check` of the
+distributions — install the `security` extra if you want the first two
+locally. `mypy` is strict on `src/`. Tests are not type-checked.
 
 ## Where things go
 

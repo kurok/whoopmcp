@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated:** 2026-08-11 · **Applies to:** `whoopmcp` (all versions)
+**Last updated:** 2026-08-15 · **Applies to:** `whoopmcp` (all versions)
 
 ## Summary
 
@@ -240,9 +240,10 @@ capability is exposed as an MCP tool.
 
 - **Export** — `whoopmcp export-member --whoop-user-id N` writes one JSON
   document containing every entity this store holds for member `N` (profile,
-  body measurements, recovery, sleep, cycle and workout records, webhook
-  events, tool-call audit rows, and the principal links recording what was
-  authorised and when) and nothing belonging to any other member.
+  body measurements, recovery, sleep, cycle and workout records, sync state,
+  webhook delivery state, webhook events, tool-call audit rows, and the
+  principal links recording what was authorised and when) and nothing
+  belonging to any other member.
 - **Erasure** — `whoopmcp erase-member --whoop-user-id N` revokes the
   member's WHOOP grant upstream, then permanently `DELETE`s every one of
   those rows for member `N` — a real removal, not a flag — plus their token

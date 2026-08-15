@@ -46,9 +46,12 @@ revokes it. Design and review against that, not against "leaked API key."
   OAuth hop) actually matter; in local mode they're inert by construction.
 - **MCP client** — Claude Desktop, Cursor, or anything else speaking MCP to
   this server. Trusted to relay tool calls faithfully; **not** trusted to be
-  free of bugs that duplicate/replay calls (tokens-crypto F2 shows a bare
-  sequential double-call, no malice needed, can resurrect a token past
-  logout) — see Out of scope for the malicious-client case.
+  free of bugs that duplicate/replay calls — a bare sequential double-call
+  needs no malice to trigger a race (tokens-crypto F2). It can no longer
+  resurrect a token past logout, though: `logout()`'s credential epoch
+  (closed by #142; see "Trust boundaries: the two OAuth hops") discards a
+  refresh that finishes after the forget rather than persisting it — see
+  Out of scope for the malicious-client case.
 - **Model provider** — whatever LLM the MCP client sends tool results to.
   Outside this repo's control; see Out of scope.
 - **WHOOP, Inc.** — the data holder and authorization server for the
@@ -91,34 +94,60 @@ flowchart LR
 **Outbound (auth.py → WHOOP):** this is the hop that actually holds the
 asset. `state` is CSRF/injection protection on this hop — generated with
 `secrets.token_urlsafe(32)` and checked with `compare_digest` (both sound,
-per the oauth audit) — but is **not single-use**: `verify_state` never clears
-`_pending_state` on success (oauth F1, `auth.py:585-609`), so a leaked
-`(code, state)` pair stays exploitable for authorization-code injection until
-the next login or logout, not just for one attempt. Refresh-token rotation
-has its own sharp edge under two processes sharing one store (tokens-crypto
-F1/F2, `auth.py:644`, `731-735`): a stale refresh can wipe a sibling
-process's valid grant, and `logout()` doesn't fence an in-flight refresh, so
-credentials can resurrect after an explicit "forget me."
+per the oauth audit) — and is now **single-use**: `verify_state` clears
+`_pending_state` on a successful check (oauth F1, closed by #146,
+`auth.py:777-803`), so a leaked `(code, state)` pair is good for exactly one
+authorization-code exchange, not indefinitely many. A *mismatched* state
+deliberately does **not** clear `_pending_state` — that's not a residual
+version of F1, it's anti-DoS by design: clearing on failure too would let
+anyone who can reach the callback URL kill someone else's genuine
+in-flight login with one bad guess, and 32 random bytes of `state` leave
+nothing worth brute-forcing while the real login is still pending.
+Refresh-token rotation's race under two processes sharing one store is also
+closed: `_supersedes` is now checked against the *caller's own* original
+token, before the store is cleared, when classifying an `invalid_grant`
+response (tokens-crypto F1, closed by #144, `auth.py:646-663`,
+`945-996`) — so a stale refresh that WHOOP already rotated past no longer
+mislabels a sibling process's fresher, still-live grant as gone. `logout()`
+now fences an in-flight refresh too (tokens-crypto F2, closed by #142,
+`auth.py:769`, `880`, `1015-1033`, `1057-1066`): a monotonic credential
+epoch captured at the top of `refresh()`, before the refresh lock is even
+acquired, is re-checked immediately before `_do_refresh` persists or
+installs its result, so a refresh that completes after an explicit
+"forget me" is discarded rather than resurrecting the credential it was
+told to forget.
 
 **Inbound (MCP client → whoopmcp):** this hop exists in the code
 (`mcpauth.py`) but is a resource-server skeleton, not a working gate.
-`_resolve()` is a stub that returns `None` unconditionally (mcpauth.py:251),
-so every real signature/issuer/audience check downstream
-(`_issued_by_trusted_as`, `_names_this_resource`) is exercised only against
-a hand-built `AccessToken` in tests — the oauth audit verified those checks
-fail closed against every spoofing shape it tried (suffix-host, port, path,
-userinfo, IDN, non-string `iss`), but **none of that currently reaches
-`/mcp`**, the actual JSON-RPC endpoint tool calls travel over. The verifier
-is wired only to a demo `/tools` route (mcpauth.py:79-84, by explicit
-module-docstring design, pending #29). Every streamable-http caller today
-collapses to one sentinel principal (`server.py:315-318`,
-`("__local__", None, None)`) and therefore one shared WHOOP member — safe
-*only* because the stub rejects everything and multi-tenancy isn't really
-turned on yet. **A future change that wires a real `_resolve()` into `/mcp`
-without also closing mcpauth F2 (no expiry check of its own; `required_scopes`
-never enforced anywhere) inherits a resource server that trusts its
-resolver's claims wholesale.** That is the highest-leverage place a future
-regression could land, precisely because today's gap looks so inert.
+`_resolve()` is a stub that returns `None` unconditionally
+(mcpauth.py:312-342), so every real signature/issuer/audience/expiry check
+downstream (`_issued_by_trusted_as`, `_names_this_resource`,
+`_is_unexpired`) is exercised only against a hand-built `AccessToken` in
+tests — the oauth audit verified those checks fail closed against every
+spoofing shape it tried (suffix-host, port, path, userinfo, IDN, non-string
+`iss`), but **none of that currently reaches `/mcp`**, the actual JSON-RPC
+endpoint tool calls travel over. The verifier is wired only to a demo
+`/tools` route (mcpauth.py:77-85, by explicit module-docstring design,
+pending #29). Every streamable-http caller today collapses to one sentinel
+principal (`server.py:315-318`, `("__local__", None, None)`) and therefore
+one shared WHOOP member — safe *only* because the stub rejects everything
+and multi-tenancy isn't really turned on yet.
+
+mcpauth F2 — no expiry check of its own — is closed (#164): `_is_unexpired`
+(mcpauth.py:183-212) rejects both an expired token and one whose
+`expires_at` is absent, and `verify_token` runs it unconditionally alongside
+the issuer/audience checks. Scopes were never this verifier's gap to begin
+with: `TokenVerifier.verify_token` takes no `required_scopes` to check
+against, and the SDK's `RequireAuthMiddleware` enforces scopes itself, by
+design, on whatever route it wraps — a second scope check here would just
+be a second source of truth that could drift from the first. **A future
+change that wires a real `_resolve()` into `/mcp` still inherits a resource
+server that trusts its resolver's claims wholesale** for the one thing
+`verify_token` structurally cannot check on the resolver's behalf: whether
+the resolver verified the token's signature (or introspected it) before
+handing back claims as though they were genuine (mcpauth.py:329-339). That
+is the highest-leverage place a future regression could land, precisely
+because today's gap looks so inert.
 
 ## Trust boundary: one process, many members (hosted mode)
 
@@ -128,14 +157,27 @@ single check: a SQLite `set_authorizer` callback records every table
 touched and requires a `whoop_user_id` read on any scoped table
 (`_execute_with_tenancy_authorizer`) — this is the load-bearing control, and
 the audit found no way to touch a scoped table without tripping it — plus a
-regex-based secondary check (`_statement_restricts_to_one_member`, tightened
-by #109) that is depth-blind to parentheses and can be satisfied by a
-member-equality fragment buried in a subquery that follows a
-non-restrictive top-level `WHERE` (store-tenancy-sql F1). That gap is
-**latent**: nothing in this codebase today calls `_execute_scoped` with
-attacker-shaped SQL, only static in-repo statements. It stops being latent
-the moment any future code builds SQL from caller input and routes it
-through that path — treat that as a hard line, not a refactor detail.
+regex-based secondary check (`_statement_restricts_to_one_member`) that is
+no longer depth-blind the way it was (#153/#156/#157/#162): the member
+predicate must now sit at parenthesis depth zero, not merely somewhere
+after the first top-level `WHERE` (#153); comment, string, and now
+backtick-/bracket-quoted regions are stripped from the copy the check
+searches, so a stray `)` inside a quoted identifier can no longer
+desynchronise the depth counter (#156); every arm of a compound statement
+(`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) must independently restrict to
+the member rather than just whichever arm the check happens to examine
+first (#157); and the rollback the check relies on when it rejects a
+statement is now enforced even for statement shapes sqlite3's driver does
+not auto-wrap in a transaction (#162). One gap remains, named in
+`_statement_restricts_to_one_member`'s own docstring rather than smoothed
+over here: a fragment sitting *after* a genuinely depth-zero top-level
+`WHERE` can still widen the statement's own reach back out —
+`WHERE whoop_user_id = ? OR 1 = 1`, or a second `OR`-ed member — because
+nothing here understands boolean precedence (store-tenancy-sql F1). That
+gap is **latent**: nothing in this codebase today calls `_execute_scoped`
+with attacker-shaped SQL, only static in-repo statements. It stops being
+latent the moment any future code builds SQL from caller input and routes
+it through that path — treat that as a hard line, not a refactor detail.
 
 The webhook consumer is a second, adjacent instance of the same boundary: it
 runs with **one process-wide `WhoopClient`** bound to the lifespan
@@ -166,27 +208,50 @@ None of the above needed a finding. They're listed so a reader can tell
 "checked and solid" from "not looked at" — the standard this document is
 held to.
 
+## Closed since this document was first written
+
+The #37 audit found these too; each is closed now by a specific, named
+mechanism, not merely "fixed" — recorded here so the next reader can tell
+"checked, was broken, now isn't" from "never looked at," the same way
+"What already holds" above does for findings that were clean from the
+start:
+
+- **OAuth `state` not single-use** (oauth F1) — closed by #146. Mechanism
+  above, under "Trust boundaries: the two OAuth hops."
+- **Stale-refresh path could destroy a sibling's valid grant** (tokens-crypto
+  F1) — closed by #144. Mechanism above, same section.
+- **`logout()` didn't fence an in-flight refresh** (tokens-crypto F2) —
+  closed by #142. Mechanism above, same section.
+- **`_statement_restricts_to_one_member`'s parenthesis-depth-blindness**
+  (store-tenancy-sql F1, in its original form) — closed by
+  #153/#156/#157/#162. Mechanism above, under "Trust boundary: one process,
+  many members" — which also names the one shape that reworking did not
+  close (now the sole entry in Known Weaknesses below).
+- **mcpauth had no expiry check of its own** (mcpauth F2) — closed by #164.
+  Mechanism above, under "Trust boundaries: the two OAuth hops."
+- **`repr(Token)`/`repr(Config)` exposed every secret verbatim** if anything
+  ever reprs them (tokens-crypto F4 / leakage F7) — closed by #147:
+  `field(repr=False)` on `access_token`/`refresh_token` (`Token`) and
+  `client_secret`/`token_encryption_keys`/`metrics_token`/
+  `metrics_member_salt` (`Config`).
+- **`softprops/action-gh-release@v3` was a mutable-tag third-party action**
+  inside the `contents: write` release job (leakage F1) — closed by #145:
+  pinned by commit SHA
+  (`3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2`).
+
 ## Known weaknesses in scope, not yet fixed
 
 Fresh (#37) findings describing real, bounded gaps — see the audit reports
 for the reasoning; this is the pointer, not the argument:
 
-- OAuth `state` not single-use (oauth F1, P2, reachable today).
-- Stale-refresh path can destroy a sibling's valid grant and mislabel a live
-  grant as gone (tokens-crypto F1, P2, reachable today).
-- `logout()` doesn't fence an in-flight refresh (tokens-crypto F2, P2,
-  reachable today).
-- `_statement_restricts_to_one_member` is parenthesis-depth-blind
+- `_statement_restricts_to_one_member` still can't see boolean precedence: a
+  depth-zero member-equality fragment can be widened right back out by a
+  trailing `WHERE whoop_user_id = ? OR 1 = 1` (or a second `OR`-ed member)
+  immediately after it — the one shape #153/#156/#157/#162 did not close
   (store-tenancy-sql F1, P3, latent).
 - Webhook consumer's single process-wide client doesn't bind fetches to the
   event's member (adjacent observation above; blocks real multi-tenant
   webhook handling).
-- `repr(Config)`/`repr(Token)` expose every secret verbatim if anything ever
-  reprs them (tokens-crypto F4 / leakage F7, P3, latent, structural — no
-  call site does this today).
-- `softprops/action-gh-release@v3` is a mutable-tag third-party action inside
-  the `contents: write` release job (leakage F1, P2, latent until the tag
-  moves).
 
 ## Explicitly out of scope
 

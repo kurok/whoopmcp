@@ -75,10 +75,16 @@ Deliberate choices, so you can tell a decision from an oversight:
 - **`state` is compared with `secrets.compare_digest`** against a
   `token_urlsafe(32)` value generated per login.
 - **This server's own logs go to stderr,** never stdout: on stdio transport
-  stdout carries the JSON-RPC framing. One caveat found by the #37 audit and
-  tracked in #126: under `streamable-http` the embedded uvicorn writes its
-  *access* log (including client IPs) to stdout with its default
-  configuration. That does not affect stdio, where the framing lives.
+  stdout carries the JSON-RPC framing. A gap found by the #37 audit (#126) is
+  closed: under `streamable-http`, the embedded uvicorn used to write its
+  *access* log (including client IPs) to stdout by default; `whoopmcp`'s own
+  entry point now redirects that handler to stderr at startup, before the
+  transport is constructed, so this holds in hosted mode too (#170). That
+  redirect fires only when the app is launched via `whoopmcp --transport
+  streamable-http` itself — an operator who mounts the ASGI app under their
+  own `uvicorn`/`gunicorn` invocation bypasses whoopmcp's entry point
+  entirely, and the access log's destination is theirs to configure in that
+  case.
 
 ## Audit history
 

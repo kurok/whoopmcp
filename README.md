@@ -17,13 +17,20 @@ tokens and health data server-side, which makes them a data controller, not
 a bystander. See [PRIVACY.md](PRIVACY.md)'s local-mode/hosted-mode split
 before hosting this for anyone but yourself.
 
+![Terminal demo: whoopmcp --help, doctor, and the privacy-default backfill refusal](docs/demo.gif)
+
+Install and usage patterns live in the
+[wiki](https://github.com/kurok/whoopmcp/wiki); [docs/SETUP.md](docs/SETUP.md)
+is the from-scratch walkthrough.
+
 > **Status.** Local mode works today against the real WHOOP v2 API,
 > read-only. The hosted surface (streamable HTTP, OAuth resource server,
 > per-tenant isolation, encrypted token storage, webhooks, metrics) is
-> implemented but has **not** been through a security audit (#37, #69).
-> Running it hosted for others also needs WHOOP's app approval, not yet
-> granted, which caps a shared deployment at 10 members in the meantime
-> (#33). See [Roadmap](#roadmap).
+> implemented and has been through the roadmap's security audits (#69, #37);
+> the findings they raised are fixed and closed. Running it hosted for
+> others still needs WHOOP's app approval, not yet granted, which caps a
+> shared deployment at 10 members in the meantime (#33). See
+> [Roadmap](#roadmap).
 
 > **Not affiliated with WHOOP, Inc.** "WHOOP" is their trademark. This is an
 > independent client of their public developer API.
@@ -37,9 +44,18 @@ before hosting this for anyone but yourself.
 | Auth | `whoop_auth_status`, `whoop_login`, `whoop_complete_login`, `whoop_logout` |
 | Profile | `get_profile`, `get_body_measurement` |
 | Records | `list_recoveries`, `list_sleeps`, `list_cycles`, `list_workouts`, `get_sleep`, `get_workout` |
-| Analysis | `summarize_period`, `metric_trend`, `correlate_metrics`, `compare_periods` |
+| Local store | `whoop_sync`, `whoop_data_coverage` |
+| Analysis | `summarize_period`, `metric_trend`, `correlate_metrics`, `compare_periods`, `whoop_timeseries`, `whoop_outliers`, `whoop_streaks` |
 
-Every data tool is annotated `readOnlyHint`. No MCP tool can mutate your
+Alongside the 21 tools it registers 3 prompts (`morning_readiness_briefing`,
+`weekly_training_review`, `sleep_debt_investigation`) and one resource
+template, `whoop://user/{item}`, serving `profile`, `latest-recovery`,
+`latest-sleep` and `latest-cycle`.
+
+Every tool that only reads is annotated `readOnlyHint`; the one exception is
+`whoop_sync`, annotated as a non-destructive, idempotent write because it
+upserts fetched records into the **local** store — it never writes to your
+WHOOP account. No MCP tool can mutate your
 WHOOP account — the one mutating endpoint WHOOP exposes
 (`DELETE /v2/user/access`) is never registered as an MCP tool, so no model
 can revoke your grant. It is reachable only from a terminal on the machine
@@ -208,11 +224,15 @@ when the SDK went to 2.0. The layering is deliberate:
 
 ```
 config.py     environment -> Config, validated once at startup
-auth.py       OAuth 2.0 flow + token storage (file or keychain)
+auth.py       OAuth 2.0 flow + token storage (file, encrypted file, keychain)
 client.py     one method per documented WHOOP endpoint, nothing more
+store.py      persistent store: schema, tenancy enforcement, erasure
 analysis.py   pure functions over already-fetched records
-server.py     MCP tool definitions; the only file that knows about MCP
+server.py     MCP tool definitions
 ```
+
+Only `server.py`, `webhooks.py` and `mcpauth.py` import `mcp` — enforced by
+`tests/test_module_map.py`; CONTRIBUTING.md carries the full 18-module map.
 
 `analysis.py` holds no network code and `client.py` holds no statistics, so
 each can be tested without the other.
@@ -222,13 +242,12 @@ each can be tested without the other.
 | Issue | Work |
 | --- | --- |
 | #33 | [human] Submit the WHOOP app for approval; lifts the 10-member cap on hosted deployments |
-| #34 | Publish to PyPI and the MCP registry |
-| #37 | Full security audit, after everything else here lands |
-| #69 | Earlier-scoped security audit of the already-merged hosted surface |
-| #76 | `whoopmcp login` terminal subcommand, instead of routing the OAuth dance through the model |
-| #70 | README: install instructions and Configuration table |
-| #71 | CONTRIBUTING.md's module map |
-| #75 | Docs claim `delete-member` isn't wired up; it is |
+
+Everything else the roadmap tracked — including both security audits (#69,
+#37), the `whoopmcp login` terminal flow (#76) and the PyPI/MCP-registry
+release plumbing (#34) — is implemented and closed. The package is not yet
+on PyPI: publication waits on the name-clash resolution recorded in #34, so
+install from a clone (see Install above) until then.
 
 ## Contributing
 
