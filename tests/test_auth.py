@@ -100,12 +100,7 @@ def test_verify_state_rejects_when_no_login_is_pending(config: Config) -> None:
 
 
 def test_verify_state_is_consumed_on_successful_verification(config: Config) -> None:
-    """Test 1 (headline): one start_login(), then verify_state(state) succeeds
-    and a second verify_state(state) raises AuthError.
-
-    This test MUST FAIL against current main -- the state is not cleared on
-    successful verification, so the second call would also succeed.
-    """
+    """Test 1 (headline): one start_login(), then verify_state(state) succeeds"""
     auth = Authenticator(config)
     url = auth.start_login()
     state = parse_qs(urlparse(url).query)["state"][0]
@@ -119,12 +114,7 @@ def test_verify_state_is_consumed_on_successful_verification(config: Config) -> 
 
 
 def test_verify_state_mismatch_does_not_consume_pending_state(config: Config) -> None:
-    """Test 2: A mismatch does not consume the pending state (D2).
-
-    verify_state("wrong") raises, and a subsequent verify_state(correct)
-    still succeeds. This is important because clearing on mismatch would let
-    an attacker kill a legitimate in-progress login by sending one bad value.
-    """
+    """Test 2: A mismatch does not consume the pending state (D2)."""
     auth = Authenticator(config)
     url = auth.start_login()
     state = parse_qs(urlparse(url).query)["state"][0]
@@ -171,11 +161,7 @@ def test_fresh_start_login_issues_new_state(config: Config) -> None:
 
 @respx.mock
 async def test_both_real_flows_work_end_to_end(config: Config) -> None:
-    """Test 4: Both real flows (verify-then-exchange) work end to end.
-
-    Tests the __main__.py login path and server.py's whoop_complete_login,
-    each doing verify-then-exchange once. Mock HTTP with respx.
-    """
+    """Test 4: Both real flows (verify-then-exchange) work end to end."""
     # Mock the token endpoint
     respx.post(TOKEN_URL).mock(
         return_value=respx.MockResponse(
@@ -219,11 +205,7 @@ async def test_both_real_flows_work_end_to_end(config: Config) -> None:
 def test_state_does_not_appear_in_exception_messages_or_logs(
     config: Config, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Test 6: No state value reaches any log record or exception message.
-
-    State is cryptographic material and must never appear in error messages
-    or logs, on either the verify or exchange path.
-    """
+    """Test 6: No state value reaches any log record or exception message."""
     caplog.set_level(logging.DEBUG)
 
     auth = Authenticator(config)
@@ -858,24 +840,7 @@ def test_encrypted_file_store_reseals_lazily_on_load_after_rotation(tmp_path: Pa
 def test_encrypted_file_store_fails_closed_if_old_key_removed_before_rotation_completes(
     tmp_path: Path,
 ) -> None:
-    """#69 test 4's negative half. test_encrypted_file_store_reseals_lazily_on
-    _load_after_rotation above already proves the positive case (both keys
-    present, rotation completes, re-seals under N+1) end to end -- fully
-    covered, not restated here. What no existing test drives is the
-    unfinished-rotation failure mode: an operator retires the old key
-    (removes it from the env/keyring) before every v1 record has been
-    touched by a read. That must fail closed on the still-v1 record, not
-    silently lose it or fall back to plaintext.
-
-    test_unknown_key_version_raises_sealerror_not_keyerror in test_crypto.py
-    proves the underlying crypto.unseal primitive fails closed on an unknown
-    version with a hand-built envelope -- but never through
-    EncryptedFileTokenStore.load()/save(), and never with a *real* rotation
-    setup (current_version actually advanced, a real save() under the old
-    key first). This closes that gap at the layer #69 asks about, and
-    additionally confirms the on-disk file is left completely unchanged --
-    no data loss, and no partial/corrupt rewrite attempt either.
-    """
+    """#69 test 4's negative half."""
     key_v1 = os.urandom(32)
     key_v2 = os.urandom(32)
     path = tmp_path / "token.json"
@@ -1126,14 +1091,7 @@ async def test_revoke_and_forget_raises_auth_error_without_leaking_the_token_on_
 def test_write_does_not_follow_a_pre_created_symlink_at_the_predictable_temp_name(
     tmp_path: Path,
 ) -> None:
-    """The #98 regression test.
-
-    ``path.with_suffix(".tmp")`` is guessable from the destination alone, so
-    an attacker who can write to the destination's directory can plant a
-    symlink there *before* the write and have the plaintext delivered
-    wherever they point it -- and, because the symlink is what then gets
-    renamed onto the destination, have every later read follow it too.
-    """
+    """The #98 regression test."""
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     attacker = tmp_path / "attacker" / "stolen.json"
@@ -1221,12 +1179,7 @@ def test_write_keeps_its_existing_guarantees(tmp_path: Path) -> None:
 
 
 def test_lazy_reseal_missing_current_key_returns_unrotated_token(tmp_path: Path) -> None:
-    """Test 1: headline case. Seal under v1, load with current_version=2 and
-    no v2 key → returns valid Token (the original stored value), raises nothing.
-
-    This test MUST FAIL against current main with the raw SealError; the fix
-    wraps the lazy re-seal in its own try/except to handle it gracefully.
-    """
+    """Test 1: headline case."""
     key_v1 = os.urandom(32)
     path = tmp_path / "token.json"
     token = Token("access-token-test", expires_at=1234.0, refresh_token="refresh-token-test")
@@ -1274,12 +1227,7 @@ def test_lazy_reseal_missing_key_emits_warning_naming_version(
 def test_lazy_reseal_missing_key_log_contains_no_secrets(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Test 3: no secret in the log. The access token, refresh token, and key
-    bytes must not appear anywhere in the captured log text (message + exc_text).
-
-    This is the most critical test: a store that logs a secret while
-    "fixing availability" is a far worse bug than the one being fixed.
-    """
+    """Test 3: no secret in the log."""
     key_v1 = os.urandom(32)
     path = tmp_path / "token.json"
     sentinel_access = "SENTINEL-ACCESS-TOKEN-test-abc123"
@@ -1357,15 +1305,7 @@ def test_lazy_reseal_with_both_keys_present_still_rotates(tmp_path: Path) -> Non
 def test_lazy_reseal_missing_key_is_not_suppressed_by_direct_save_call(
     tmp_path: Path,
 ) -> None:
-    """Test 6: save() itself must still raise when the current key is missing
-    (D4). Only the *lazy re-seal inside load()* degrades to a warning. A
-    direct save() call must keep raising because silently failing to persist
-    a freshly obtained token would lose it.
-
-    The exception raised by a direct save() call is SealError (from the crypto
-    layer), not AuthError -- AuthError wrapping is only in the load() path for
-    the initial unseal. This test verifies save() raises (does not degrade to
-    a warning), without prescribing the exact exception type."""
+    """Test 6: save() itself must still raise when the current key is missing"""
     from whoopmcp.crypto import SealError
 
     key_v1 = os.urandom(32)
@@ -1483,14 +1423,7 @@ def test_lazy_reseal_windows_and_missing_key_warnings_are_independent(
 
 
 def test_genuine_decrypt_failure_still_raises_autherror(tmp_path: Path) -> None:
-    """Test 8: no regression on a genuine decrypt failure. A record whose own
-    version's key is wrong (or the ciphertext is tampered with) still raises
-    AuthError, not SealError and not a silent success.
-
-    This is different from the missing current_version case: here, we're trying
-    to decrypt a record sealed under v1, we have the v1 key, but the ciphertext
-    is tampered with. This is NOT the missing-key-during-re-seal case; it's a
-    genuine decrypt failure and must still raise."""
+    """Test 8: no regression on a genuine decrypt failure."""
     key_v1 = os.urandom(32)
     path = tmp_path / "token.json"
     token = Token("a", expires_at=1234.0, refresh_token="r")
@@ -1521,12 +1454,7 @@ def test_genuine_decrypt_failure_still_raises_autherror(tmp_path: Path) -> None:
 
 
 async def test_logout_during_refresh_leaves_store_empty(config: Config) -> None:
-    """Test 1 (headline): Start a refresh, call logout() while in flight, assert
-    the store is still empty and self._token is None.
-
-    MUST FAIL against current main -- the resurrected token is expected to be
-    in the store and self._token after the refresh completes.
-    """
+    """Test 1 (headline): Start a refresh, call logout() while in flight, assert"""
     store = FileTokenStore(config.token_path)
     expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
     store.save(expired)
@@ -1571,31 +1499,7 @@ async def test_logout_during_refresh_leaves_store_empty(config: Config) -> None:
 
 
 async def test_revoke_and_forget_during_refresh_leaves_store_empty(config: Config) -> None:
-    """Test 2: `revoke_and_forget()` must also not be undone by an in-flight refresh.
-
-    The interleaving matters, and two plausible ones prove nothing (#143).
-
-    First, the obvious one: `revoke_and_forget` refreshes when the stored token
-    is expired, so a refresh started beforehand merely *coalesces* onto the same
-    task -- the save lands before the revoke and the test passes on unfixed code.
-
-    Second, and this is the one that shipped: hold the store's token live, then
-    start a refresh with some *other*, expired token. That looks like it puts a
-    refresh in flight and does not. `refresh()` re-reads the store after taking
-    the lock, finds a live token that `_supersedes` the caller's, and returns it
-    immediately -- `_do_refresh` is never entered, no task is created, nothing
-    could ever write to the store, and every assertion below is trivially true.
-    Measured: `_do_refresh` entered 0 times, `_inflight_refresh` never set.
-
-    What discriminates is refreshing with the *same* token the store holds:
-    `_supersedes` compares credential identity, so it is False, the recheck does
-    not short-circuit, and the refresh proceeds to `_do_refresh` and its save.
-    The revoke's DELETE is gated so `logout()` -- and the epoch bump -- happen
-    while that refresh is in flight.
-
-    The assertion that `_inflight_refresh` was actually set is what stops this
-    regressing to a vacuous test a third time.
-    """
+    """Test 2: `revoke_and_forget()` must also not be undone by an in-flight refresh."""
     store = FileTokenStore(config.token_path)
     live_token = Token("live-access", expires_at=time.time() + 3600, refresh_token="live-refresh")
     store.save(live_token)
@@ -1652,11 +1556,7 @@ async def test_revoke_and_forget_during_refresh_leaves_store_empty(config: Confi
 
 
 async def test_refresh_without_logout_still_persists_normally(config: Config) -> None:
-    """Test 3: Regression test. A normal refresh with no interleaved logout
-    still persists the token and sets self._token exactly as before.
-
-    This ensures the fix doesn't break the happy path.
-    """
+    """Test 3: Regression test."""
     store = FileTokenStore(config.token_path)
     expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
     store.save(expired)
@@ -1676,11 +1576,7 @@ async def test_refresh_without_logout_still_persists_normally(config: Config) ->
 
 
 async def test_concurrent_refresh_still_coalesces_with_one_request(config: Config) -> None:
-    """Test 4: Coalescing still works. Two concurrent refresh() calls issue
-    exactly one token-endpoint request.
-
-    This ensures the epoch fix doesn't break the coalescing optimization.
-    """
+    """Test 4: Coalescing still works."""
     store = FileTokenStore(config.token_path)
     expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
     store.save(expired)
@@ -1703,11 +1599,7 @@ async def test_concurrent_refresh_still_coalesces_with_one_request(config: Confi
 
 
 async def test_logout_during_refresh_does_not_raise_out_of_caller(config: Config) -> None:
-    """Test 5: Logout during refresh does not crash the caller.
-
-    The tool call that triggered the refresh may finish with whatever token it
-    obtained. It must not crash due to the interleaved logout.
-    """
+    """Test 5: Logout during refresh does not crash the caller."""
     store = FileTokenStore(config.token_path)
     expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
     store.save(expired)
@@ -1740,11 +1632,7 @@ async def test_logout_during_refresh_does_not_raise_out_of_caller(config: Config
 
 
 async def test_refresh_after_logout_works_normally(config: Config) -> None:
-    """Test 6: A later, post-logout refresh works normally.
-
-    The epoch must not permanently wedge the store. After logout and a fresh
-    login, refresh should work normally again.
-    """
+    """Test 6: A later, post-logout refresh works normally."""
     store = FileTokenStore(config.token_path)
 
     # First: login, then logout, confirm store is empty
@@ -1774,23 +1662,7 @@ async def test_refresh_after_logout_works_normally(config: Config) -> None:
 
 
 async def test_logout_before_refresh_task_starts_leaves_store_empty(config: Config) -> None:
-    """Regression test for review finding B1.
-
-    `refresh()` creates the `_do_refresh` task with `asyncio.ensure_future`
-    and then suspends awaiting it -- the task has not actually run a single
-    line yet at that point. If `logout()` happens to run in that same
-    window (any ready callback in the same event-loop tick, e.g. a sibling
-    `whoop_logout` tool call -- see fact #4), a naive fix that captures the
-    epoch as the first line *inside* `_do_refresh` captures the epoch
-    *after* the logout already bumped it, so the check at the end of
-    `_do_refresh` passes and the forgotten grant's rotated token gets
-    written back to disk anyway.
-
-    This must FAIL if the epoch is captured inside `_do_refresh` instead of
-    at the top of `refresh()` (i.e. it is the regression test for the fix
-    actually shipped, not just for the mid-flight case tests 1 and 2
-    already cover).
-    """
+    """Regression test for review finding B1."""
     store = FileTokenStore(config.token_path)
     expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
     store.save(expired)
@@ -1846,17 +1718,7 @@ async def test_logout_before_refresh_task_starts_leaves_store_empty(config: Conf
 async def test_issue_122_test_1_store_superseding_expired_token_is_refreshed(
     config: Config,
 ) -> None:
-    """Test 1 (D1): The store's superseding-but-expired token is what gets refreshed.
-
-    Seed the store with a fresher-but-expired token, call refresh() with a
-    stale one, and assert the token endpoint received the STORE's refresh
-    token, not the caller's stale one.
-
-    MUST FAIL against current main -- the code requires the stored token to be
-    non-expired to use the short-circuit (line 676: `not current.expired`).
-    When the store's token is expired, the code falls through and tries to
-    refresh the caller's stale token instead.
-    """
+    """Test 1 (D1): The store's superseding-but-expired token is what gets refreshed."""
     store = FileTokenStore(config.token_path)
 
     # Store holds a fresher token (different refresh_token) but it is expired
@@ -1909,15 +1771,7 @@ async def test_issue_122_test_1_store_superseding_expired_token_is_refreshed(
 async def test_issue_122_test_2_superseded_invalid_grant_does_not_clear_store(
     config: Config,
 ) -> None:
-    """Test 2 (D2): A superseded-token invalid_grant does not clear the store.
-
-    Store holds a fresher token, the caller's stale one fails with invalid_grant
-    -> the store still holds the fresher token afterwards.
-
-    MUST FAIL against current main -- the code unconditionally clears the store
-    on invalid_grant (lines 714-716), destroying the fresher token that another
-    process just saved.
-    """
+    """Test 2 (D2): A superseded-token invalid_grant does not clear the store."""
     store = FileTokenStore(config.token_path)
 
     # Store holds a fresher token
@@ -1963,12 +1817,7 @@ async def test_issue_122_test_2_superseded_invalid_grant_does_not_clear_store(
 async def test_issue_122_test_3_genuine_invalid_grant_clears_store_and_raises(
     config: Config,
 ) -> None:
-    """Test 3 (genuine case, D3): The store holds the very token WHOOP rejected.
-
-    When the token that failed is the same one in the store, clear it and raise
-    GrantAlreadyGoneError, exactly as today. This proves the fix does not break
-    the genuine case.
-    """
+    """Test 3 (genuine case, D3): The store holds the very token WHOOP rejected."""
     from whoopmcp.auth import GrantAlreadyGoneError
 
     store = FileTokenStore(config.token_path)
@@ -2003,16 +1852,7 @@ async def test_issue_122_test_3_genuine_invalid_grant_clears_store_and_raises(
 async def test_issue_122_test_4_erase_member_does_not_report_fake_revoke_success(
     config: Config,
 ) -> None:
-    """Test 4 (fact #3, D3): erase-member does not report a revoke that did not happen.
-
-    Drive the CLI path where refresh fails on a superseded token and assert it
-    does NOT treat the revoke step as succeeded (i.e., does not catch
-    GrantAlreadyGoneError). The genuine case (store holds the failed token)
-    would raise GrantAlreadyGoneError, which the CLI catches as success. But when
-    the store has moved on (superseded token), the refresh failure must raise a
-    plain AuthError, not GrantAlreadyGoneError, so the CLI treats it as a real
-    failure and aborts rather than reporting a revoke that did not happen.
-    """
+    """Test 4 (fact #3, D3): erase-member does not report a revoke that did not happen."""
     store = FileTokenStore(config.token_path)
 
     # Store holds a fresher token
@@ -2064,11 +1904,7 @@ async def test_issue_122_test_4_erase_member_does_not_report_fake_revoke_success
 async def test_issue_122_test_5_logout_during_refresh_leaves_store_empty_123(
     config: Config,
 ) -> None:
-    """Test 5 (D4): #123's interlock still holds.
-
-    A logout during refresh still leaves the store empty. This ensures the fix
-    for #122 does not disturb #123's epoch interlock.
-    """
+    """Test 5 (D4): #123's interlock still holds."""
     store = FileTokenStore(config.token_path)
     expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
     store.save(expired)
@@ -2103,11 +1939,7 @@ async def test_issue_122_test_5_logout_during_refresh_leaves_store_empty_123(
 async def test_issue_122_test_6_coalescing_intact(
     config: Config,
 ) -> None:
-    """Test 6: Coalescing intact.
-
-    Two concurrent refreshes still share one token-endpoint request. This ensures
-    the fix for #122 does not break the coalescing optimization.
-    """
+    """Test 6: Coalescing intact."""
     store = FileTokenStore(config.token_path)
     expired = Token("old-access", expires_at=time.time() - 100, refresh_token="old-refresh")
     store.save(expired)
@@ -2138,12 +1970,7 @@ async def test_issue_122_test_6_coalescing_intact(
 
 
 def test_no_secret_in_repr_token() -> None:
-    """Test 1: No secret in repr(Token).
-
-    Neither the access token nor the refresh token appears in repr(Token).
-
-    This test MUST FAIL against current main (before repr=False is added).
-    """
+    """Test 1: No secret in repr(Token)."""
     access_secret = "ACCESS-SECRET-abc123"
     refresh_secret = "REFRESH-SECRET-xyz789"
     token = Token(access_token=access_secret, expires_at=1234.0, refresh_token=refresh_secret)
@@ -2155,11 +1982,7 @@ def test_no_secret_in_repr_token() -> None:
 
 
 def test_json_serialization_unaffected_by_repr_redaction() -> None:
-    """Test 4: Serialisation is unaffected (D4).
-
-    Even though repr(Token) redacts secrets, to_json() still contains them
-    intact. Redaction is display-only, not data-loss.
-    """
+    """Test 4: Serialisation is unaffected (D4)."""
     access_secret = "SECRET-ACCESS-TOKEN-xyz"
     refresh_secret = "SECRET-REFRESH-TOKEN-abc"
     token = Token(access_token=access_secret, expires_at=1234.0, refresh_token=refresh_secret)
@@ -2266,13 +2089,7 @@ def _keyring_store_with(value: str | None) -> KeyringTokenStore:
 def test_keyring_store_without_the_extra_raises_autherror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`import keyring` failing must surface as AuthError naming the extra.
-
-    Stubbed via sys.modules rather than assumed from the environment (#198):
-    None there makes the import raise ImportError deterministically, so this
-    holds whether or not `whoopmcp[keyring]` is installed -- the same
-    technique test_data_subject_rights.py's degraded-export tests use.
-    """
+    """`import keyring` failing must surface as AuthError naming the extra."""
     monkeypatch.setitem(sys.modules, "keyring", None)
     with pytest.raises(AuthError, match=r"whoopmcp\[keyring\]"):
         KeyringTokenStore()
@@ -2388,12 +2205,7 @@ async def test_exchange_code_persists_normally_when_save_succeeds(config: Config
 def test_atomic_write_syncs_data_before_the_rename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The bytes must be on disk before the rename that publishes them.
-
-    Without this ordering the rename can land first, so a power loss leaves an
-    empty file exactly where a good token was -- the failure the write-then-
-    rename dance exists to prevent, arriving by a route it does not cover.
-    """
+    """The bytes must be on disk before the rename that publishes them."""
     order: list[str] = []
     real_fsync, real_replace = os.fsync, os.replace
 
@@ -2472,16 +2284,7 @@ def _rotating_store(tmp_path: Path) -> tuple[EncryptedFileTokenStore, Path, byte
 def test_reseal_does_not_clobber_a_token_saved_during_the_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The race, driven deterministically: a save lands between `load`'s read and
-    its re-seal, and the re-seal must not overwrite it.
-
-    The interleaving is injected at `Token.from_json`, which `load` calls after
-    it has the plaintext and before it decides to re-seal. That hook exists on
-    both the fixed and unfixed versions, which matters: an earlier draft of this
-    test hooked the compare's own re-read, a call that only the fixed version
-    makes -- so against unfixed code the concurrent save never happened and the
-    test failed for the wrong reason entirely, proving nothing.
-    """
+    """The race, driven deterministically: a save lands between `load`'s read and"""
     store, path, _key_v1, key_v2 = _rotating_store(tmp_path)
     rotated = Token("access-Y", expires_at=5678.0, refresh_token="refresh-Y")
 
@@ -2538,13 +2341,7 @@ def test_reseal_still_happens_when_nothing_changed(tmp_path: Path) -> None:
 def test_reseal_skipped_when_the_file_was_deleted_during_the_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A logout during the load removes the file. The re-seal must not recreate
-    it -- resurrecting a credential the user explicitly forgot is worse than
-    skipping a rotation.
-
-    Hooked at `Token.from_json` for the same reason as the test above: it is a
-    call both versions make, at the right point.
-    """
+    """A logout during the load removes the file."""
     store, path, _key_v1, _key_v2 = _rotating_store(tmp_path)
 
     original_from_json = Token.from_json
@@ -2570,18 +2367,7 @@ def test_reseal_skipped_when_the_file_was_deleted_during_the_load(
 def test_non_utf8_rewrite_during_the_load_does_not_escape_as_unicodedecodeerror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The compare must not introduce a new way for `load` to raise.
-
-    A first draft read the file back as *text* for the compare. If an external
-    writer replaced it with non-UTF-8 bytes inside the window, `read_text`
-    raised `UnicodeDecodeError` -- which is neither `SealError` nor `OSError`, so
-    the caller's except did not catch it, and a raw `ValueError` escaped `load`.
-    That breaks two promises at once: the `TokenStore.load` contract (a `Token`,
-    `None`, or `AuthError`) and the adjacent comment's own rule that a token
-    which just decrypted perfectly well is never denied to the caller.
-
-    Reading bytes fixes it structurally -- there is no decode to fail.
-    """
+    """The compare must not introduce a new way for `load` to raise."""
     store, path, _key_v1, _key_v2 = _rotating_store(tmp_path)
 
     original_from_json = Token.from_json
@@ -2607,25 +2393,7 @@ def test_non_utf8_rewrite_during_the_load_does_not_escape_as_unicodedecodeerror(
 def test_concurrent_save_and_reseal_in_threads_never_loses_the_newer_token(
     tmp_path: Path,
 ) -> None:
-    """The in-process race, run for real: threads, no monkeypatching.
-
-    What this does and does not prove, stated plainly because the distinction
-    matters. It asserts an *invariant*: after a concurrent load-with-reseal and
-    save, one of the two tokens must be on disk intact -- never a torn file,
-    never neither. `_TOKEN_PATH_LOCKS` is what guarantees that under threads.
-
-    It is **not** a regression test for #132, and it passes against the unfixed
-    code. The reason is worth recording: when the unfixed re-seal clobbers the
-    rotated token, what lands is the stale token re-sealed under the new key --
-    which still satisfies "one of the two, intact". Detecting the clobber needs
-    to know which write went last, and under natural scheduling this test does
-    not. The deterministic tests above, which inject the interleaving at a known
-    point, are the regression evidence; this one is a safety net that would catch
-    a deadlock, a torn write, or a lock that serialises the wrong section.
-
-    A short switch interval makes the threads actually interleave rather than
-    each running to completion.
-    """
+    """The in-process race, run for real: threads, no monkeypatching."""
     key_v1, key_v2 = os.urandom(32), os.urandom(32)
     path = tmp_path / "token.json"
     stale = Token("access-X", expires_at=1234.0, refresh_token="refresh-X")
@@ -2693,13 +2461,7 @@ def _make_encrypted_file_store(path: Path) -> EncryptedFileTokenStore:
 def test_unreadable_token_file_raises_autherror_not_permissionerror(
     tmp_path: Path, store_factory: object
 ) -> None:
-    """Test 1: A token file with mode 000 raises AuthError, not PermissionError.
-
-    This is a common operational situation (permission change, UID switch).
-    The contract promises to raise AuthError, not PermissionError.
-
-    MUST FAIL against current main with PermissionError.
-    """
+    """Test 1: A token file with mode 000 raises AuthError, not PermissionError."""
     if os.geteuid() == 0:
         pytest.skip("chmod 000 does not prevent reads when running as root")
 
@@ -2730,13 +2492,7 @@ def test_unreadable_token_file_raises_autherror_not_permissionerror(
 def test_directory_at_token_path_raises_autherror_not_isadir(
     tmp_path: Path, store_factory: object
 ) -> None:
-    """Test 2: A directory at the token path raises AuthError, not IsADirectoryError.
-
-    This could happen if the user misconfigures the state directory path,
-    or through some race condition or user error.
-
-    MUST FAIL against current main with IsADirectoryError.
-    """
+    """Test 2: A directory at the token path raises AuthError, not IsADirectoryError."""
     path = tmp_path / "token.json"
     path.mkdir()  # Create a directory instead of a file
     store = store_factory(path)  # type: ignore[operator]
@@ -2748,13 +2504,7 @@ def test_directory_at_token_path_raises_autherror_not_isadir(
 def test_non_utf8_token_file_raises_autherror_not_unicodedecodeerror(
     tmp_path: Path,
 ) -> None:
-    """Test 3: A FileTokenStore with non-UTF-8 bytes raises AuthError.
-
-    EncryptedFileTokenStore already handles this correctly (issue #190's table),
-    so this test is only for FileTokenStore.
-
-    MUST FAIL against current main with UnicodeDecodeError.
-    """
+    """Test 3: A FileTokenStore with non-UTF-8 bytes raises AuthError."""
     path = tmp_path / "token.json"
     # Write non-UTF-8 bytes
     path.write_bytes(b"\xff\xfe not valid UTF-8")
@@ -2772,13 +2522,7 @@ def test_non_utf8_token_file_raises_autherror_not_unicodedecodeerror(
     ],
 )
 def test_missing_token_file_still_returns_none(tmp_path: Path, store_factory: object) -> None:
-    """Test 4: Missing token file returns None, not AuthError.
-
-    This is the regression test for the fix. If missing files get wrapped
-    in AuthError, every "not logged in" path would start raising errors.
-
-    MUST PASS against current main (missing file already returns None).
-    """
+    """Test 4: Missing token file returns None, not AuthError."""
     path = tmp_path / "token.json"
     store = store_factory(path)  # type: ignore[operator]
 
@@ -2796,13 +2540,7 @@ def test_missing_token_file_still_returns_none(tmp_path: Path, store_factory: ob
     ],
 )
 def test_corrupt_json_still_raises_autherror(tmp_path: Path, store_factory: object) -> None:
-    """Test 5: Corrupt JSON still raises AuthError (regression test).
-
-    This test ensures the fix doesn't break the existing behavior
-    for genuinely corrupt JSON.
-
-    MUST PASS against current main.
-    """
+    """Test 5: Corrupt JSON still raises AuthError (regression test)."""
     path = tmp_path / "token.json"
     store = store_factory(path)  # type: ignore[operator]
 
@@ -2825,12 +2563,7 @@ def test_corrupt_json_still_raises_autherror(tmp_path: Path, store_factory: obje
     ],
 )
 def test_zero_byte_file_raises_autherror(tmp_path: Path, store_factory: object) -> None:
-    """Test 6: A zero-byte token file raises AuthError (regression test).
-
-    A truncated or cleared file should raise AuthError, not an OSError.
-
-    MUST PASS against current main.
-    """
+    """Test 6: A zero-byte token file raises AuthError (regression test)."""
     path = tmp_path / "token.json"
     path.touch()  # Create empty file
     store = store_factory(path)  # type: ignore[operator]
@@ -2847,12 +2580,7 @@ def test_zero_byte_file_raises_autherror(tmp_path: Path, store_factory: object) 
     ],
 )
 def test_valid_token_still_loads_correctly(tmp_path: Path, store_factory: object) -> None:
-    """Test 7: A valid token still loads correctly (regression test).
-
-    The fix must not break the happy path where a valid token file exists.
-
-    MUST PASS against current main.
-    """
+    """Test 7: A valid token still loads correctly (regression test)."""
     path = tmp_path / "token.json"
     store = store_factory(path)  # type: ignore[operator]
 
@@ -2878,16 +2606,7 @@ def test_valid_token_still_loads_correctly(tmp_path: Path, store_factory: object
 def test_autherror_message_does_not_leak_token_values(
     tmp_path: Path, store_factory: object
 ) -> None:
-    """Test 8: AuthError message doesn't leak token values.
-
-    The message MUST name no access token, no refresh token, no encryption key.
-    The path is acceptable (per issue #190's "existing errors name only the path").
-
-    Sentinel values are written, the file is made unreadable, and we assert
-    the sentinels appear nowhere in the error message.
-
-    MUST PASS against current main (once unreadable files raise AuthError).
-    """
+    """Test 8: AuthError message doesn't leak token values."""
     if os.geteuid() == 0:
         pytest.skip("chmod 000 does not prevent reads when running as root")
 

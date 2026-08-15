@@ -1,40 +1,4 @@
-"""PRIVACY.md's local-mode promise, enforced as tests (issue #74).
-
-PRIVACY.md §2 tells a local-mode user that "the only thing this software
-persists is your token" and that `cache.sqlite3` is off unless
-`WHOOPMCP_CACHE=true`. `lifespan()` opened `config.cache_path`
-unconditionally, so a default local stdio session created that database,
-wrote a `principal_members` row on login, and wrote a `tool_call_audit` row
-on every data-tool call. PR #63 settled the direction for exactly this kind
-of disagreement: the document is the contract and the code bends to it.
-
-So these tests are written from the document, not from the implementation:
-
-- the headline regression -- `$WHOOPMCP_STATE_DIR/cache.sqlite3` must not
-  exist after a *complete* default-local session (principal resolved, login
-  completed, data tool called);
-- a structural guard on the connection itself (`PRAGMA database_list`), so a
-  future edit that reintroduces `open_store(config.cache_path)` fails here
-  rather than silently re-breaking the promise;
-- the restart case, which is the whole reason the in-memory store has to
-  seed a `principal_members` row: `resolve_member_id` requires a real row
-  and has no fallback to `AppContext.principal`, so an unseeded ephemeral
-  store would make every data tool raise `UnresolvedPrincipalError` after a
-  restart while the token on disk is still perfectly valid;
-- and both of the paths that legitimately do persist -- `WHOOPMCP_CACHE=true`
-  and hosted (`streamable-http`) mode -- pinned so the local fix cannot leak
-  into them.
-
-The data-rights CLI subcommands (`delete-member`, `export-member`,
-`erase-member`, `enforce-retention`) must also respect this promise when
-operating on leftover cache files from prior persistent-mode sessions
-(issue #101).
-
-Every test here drives the real `lifespan()`. The `app_context` fixture in
-test_server.py deliberately bypasses it (hand-built `AppContext` over
-`open_store(":memory:")`), which is precisely the code path that cannot
-observe this bug.
-"""
+"""PRIVACY."""
 
 from __future__ import annotations
 
@@ -110,13 +74,7 @@ RANGE = {"start": "2026-01-01T00:00:00Z", "end": "2027-01-01T00:00:00Z"}
 
 @pytest.fixture
 def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A pristine `$WHOOPMCP_STATE_DIR` on the real environment.
-
-    `lifespan()` calls `Config.from_env()` with no argument, so it reads
-    `os.environ` itself -- an explicitly-built `Config` (as test_server.py's
-    `config` fixture makes) cannot be handed to it. These tests therefore
-    have to set the real environment, and clear the rest of it first.
-    """
+    """A pristine `$WHOOPMCP_STATE_DIR` on the real environment."""
     for name in _WHOOPMCP_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("WHOOP_CLIENT_ID", "cid")
@@ -128,13 +86,7 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def logged_in(state_dir: Path) -> Path:
-    """A valid token already on disk, as a restarted process would find.
-
-    This is the state that makes the D2 seeding requirement real: the token
-    is usable, so `_resolve_principal`'s profile call succeeds and
-    `AppContext.principal` is populated, but no login has run *in this
-    process* to write a `principal_members` row.
-    """
+    """A valid token already on disk, as a restarted process would find."""
     FileTokenStore(state_dir / TOKEN_FILE).save(
         Token("fake-access-token", expires_at=time.time() + 3600, refresh_token="fake-refresh")
     )
@@ -168,23 +120,12 @@ def cache_file(state_dir: Path) -> Path:
 
 
 def database_files(conn: sqlite3.Connection) -> list[str]:
-    """The filename backing each attached database, per `PRAGMA database_list`.
-
-    An in-memory database reports the empty string; a file-backed one reports
-    its absolute path. This is the structural check the guard test rests on:
-    it interrogates the connection itself, so it cannot be satisfied by a
-    file merely being absent at the moment the test looks.
-    """
+    """The filename backing each attached database, per `PRAGMA database_list`."""
     return [str(row[2]) for row in conn.execute("PRAGMA database_list").fetchall()]
 
 
 async def complete_login(server: Any, app: AppContext) -> str:
-    """Run the real two-step login against `app`, returning the final message.
-
-    `whoop_login` stashes the pending `state` on `app.auth`, which
-    `whoop_complete_login` then verifies, so the two calls have to share one
-    AppContext -- the one `lifespan()` yielded.
-    """
+    """Run the real two-step login against `app`, returning the final message."""
     login_result = await call_tool(server, "whoop_login", {}, app)
     login_text = str(login_result["result"])
     url_match = re.search(r"https://api\.prod\.whoop\.com\S+", login_text)
@@ -201,12 +142,7 @@ async def complete_login(server: Any, app: AppContext) -> str:
 
 
 def linked_member(path: Path) -> int | None:
-    """The member the *on-disk* store links the local sentinel to, if any.
-
-    Opened read-only through a fresh `sqlite3` connection rather than
-    `open_store`, so this observes the file exactly as it was left on disk
-    and cannot itself create or migrate it.
-    """
+    """The member the *on-disk* store links the local sentinel to, if any."""
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         return get_member_for_principal(conn, client_id=LOCAL_CLIENT_ID, issuer=None, subject=None)
@@ -225,16 +161,7 @@ def _no_real_whoop_calls() -> Iterator[None]:
 
 
 async def test_default_local_mode_leaves_nothing_but_the_token_on_disk(logged_in: Path) -> None:
-    """The regression #74 exists for: a full default-local session, no store file.
-
-    "Full" is the point. Each of the three writes the issue names happens at
-    a different moment -- the database is *created* when `lifespan()` opens
-    the store, the `principal_members` row is written by
-    `whoop_complete_login`, and a `tool_call_audit` row is written by
-    `resolve_member_id` on every data-tool call -- so a session that only
-    started up would miss two of them. This drives all three and then
-    asserts that `$WHOOPMCP_STATE_DIR` holds the token and nothing else.
-    """
+    """The regression #74 exists for: a full default-local session, no store file."""
     mock_profile()
     mock_token_exchange()
     server = build_server()
@@ -257,15 +184,7 @@ async def test_default_local_mode_leaves_nothing_but_the_token_on_disk(logged_in
 
 
 async def test_default_local_mode_store_is_not_backed_by_a_file(logged_in: Path) -> None:
-    """Structural guard: `AppContext.store_conn` must be an in-memory database.
-
-    The test above can be satisfied by accident -- delete the file on
-    shutdown, never open it in the first place, or open it somewhere the test
-    isn't looking -- and would then pass while the promise was broken again.
-    This one asks the live connection what backs it, so any future edit that
-    reintroduces `open_store(config.cache_path)` in `lifespan()`'s default
-    local branch fails right here.
-    """
+    """Structural guard: `AppContext."""
     mock_profile()
 
     async with lifespan(build_server()) as app:
@@ -301,17 +220,7 @@ async def test_whoop_complete_login_still_reports_success_in_default_local_mode(
 async def test_data_tool_resolves_the_member_after_a_restart_without_a_login(
     logged_in: Path,
 ) -> None:
-    """The D2 guard: a valid token and *no login in this process* still serves data.
-
-    This is the trap the fix has to avoid. `resolve_member_id` requires a
-    real `principal_members` row and, by design (#29 depends on it), has no
-    fallback to `AppContext.principal` -- so moving the store into memory
-    without seeding that row from the already-resolved live grant would make
-    every data tool raise `UnresolvedPrincipalError` on every restart, while
-    `whoop_auth_status` cheerfully reported the user logged in. Nothing here
-    calls `whoop_login`: the only thing linking the local sentinel to a
-    member is startup itself.
-    """
+    """The D2 guard: a valid token and *no login in this process* still serves data."""
     mock_profile()
     server = build_server()
 
@@ -344,11 +253,7 @@ async def test_data_tool_resolves_the_member_after_a_restart_without_a_login(
 async def test_cache_opt_in_still_persists_the_store_and_the_principal_link(
     logged_in: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`WHOOPMCP_CACHE=true` keeps today's on-disk behaviour, link and all.
-
-    The opt-in path is what PRIVACY.md says moves the store to disk, so it
-    must not be collateral damage of fixing the default.
-    """
+    """`WHOOPMCP_CACHE=true` keeps today's on-disk behaviour, link and all."""
     monkeypatch.setenv("WHOOPMCP_CACHE", "true")
     mock_profile()
     mock_token_exchange()
@@ -366,15 +271,7 @@ async def test_cache_opt_in_still_persists_the_store_and_the_principal_link(
 async def test_hosted_mode_still_opens_the_store_on_disk(
     logged_in: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Hosted mode persists unconditionally; the local fix must not reach it.
-
-    PRIVACY.md's hosted paragraph documents hosted mode as storing
-    materially more, unconditionally -- and hosted mode holds several
-    members' links, so an ephemeral store there would be a functional
-    regression, not a privacy win. Note the predicate keys off
-    `WHOOPMCP_TRANSPORT`, i.e. configuration, not which ASGI app happens to
-    have been constructed.
-    """
+    """Hosted mode persists unconditionally; the local fix must not reach it."""
     monkeypatch.setenv("WHOOPMCP_TRANSPORT", "streamable-http")
     mock_profile()
 
@@ -388,12 +285,7 @@ async def test_hosted_mode_still_opens_the_store_on_disk(
 async def test_webhooks_enabled_still_opens_the_store_on_disk(
     logged_in: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Webhooks persist too: a consumer whose work vanishes on restart is pointless.
-
-    The third leg of the D1 predicate. Kept separate from the transport case
-    so a fix that gates on only two of the three conditions fails a test that
-    names the missing one.
-    """
+    """Webhooks persist too: a consumer whose work vanishes on restart is pointless."""
     monkeypatch.setenv("WHOOPMCP_WEBHOOKS_ENABLED", "true")
     mock_profile()
 
@@ -408,13 +300,7 @@ async def test_webhooks_enabled_still_opens_the_store_on_disk(
 
 
 async def test_no_token_seeds_no_link_and_still_writes_nothing(state_dir: Path) -> None:
-    """With nobody logged in, startup seeds nothing and tools say so.
-
-    The seed is a real row derived from a live grant, not a fallback: when
-    `_resolve_principal` returns `None` there is no grant to derive one from,
-    so `principal_members` must stay empty and a data tool must keep
-    reporting "run whoop_login" rather than silently resolving to somebody.
-    """
+    """With nobody logged in, startup seeds nothing and tools say so."""
     # No token file at all -- FileTokenStore.load() returns None for that,
     # so _resolve_principal degrades to None without any HTTP call.
     async with lifespan(build_server()) as app:
@@ -449,12 +335,7 @@ def test_ephemeral_mode_subcommands_refuse_and_create_no_cache_file(
     subcommand: str,
     extra_args: list[str],
 ) -> None:
-    """In default local mode with an empty state dir, the four subcommands
-    must exit 2 and NOT create cache.sqlite3.
-
-    This test FAILS against the buggy code (exit 0 for enforce-retention,
-    cache.sqlite3 exists for all four).
-    """
+    """In default local mode with an empty state dir, the four subcommands"""
     # Ensure no pre-existing cache file
     assert not cache_file(state_dir).exists()
 
@@ -483,17 +364,7 @@ def test_leftover_cache_file_is_still_operated_on_in_ephemeral_mode(
     capsys: pytest.CaptureFixture[str],
     subcommand: str,
 ) -> None:
-    """With a pre-existing cache.sqlite3 (leftover from WHOOPMCP_CACHE=true),
-    data-rights subcommands must still work on it -- refusing would deny a
-    data subject their erasure/export right.
-
-    Seed the cache with a member's data, then run the command. It must
-    succeed (exit 0 for all three) and actually operate on the store.
-
-    This test specifically catches the mistake of using `if not
-    config.cache_enabled:` instead of `if config.store_is_ephemeral and not
-    config.cache_path.exists():`.
-    """
+    """With a pre-existing cache."""
     # Ensure WHOOPMCP_CACHE is NOT set (ephemeral mode)
     import os
 
@@ -571,15 +442,7 @@ def test_enforce_retention_in_ephemeral_mode_prints_no_summary(
     state_dir: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """enforce-retention in ephemeral mode must not print the false-success
-    string "retention enforced (max_age_days=...)".
-
-    The buggy code prints this summary even when the store doesn't exist,
-    making an operator's cron logs claim success for work performed against
-    a store that was just created.
-
-    This test FAILS against buggy code (summary is printed).
-    """
+    """enforce-retention in ephemeral mode must not print the false-success"""
     # Ensure no pre-existing cache
     assert not cache_file(state_dir).exists()
 
@@ -601,11 +464,7 @@ def test_with_cache_enabled_all_four_subcommands_create_cache_and_work_normally(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """With WHOOPMCP_CACHE=true, all four subcommands must behave exactly as
-    before: they create cache.sqlite3 and operate normally.
-
-    This verifies decision D6 (no behaviour change in non-ephemeral mode).
-    """
+    """With WHOOPMCP_CACHE=true, all four subcommands must behave exactly as"""
     monkeypatch.setenv("WHOOPMCP_CACHE", "true")
 
     config = Config.from_env()
@@ -681,17 +540,7 @@ def test_ephemeral_mode_error_messages_do_not_advise_enabling_cache(
     subcommand: str,
     extra_args: list[str],
 ) -> None:
-    """The error message for data-rights subcommands in ephemeral mode must
-    NOT tell the user to "set WHOOPMCP_CACHE=true".
-
-    That advice is correct for backfill/replay-webhook/reconcile-webhooks
-    (which are legitimate bulk operations), but wrong here: telling someone
-    who asked to *erase* their data to first enable a persistent store is
-    absurd advice.
-
-    Decision D4: the message says nothing is stored; it must NOT tell the
-    user to enable the cache.
-    """
+    """The error message for data-rights subcommands in ephemeral mode must"""
     main([subcommand, *extra_args])
 
     captured = capsys.readouterr()
@@ -711,12 +560,7 @@ def test_ephemeral_mode_error_messages_do_not_advise_enabling_cache(
 def test_doctor_store_check_in_ephemeral_mode_passes(
     state_dir: Path,
 ) -> None:
-    """doctor's own store check (in doctor.py:151) must continue to pass
-    unchanged: it already implements the correct guard pattern.
-
-    This is a regression guard to ensure doctor's logic is consistent with
-    the fix being applied to the four data-rights subcommands.
-    """
+    """doctor's own store check (in doctor."""
     # doctor should reach and pass the store check
     checks = run_checks()
 

@@ -1,39 +1,4 @@
-"""Tests for issue #32: data subject rights -- export, erasure, retention.
-
-Written before any implementation exists, per the issue's own instruction.
-None of the following symbols exist yet: ``store.export_member_data``,
-``store.erase_member_data``, ``store.enforce_retention``,
-``store._ERASURE_TABLES``, ``store._RETENTION_TIMESTAMP_COLUMNS``, the four
-small ``get_*_for_member`` export helpers, or the ``export-member``/
-``erase-member``/``enforce-retention`` CLI subcommands in ``__main__.py``.
-``store`` and ``whoopmcp.__main__`` are referenced via module attribute access
-below rather than ``from ... import ...`` for exactly the reason
-``tests/test_tenancy.py``'s own docstring gives: this file must still
-*collect* today, so an individual test missing an attribute fails with a
-clear ``AttributeError``/``TypeError`` at call time rather than an
-``ImportError`` hiding every other test in the file. Once #32 lands both
-styles behave identically.
-
-Anchors this file leans on, already merged:
-
-- ``store._TENANT_SCOPED_TABLES`` / ``store._execute_scoped`` (#29) -- any new
-  erasure/export function must go through the same enforcement, not around it.
-- ``auth.Authenticator.revoke_and_forget`` / ``auth.revoke_upstream`` (#30) --
-  reused, not rebuilt, for erasure's "tokens ... plus upstream revocation"
-  scope. See ``tests/test_auth.py``'s own respx-mocked pattern, mirrored below.
-- ``__main__._delete_member`` / the ``delete-member`` subcommand (#30) --
-  ``erase-member`` is a new sibling subcommand, mirrored structurally
-  (including ``tests/test_main.py``'s own two delete-member tests).
-
-Erasure is a real ``DELETE``, never a ``deleted_at`` ``UPDATE`` -- that
-machinery is #18's, reserved for ``*.deleted`` webhook events, and is a
-deliberately distinct code path from a member exercising erasure (see the
-"soft-delete vs erasure are distinct paths" section at the bottom of this
-file). Every erasure assertion below reads the database directly with raw
-SQL on a plain ``sqlite3.Connection`` -- never through a store.py ``get_*``
-repository function that could itself filter member data and produce a false
-negative.
-"""
+"""Tests for issue #32: data subject rights -- export, erasure, retention."""
 
 from __future__ import annotations
 
@@ -318,45 +283,7 @@ def test_erasure_registry_covers_every_schema_table() -> None:
 def test_erasure_covers_every_table_export_actually_reads_from(
     store_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#69 test 5: erase-member covers every table export-member reads from --
-    the two must enumerate the same table set, so a table added to one but
-    not the other is caught here rather than shipping silently uncovered.
-
-    Genuinely new: no existing test compares these two sets dynamically.
-    ``test_erasure_registry_covers_every_schema_table`` above compares
-    ``_ERASURE_TABLES`` against the *live schema*'s table list, and
-    ``test_export_returns_every_entity_held_for_the_member`` asserts
-    export's *field* presence -- neither ever asks "which tables did
-    ``export_member_data`` itself actually touch, at the sqlite level, and
-    is that the same set ``erase_member_data`` deletes from?" A table that
-    export starts reading from (or stops reading from) without a matching
-    change to ``_ERASURE_TABLES`` would pass both existing tests untouched;
-    this one exists to catch exactly that drift.
-
-    Every entity read in ``export_member_data`` goes through
-    ``store._execute_scoped`` (enforced structurally by
-    ``test_store_has_no_unwrapped_sqlite_execute_outside_scoped_wrapper`` in
-    test_tenancy.py). ``sqlite3.Connection`` is a C extension type and
-    cannot be monkeypatched at the class level (tried first; raises
-    ``TypeError: cannot set ... attribute of immutable type``), and
-    ``_execute_scoped`` installs its own authorizer unconditionally on every
-    call, so a callback set on the connection *before* calling it would just
-    be clobbered. Instead this monkeypatches ``store._execute_scoped`` itself
-    for the duration of the test: the replacement installs its own
-    ``SQLITE_READ``-recording authorizer and runs the same ``sql``/``params``
-    directly, so every table an export statement's compiled query actually
-    names is captured straight from sqlite, not from a hand-maintained guess
-    at which tables ``export_member_data`` "should" touch. (It does not
-    replicate ``_execute_scoped``'s own scoping validation -- that property
-    is test_tenancy.py's job, not this test's; every query the fixtures below
-    issue is already known-correctly-scoped.)
-
-    ``principal_members`` is read via the identity join but is not itself in
-    ``_ERASURE_TABLES`` (erased separately, by
-    ``delete_principal_links_for_member`` -- see that table's own comment in
-    store.py), which is exactly why the assertion below adds it explicitly
-    rather than asserting equality with ``_ERASURE_TABLES`` alone.
-    """
+    """#69 test 5: erase-member covers every table export-member reads from --"""
     _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
 
     tables_read: set[str] = set()
@@ -942,16 +869,7 @@ def _compact_database_bare_references() -> list[str]:
 
 
 def test_compact_database_function_has_exactly_one_caller() -> None:
-    """Single-caller pin, AST-based, mirroring #99's own test 6.
-
-    ``compact_database`` must be called from exactly one place anywhere
-    under ``src/whoopmcp`` -- ``__main__._erase_member``, per D2 -- in
-    either call form (bare name or attribute access), and referenced by no
-    other file beyond its own definition in store.py and that one call
-    site. Pins the narrowly-scoped nature of the VACUUM function per D1 and
-    prevents silent widening, including via a second call added in a
-    *different* function of ``__main__.py`` itself.
-    """
+    """Single-caller pin, AST-based, mirroring #99's own test 6."""
     assert callable(getattr(store, "compact_database", None)), (
         "store.compact_database does not exist; check the function name in D1"
     )
@@ -1505,22 +1423,7 @@ def test_export_member_does_not_inherit_the_mode_of_a_stale_temp_neighbour(
 def test_export_member_never_opens_a_world_readable_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Prove the *absence of a window* structurally, not by polling.
-
-    A write-then-chmod implementation passes an end-state assertion while
-    still having published the whole health record at 0644 for as long as the
-    write took. The property that rules that out is checkable at the moment
-    content first reaches the filesystem: the file being written into must
-    already exist, and must already carry no group or other bits. Since #98,
-    ``auth``'s atomic helper writes through the file object ``os.fdopen``
-    hands back for the ``tempfile.mkstemp`` fd, never via ``Path.write_text``
-    -- and ``io.TextIOWrapper`` is an immutable extension type pytest's
-    monkeypatch can't patch directly, so this wraps ``os.fdopen`` itself in a
-    spy that checks exactly that (via ``fstat`` on the fd) for whichever
-    write carries the export payload, then delegates to the real write. A
-    stronger guarantee than before, since ``mkstemp`` itself creates the file
-    at 0600 with ``O_EXCL``, before any content lands.
-    """
+    """Prove the *absence of a window* structurally, not by polling."""
     _set_required_env_and_state_dir(monkeypatch, tmp_path)
     _link_and_seed_one_member(tmp_path)
     out_path = tmp_path / "export.json"
@@ -1630,14 +1533,7 @@ def test_set_deleted_at_and_erase_member_data_are_different_functions() -> None:
 def test_erase_member_and_links_atomic_rolls_back_on_link_deletion_failure(
     store_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Issue #104 headline: when deleting the principal link fails AFTER the
-    health data has been deleted within the same transaction, a composed
-    atomic erasure rolls back BOTH deletions, leaving the member fully intact.
-
-    On current main, erase_member_data commits immediately after its deletes,
-    so this test will FAIL: health data is already gone, not rolled back. After
-    the fix, both operations batch in one transaction, and either both succeed
-    or both roll back together."""
+    """Issue #104 headline: when deleting the principal link fails AFTER the"""
     _seed_every_entity_table(store_conn, MEMBER_A, "member-a-tag")
     _seed_principal_link(store_conn, MEMBER_A, "client-a")
 
@@ -1914,22 +1810,7 @@ MEMBER_ISSUE_188 = 930001  # disjoint from other test files' ranges
 
 
 def _make_keyring_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make ``import keyring`` fail for this test, whatever is installed.
-
-    The degraded-export tests below need ``build_store()`` to raise -- the
-    "backend unavailable" trigger. They used to get that by assuming the
-    ``keyring`` extra was absent from the environment, which made the suite's
-    *correctness* depend on which optional extras happened to be installed:
-    with ``whoopmcp[keyring]`` present, ``KeyringTokenStore`` constructed
-    fine, ``load()`` read the developer's REAL OS keychain (the ``whoopmcp``
-    service entry), and four of these tests failed against a healthy export
-    (#198). Setting ``sys.modules["keyring"] = None`` makes the import raise
-    ``ImportError`` deterministically -- Python treats ``None`` in
-    ``sys.modules`` as "import halted" -- so the degraded path is chosen
-    explicitly rather than inherited from the environment, and no test can
-    reach a real keychain. ``tests/conftest.py``'s autouse guard backstops
-    the second half repo-wide.
-    """
+    """Make ``import keyring`` fail for this test, whatever is installed."""
     monkeypatch.setitem(sys.modules, "keyring", None)
 
 
@@ -2321,12 +2202,7 @@ def test_export_member_with_unreadable_token_store_error_text_redacted(
 def _export_document(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member: int, backend: str | None = None
 ) -> dict[str, Any]:
-    """Run ``export-member`` for ``member`` and return the JSON it wrote.
-
-    Seeds every entity table, so a caller can compare a degraded export against
-    a healthy one key-by-key rather than spot-checking the three collections a
-    test happened to think of.
-    """
+    """Run ``export-member`` for ``member`` and return the JSON it wrote."""
     state = tmp_path / f"state-{member}"
     state.mkdir(parents=True, exist_ok=True)
     _set_required_env_and_state_dir(monkeypatch, state)
@@ -2360,18 +2236,7 @@ def _export_document(
 def test_degraded_export_holds_everything_the_healthy_one_does(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The degraded path must not quietly become a smaller export.
-
-    ``export_member_data`` returns 13 keys. A test that seeds and checks only
-    recoveries, sleeps and cycles passes just as happily against a degraded
-    branch that dropped profile, body measurements, workouts, webhook events and
-    the audit trail -- a partial version of exactly the loss #188 exists to
-    prevent. Verified: a mutation discarding 8 of the 13 keys passed the whole
-    suite before this test existed.
-
-    So the assertion is the comparison itself -- healthy and degraded must carry
-    the same keys -- rather than a hand-maintained list of entities.
-    """
+    """The degraded path must not quietly become a smaller export."""
     healthy = _export_document(tmp_path, monkeypatch, 940001)
     degraded = _export_document(tmp_path, monkeypatch, 940002, backend="keyring")
 
@@ -2393,18 +2258,7 @@ def test_degraded_export_holds_everything_the_healthy_one_does(
 def test_degraded_export_does_not_leak_a_stored_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Seed a real token with sentinel values, then force the degraded path.
-
-    The other redaction test asserts the absence of ``access_token``/``Bearer``
-    in a scenario where no token was ever written -- unfalsifiable, and proven
-    so: a mutation dumping the plaintext token file into the consent note passed
-    the entire suite. A sentinel that genuinely exists on disk is what makes the
-    assertion mean anything.
-
-    It also covers the case the widened guard added: a token file that exists
-    and is full of secrets but cannot be read (mode 000), which raised
-    ``PermissionError`` straight out of the command before #188.
-    """
+    """Seed a real token with sentinel values, then force the degraded path."""
     state = tmp_path / "state-leak"
     state.mkdir(parents=True, exist_ok=True)
     _set_required_env_and_state_dir(monkeypatch, state)

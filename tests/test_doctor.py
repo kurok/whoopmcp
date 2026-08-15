@@ -1,13 +1,4 @@
-"""Tests for the ``doctor`` subcommand (#35): configuration, credentials,
-store, and sync-state checks, run as one pass over a local-mode install.
-
-Written before ``whoopmcp.doctor`` exists -- every test below is expected to
-fail on collection/import until that module and ``__main__.py``'s ``doctor``
-subcommand are implemented. Nothing here calls the real WHOOP API; the one
-check that reuses networked auth code (credentials) is exercised purely
-against the local token store, matching ``test_auth.py``'s own precedent of
-never hitting WHOOP in a test.
-"""
+"""Tests for the ``doctor`` subcommand (#35): configuration, credentials,"""
 
 from __future__ import annotations
 
@@ -239,15 +230,7 @@ def test_entry_point_importable_without_optional_extras() -> None:
 def test_doctor_diagnoses_an_unreadable_token_file_instead_of_crashing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A token file that exists but cannot be read is diagnosed, not fatal (#190).
-
-    `doctor` catches `AuthError` around its store read, which was the whole
-    contract: `TokenStore.load` returns a token, returns `None`, or raises
-    `AuthError`. The file-backed stores did not honour it -- they guarded only
-    `FileNotFoundError`, so a `PermissionError` escaped as itself and took down
-    the very command whose job is diagnosing a broken setup. A state directory
-    restored under a different uid produces exactly this.
-    """
+    """A token file that exists but cannot be read is diagnosed, not fatal (#190)."""
     if os.geteuid() == 0:
         pytest.skip("running as root: mode 000 does not deny reads")
 

@@ -165,13 +165,7 @@ def test_malformed_backfill_floor_date_is_rejected_at_startup() -> None:
 
 
 def test_no_secret_in_repr_config(tmp_path: Path) -> None:
-    """Test 2: No secret in repr(Config).
-
-    Client secret, key bytes (in all forms: raw bytes, .hex(), base64),
-    metrics token, and metrics_member_salt must not appear in repr(Config).
-
-    This test MUST FAIL against current main (before repr=False is added).
-    """
+    """Test 2: No secret in repr(Config)."""
     import base64
     import os
 
@@ -217,12 +211,7 @@ def test_no_secret_in_repr_config(tmp_path: Path) -> None:
 
 
 def test_non_secret_fields_shown_in_repr_config(tmp_path: Path) -> None:
-    """Test 3: Non-secret fields ARE still shown (D2).
-
-    The token_backend name and token_encryption_key_version integer are not
-    secrets and must remain visible in repr(Config) so diagnostics work.
-    Redacting everything is worse for debugging than redacting nothing.
-    """
+    """Test 3: Non-secret fields ARE still shown (D2)."""
     config = Config(
         client_id="cid",
         client_secret="csecret",
@@ -247,16 +236,7 @@ def test_non_secret_fields_shown_in_repr_config(tmp_path: Path) -> None:
 
 
 def test_every_secret_field_has_repr_false() -> None:
-    """Test 5: Structural guard (no regression on secret field additions).
-
-    Every field whose name contains 'secret', 'key', 'token', or 'salt'
-    (and which is actually a secret) must have repr=False. This test derives
-    the field list from dataclasses.fields at runtime, so adding a new
-    secret-bearing field later will fail the test rather than silently leak.
-
-    Fields that match the naming pattern but are NOT secrets (e.g. client_id,
-    token_backend, token_encryption_key_version) are explicitly exempted.
-    """
+    """Test 5: Structural guard (no regression on secret field additions)."""
     import dataclasses
 
     # Fields that match secret-like names but are NOT secrets

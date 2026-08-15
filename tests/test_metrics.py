@@ -1,43 +1,4 @@
-"""Observability tests: sync lag, webhook health, rate budget, token failures (issue #31).
-
-Written before ``whoopmcp/metrics.py`` exists, so this file doubles as the
-specification of that module's public surface. Every name imported from
-``whoopmcp.metrics`` below is part of the contract:
-
-``reset()``
-    Drop every process-local counter/gauge back to its initial state. Exists
-    for test isolation; the module is process-local by design (see the
-    multi-worker caveat the brief requires in its docstring).
-``record_webhook_signature_failure(reason)`` / ``record_webhook_accepted()``
-    Called from ``webhooks.py``'s single rejection point and its success path.
-``record_rate_limited()`` / ``record_rate_limit_exhausted()``
-    Called from ``client.py``'s two distinct 429 sites: the retry loop body
-    (recovered, noise) and the ``RateLimitedError`` raise (gave up, incident).
-``record_token_refresh_failure(cause)`` / ``record_token_refresh_success()``
-    Called from ``auth.py``'s ``_do_refresh`` failure sites, never from the
-    shared ``_raise_for_token_error`` (which ``exchange_code`` also uses, so a
-    counter there would conflate first-login failures with refresh failures).
-``publish_rate_budget(...)``
-    How the live ``RateLimiter`` hands its budget to the exporter. A
-    ``custom_route`` handler cannot reach ``AppContext`` (see
-    ``server._check_token_store_reachable``) and therefore cannot reach the
-    ``RateLimiter`` built in ``lifespan()``, so the limiter pushes into this
-    module's process-local state rather than the exporter pulling.
-``member_ref(whoop_user_id, salt)``
-    D3's keyed, truncated HMAC. The only member-derived string that may ever
-    appear in exposition output.
-``render(conn, config, *, now=None)``
-    The whole exposition text.
-
-The security-critical test here is ``test_no_exported_label_carries_member_
-identifying_data``: it enumerates labels out of really-rendered output and
-checks them against a deny-list *and* an allow-by-shape vocabulary, so a
-future metric added with a bad label fails without anyone editing a list of
-"things we remembered to check". Health data in a metric label is a real
-leak, not a cardinality nuisance.
-
-No real member data, token, or secret appears in any fixture here.
-"""
+"""Observability tests: sync lag, webhook health, rate budget, token failures (issue #31)."""
 
 from __future__ import annotations
 
@@ -214,12 +175,7 @@ _LABEL_RE = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:[^"\\]|\\
 
 
 def parse_samples(text: str) -> list[Sample]:
-    """Parse Prometheus text exposition into samples.
-
-    Deliberately a real parser over the rendered bytes rather than a peek at
-    the exporter's internal registry: every assertion in this file is about
-    what a scrape actually receives.
-    """
+    """Parse Prometheus text exposition into samples."""
     samples: list[Sample] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -250,12 +206,7 @@ def sample_value(text: str, name: str, **labels: str) -> float:
 
 
 def metric_total(text: str, name: str, **labels: str) -> float:
-    """``name``'s value summed over every label combination present.
-
-    Used wherever a test cares that a counter moved but not how the
-    implementation chose to break it down -- so adding or removing a
-    ``reason``/``cause`` dimension does not break an unrelated assertion.
-    """
+    """``name``'s value summed over every label combination present."""
     return sum(
         sample.value
         for sample in parse_samples(text)
@@ -327,12 +278,7 @@ def seed_member(
     sync_last_run_at: str = "2026-08-11T11:00:00+00:00",
     webhook_delivered: bool = True,
 ) -> None:
-    """Link a member and give them one live record per entity.
-
-    ``resource_id`` values are deliberately distinctive strings so the
-    deny-list test can assert they never reach exposition output; the raw
-    records also carry a fake email, for the same reason.
-    """
+    """Link a member and give them one live record per entity."""
     link_principal_to_member(
         connection,
         client_id="__local__",
@@ -404,13 +350,7 @@ def ref(whoop_user_id: int = MEMBER_ID) -> str:
 def test_every_always_on_metric_is_exported_from_an_empty_store(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """An empty store still exports every counter and rate gauge, at zero.
-
-    A counter that springs into existence on its first increment gives
-    ``rate()`` nothing to compare the first failure against -- so every
-    fixed-vocabulary series is pre-initialised. The store-backed gauges are
-    the deliberate exception (see STORE_BACKED_METRICS' own comment).
-    """
+    """An empty store still exports every counter and rate gauge, at zero."""
     text = metrics.render(conn, config, now=NOW)
 
     assert metric_names(text) == set(ALWAYS_EXPORTED_METRICS)
@@ -455,14 +395,7 @@ def test_exposition_ends_with_a_single_trailing_newline(
 def test_freshness_help_text_names_the_timestamp_each_entity_actually_uses(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """The four coverage accessors are not uniform and the HELP must say so.
-
-    ``get_recovery_coverage`` returns ``MAX(created_at)``; the other three
-    return ``MAX(end)`` over a *nullable* ``end``, so for sleep/cycle/workout
-    the number is the newest *completed* record and an in-progress one is
-    invisible to it. An operator reading "age of the newest record" would
-    misdiagnose that as staleness.
-    """
+    """The four coverage accessors are not uniform and the HELP must say so."""
     seed_member(conn)
     text = metrics.render(conn, config, now=NOW)
 
@@ -475,13 +408,7 @@ def test_freshness_help_text_names_the_timestamp_each_entity_actually_uses(
 def test_day_rate_budget_help_says_it_is_local_accounting_only(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """``RateLimiter.reconcile`` only ever touches the *minute* window.
-
-    ``_day_remaining``/``_per_day_limit`` are never reconciled against a
-    WHOOP header -- they are purely local, resetting at UTC midnight. An
-    operator paging on "day budget near exhaustion" needs to know that number
-    is this process's estimate, not WHOOP's truth.
-    """
+    """``RateLimiter."""
     text = metrics.render(conn, config, now=NOW)
 
     help_text = declared_help(text)["whoopmcp_rate_limit_remaining"].lower()
@@ -494,13 +421,7 @@ def test_day_rate_budget_help_says_it_is_local_accounting_only(
 def test_data_freshness_is_per_member_and_reflects_the_newest_record(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """Two members, different freshness, one series each.
-
-    The issue's own reason for insisting on per-member: an aggregate hides
-    the one member whose connection died three weeks ago behind everyone
-    else's healthy median. So the stale member's own series must show the
-    stale number, unaffected by the healthy member's.
-    """
+    """Two members, different freshness, one series each."""
     seed_member(conn, MEMBER_ID, recovery_created_at="2026-08-11T11:00:00+00:00")
     seed_member(conn, OTHER_MEMBER_ID, recovery_created_at="2026-07-21T12:00:00+00:00")
 
@@ -520,13 +441,7 @@ def test_data_freshness_is_per_member_and_reflects_the_newest_record(
 def test_data_freshness_tracks_the_newest_of_several_records(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """ "Newest", not "oldest" and not "the one written last".
-
-    The three recoveries below are inserted out of chronological order on
-    purpose: an implementation reading ``updated_at`` (sync bookkeeping) or
-    the last-written row instead of ``MAX(created_at)`` passes a
-    single-record test and fails this one.
-    """
+    """Track newest record, not oldest or last-written."""
     seed_member(conn, recovery_created_at="2026-08-01T12:00:00+00:00")
     upsert_recovery(
         conn,
@@ -577,12 +492,7 @@ def test_freshness_moves_as_the_newest_record_gets_newer(
 def test_freshness_for_sleep_cycle_workout_ignores_an_in_progress_record(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """``MAX(end)`` over a nullable ``end`` cannot see an unfinished record.
-
-    Asserted rather than left implicit: an in-progress sleep must not be
-    silently treated as fresh data (which would mask a real stall), and the
-    exported number must equal the newest *completed* record's end.
-    """
+    """``MAX(end)`` over a nullable ``end`` cannot see an unfinished record."""
     seed_member(conn, sleep_end="2026-08-10T12:00:00+00:00")
     upsert_sleep(
         conn,
@@ -601,11 +511,7 @@ def test_freshness_for_sleep_cycle_workout_ignores_an_in_progress_record(
 def test_freshness_series_is_omitted_for_an_entity_with_no_live_records(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """No data is not "zero seconds old".
-
-    A member linked but never backfilled holds nothing for any entity; a
-    0-valued gauge there would read as perfectly fresh.
-    """
+    """No data is not "zero seconds old"."""
     link_principal_to_member(
         conn, client_id="__local__", issuer=None, subject=None, whoop_user_id=MEMBER_ID
     )
@@ -620,13 +526,7 @@ def test_freshness_series_is_omitted_for_an_entity_with_no_live_records(
 def test_sync_recency_is_a_separate_metric_from_data_freshness(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """The two sync-lag numbers must not be conflated.
-
-    A sync that ran successfully but legitimately found nothing new advances
-    ``sync_state.last_run_at`` and not the newest record. Exporting only one
-    of these hides a real failure mode in each direction, so a test pins that
-    they move independently.
-    """
+    """The two sync-lag numbers must not be conflated."""
     seed_member(
         conn,
         recovery_created_at="2026-08-01T12:00:00+00:00",
@@ -653,13 +553,7 @@ def test_sync_recency_is_a_separate_metric_from_data_freshness(
 def test_sync_recency_carries_the_raw_sync_state_entity_key(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """``sync_state`` holds two entity-key namespaces per member.
-
-    ``backfill.BACKFILL_ENTITIES`` writes ``"recoveries"``; ``sync.py``'s
-    ``_incremental_entity_key`` writes ``"recoveries:incremental"``. They are
-    different runs with different meanings, so the label must pass the key
-    through verbatim rather than normalising the two into one series.
-    """
+    """``sync_state`` holds two entity-key namespaces per member."""
     link_principal_to_member(
         conn, client_id="__local__", issuer=None, subject=None, whoop_user_id=MEMBER_ID
     )
@@ -787,11 +681,7 @@ def test_webhook_signature_failure_counter_moves(conn: sqlite3.Connection, confi
 def test_accepted_webhook_counter_gives_the_failure_rate_a_denominator(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """The issue asks for a failure *rate*, which needs both terms.
-
-    Failures alone cannot distinguish "one forged request against a busy
-    endpoint" from "every delivery now rejected because the secret rotated".
-    """
+    """The issue asks for a failure *rate*, which needs both terms."""
     metrics.record_webhook_accepted()
     metrics.record_webhook_accepted()
     metrics.record_webhook_signature_failure("bad_signature")
@@ -808,12 +698,7 @@ def test_accepted_webhook_counter_gives_the_failure_rate_a_denominator(
 def test_retried_and_exhausted_429s_are_counted_separately(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """A retried 429 is noise; giving up is an incident.
-
-    ``client._get`` has two distinct 429 sites -- the retry loop body and the
-    ``RateLimitedError`` raise after ``_MAX_429_RETRIES``. One counter across
-    both cannot tell an operator whether any request actually failed.
-    """
+    """A retried 429 is noise; giving up is an incident."""
     metrics.record_rate_limited()
     metrics.record_rate_limited()
     metrics.record_rate_limit_exhausted()
@@ -839,13 +724,7 @@ def test_rate_limiter_exposes_its_budget_through_a_public_accessor() -> None:
 async def test_rate_budget_gauges_move_as_the_real_limiter_spends_budget(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """Driven through the real ``RateLimiter``, not a hand-set gauge.
-
-    The limiter pushes its budget into this module (``publish_rate_budget``)
-    because a ``custom_route`` handler can reach neither ``AppContext`` nor
-    the ``RateLimiter`` that ``lifespan()`` builds -- see this file's own
-    module docstring.
-    """
+    """Driven through the real ``RateLimiter``, not a hand-set gauge."""
     limiter = RateLimiter(per_minute=5, per_day=50)
     await limiter.acquire()
     await limiter.acquire()
@@ -861,13 +740,7 @@ async def test_rate_budget_gauges_move_as_the_real_limiter_spends_budget(
 def test_rate_limit_limit_follows_the_header_reported_limit(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """``reconcile`` overwrites ``_per_minute_limit`` from ``X-RateLimit-Limit``.
-
-    So the limit is mutable at runtime and must be exported rather than
-    hard-coded into an alert threshold: "near exhaustion" has to be
-    ``remaining / limit``, or the rule silently breaks the day WHOOP changes
-    the limit.
-    """
+    """``reconcile`` overwrites ``_per_minute_limit`` from ``X-RateLimit-Limit``."""
     limiter = RateLimiter(per_minute=100, per_day=10_000)
     limiter.reconcile(httpx.Headers({"X-RateLimit-Limit": "60", "X-RateLimit-Remaining": "7"}))
 
@@ -918,12 +791,7 @@ def test_every_declared_refresh_failure_cause_has_a_preinitialised_series(
 def test_a_stalled_sync_moves_the_metric_its_alert_watches(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """Both sync-lag alerts, driven from the store rather than from a counter.
-
-    "Stalled" here means the two independent shapes of stall: the sync itself
-    stopped running (``sync_last_run_age``), and the sync keeps running but
-    data stopped arriving (``data_freshness``).
-    """
+    """Both sync-lag alerts, driven from the store rather than from a counter."""
     seed_member(
         conn,
         recovery_created_at="2026-07-12T12:00:00+00:00",
@@ -951,11 +819,7 @@ def test_a_stalled_sync_moves_the_metric_its_alert_watches(
 async def test_a_bad_signature_over_http_moves_the_signature_failure_counter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, conn: sqlite3.Connection
 ) -> None:
-    """Driven through the real route, not by calling the counter directly.
-
-    A test that increments the counter itself proves the exporter works and
-    proves nothing about whether ``webhooks.py`` is wired to it.
-    """
+    """Driven through the real route, not by calling the counter directly."""
     _set_http_env(monkeypatch, tmp_path)
     config = Config.from_env()
     app = build_server().streamable_http_app(
@@ -1030,14 +894,7 @@ async def test_rejection_reason_is_broken_out_without_revealing_it_to_the_caller
     reason: str,
     headers: dict[str, str],
 ) -> None:
-    """The operator learns which check failed; the caller does not.
-
-    ``verify_webhook_request`` collapses all three causes into one ``False``,
-    so the reason is re-derived at the rejection site from header presence
-    and ``_timestamp_within_skew`` -- neither of which touches the signing
-    secret. The response body stays the same generic ``invalid_signature``
-    for every cause, so a forger still gets no oracle.
-    """
+    """The operator learns which check failed; the caller does not."""
     _set_http_env(monkeypatch, tmp_path)
     config = Config.from_env()
     app = build_server().streamable_http_app(
@@ -1060,13 +917,7 @@ async def test_rejection_reason_is_broken_out_without_revealing_it_to_the_caller
 async def test_a_revoked_token_moves_the_invalid_grant_counter(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """A real refresh against a real ``invalid_grant`` response.
-
-    ``_do_refresh``'s 400/``_is_invalid_grant`` branch is the only
-    refresh-side ``GrantAlreadyGoneError`` site; ``access_token``'s "no
-    stored credentials" raise of the same class is not a refresh failure and
-    must not be counted as one.
-    """
+    """A real refresh against a real ``invalid_grant`` response."""
     respx.post(TOKEN_URL).mock(
         return_value=httpx.Response(
             400, json={"error": "invalid_grant", "error_description": "Refresh token is expired."}
@@ -1087,11 +938,7 @@ async def test_a_revoked_token_moves_the_invalid_grant_counter(
 async def test_a_non_invalid_grant_refresh_failure_is_counted_under_its_own_cause(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """A 500 from the token endpoint is transient; ``invalid_grant`` is not.
-
-    Same counter, different cause, because only one of the two means "this
-    member must re-authorise" and only one of them should page anybody.
-    """
+    """A 500 from the token endpoint is transient; ``invalid_grant`` is not."""
     respx.post(TOKEN_URL).mock(return_value=httpx.Response(500, json={"error": "server_error"}))
     auth = Authenticator(config)
 
@@ -1148,12 +995,7 @@ async def test_a_successful_refresh_moves_the_success_counter_and_no_failure_cou
 async def test_access_token_with_no_stored_credentials_is_not_a_refresh_failure(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """``GrantAlreadyGoneError`` is raised at two sites; only one is a failure.
-
-    ``access_token()`` raising it means "nothing stored yet, run whoop_login"
-    -- a fresh install, not a revoked grant. Counting it would make
-    ``invalid_grant`` page on every un-authorised deployment.
-    """
+    """``GrantAlreadyGoneError`` is raised at two sites; only one is a failure."""
     auth = Authenticator(config)
 
     with pytest.raises(AuthError):
@@ -1171,23 +1013,7 @@ async def test_access_token_with_no_stored_credentials_is_not_a_refresh_failure(
 def test_no_exported_label_carries_member_identifying_data(
     conn: sqlite3.Connection, config: Config
 ) -> None:
-    """Enumerated from really-rendered output, not from a list of what I
-    remembered to check.
-
-    Three independent checks, so a future metric added with a bad label fails
-    here without anyone editing this test:
-
-    1. no label *name* is an identity-shaped name (deny-list);
-    2. every label *value* is either a member_ref or a member of the closed
-       fixed vocabulary -- so free-form data (a sport name, a resource id, an
-       email, a score) fails by default rather than needing to be predicted;
-    3. no known-sensitive string appears anywhere in the whole body, label or
-       not: the raw whoop_user_id, the fake email, the signing secret, the
-       metrics token, the salt, the seeded resource ids.
-
-    Health data in a metric label is a real leak; cardinality is the lesser
-    problem. This test is the line.
-    """
+    """Enumerated from really-rendered output, not from a list of what I"""
     seed_member(conn, MEMBER_ID)
     seed_member(conn, OTHER_MEMBER_ID)
     for cause in metrics.TOKEN_REFRESH_FAILURE_CAUSES:
@@ -1244,13 +1070,7 @@ def test_no_exported_label_carries_member_identifying_data(
 
 
 def test_member_ref_is_keyed_so_it_cannot_be_brute_forced_from_the_id_alone() -> None:
-    """An unsalted hash of a WHOOP user id is not opaque.
-
-    WHOOP user ids are modest integers, so an unkeyed digest is reversible by
-    enumeration in seconds -- which would defeat the whole point of the
-    label. The ref must be a keyed HMAC, must differ under a different key,
-    and must not be any plain digest of the id.
-    """
+    """An unsalted hash of a WHOOP user id is not opaque."""
     with_key = metrics.member_ref(MEMBER_ID, METRICS_SALT)
     with_other_key = metrics.member_ref(MEMBER_ID, "a-different-salt")
 
@@ -1284,14 +1104,7 @@ def test_member_ref_is_stable_for_the_same_id_and_salt() -> None:
 def test_per_member_series_are_withheld_entirely_when_the_salt_is_unset(
     tmp_path: Path, conn: sqlite3.Connection
 ) -> None:
-    """D3 fails closed: no salt means no per-member series, not a weaker id.
-
-    Falling back to a raw id or an unkeyed hash would be exactly the leak the
-    issue forbids, so the whole per-member surface disappears instead -- and
-    ``whoopmcp_member_metrics_enabled`` goes to 0 so a dashboard can tell
-    "salt not configured" apart from "no members linked", which is otherwise
-    the same silent failure this issue exists to eliminate.
-    """
+    """D3 fails closed: no salt means no per-member series, not a weaker id."""
     config = Config.from_env(
         {
             "WHOOP_CLIENT_ID": "cid",
@@ -1399,14 +1212,7 @@ async def _get_metrics(
 async def test_metrics_endpoint_is_404_and_exports_nothing_when_no_token_is_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Fail closed: unconfigured means absent, exactly like ``webhooks_enabled``.
-
-    ``custom_route`` handlers "will not require authorization" (the SDK's own
-    docstring), so an unauthenticated ``/metrics`` would hand per-member
-    health telemetry to anyone who can reach the port. The 404 is the same
-    response an unregistered path gives, so its existence isn't advertised
-    either.
-    """
+    """Fail closed: unconfigured means absent, exactly like ``webhooks_enabled``."""
     _set_http_env(monkeypatch, tmp_path, WHOOPMCP_METRICS_SALT=METRICS_SALT)
     monkeypatch.delenv("WHOOPMCP_METRICS_TOKEN", raising=False)
     app = build_server().streamable_http_app()
@@ -1442,19 +1248,7 @@ async def test_metrics_endpoint_is_404_even_with_a_bearer_token_when_unconfigure
 async def test_metrics_endpoint_is_401_for_a_non_ascii_authorization_header(
     metrics_env: None, raw_header: bytes
 ) -> None:
-    """A non-ASCII Authorization header must 401, not raise.
-
-    ``hmac.compare_digest`` raises ``TypeError`` on a ``str`` holding any
-    non-ASCII character rather than returning ``False``, and Starlette decodes
-    raw header bytes as latin-1 -- so these bytes arrive as a ``str`` the
-    comparison refuses to touch. Without an ``isascii()`` guard ahead of it
-    the handler raises, turning a 401 into an unhandled 500 on the auth path
-    of the one route standing between the internet and per-member health data.
-
-    Sent as raw bytes deliberately: httpx encodes ``str`` header values as
-    ASCII and would reject these before they ever left the client, so a
-    ``str`` parameter cannot reach the code path this pins.
-    """
+    """A non-ASCII Authorization header must 401, not raise."""
     app = build_server().streamable_http_app()
 
     async with httpx.AsyncClient(
@@ -1469,13 +1263,7 @@ async def test_metrics_endpoint_is_401_for_a_non_ascii_authorization_header(
 async def test_metrics_endpoint_unconfigured_404_is_indistinguishable_from_an_unknown_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The 404 body must match an unregistered path's byte-for-byte.
-
-    Failing closed is only half of "its existence isn't advertised": a
-    distinctive body (a JSON ``{"error": ...}``, say) still tells a prober
-    that ``/metrics`` is a route this build knows about and that it is merely
-    switched off -- which is exactly the fact worth probing for.
-    """
+    """The 404 body must match an unregistered path's byte-for-byte."""
     _set_http_env(monkeypatch, tmp_path, WHOOPMCP_METRICS_SALT=METRICS_SALT)
     monkeypatch.delenv("WHOOPMCP_METRICS_TOKEN", raising=False)
     app = build_server().streamable_http_app()
@@ -1558,11 +1346,7 @@ async def test_metrics_endpoint_never_echoes_its_own_token_or_salt(
 async def test_metrics_endpoint_over_http_carries_no_member_identifying_label(
     metrics_env: None, tmp_path: Path
 ) -> None:
-    """The deny-list, re-run against the real HTTP surface.
-
-    The unit-level test renders through ``metrics.render`` directly; this one
-    proves the route does not add a label of its own on the way out.
-    """
+    """The deny-list, re-run against the real HTTP surface."""
     config = Config.from_env()
     connection = open_store(config.cache_path)
     try:
@@ -1619,12 +1403,7 @@ def _exported_metric_names() -> set[str]:
 
 
 def test_every_metric_named_by_an_alert_rule_is_really_exported() -> None:
-    """The mechanical form of the acceptance criterion.
-
-    Renaming a metric without updating the rules file orphans an alert
-    silently -- the rule keeps evaluating, just never fires. This is what
-    catches that.
-    """
+    """The mechanical form of the acceptance criterion."""
     referenced = set(re.findall(r"\bwhoopmcp_[a-z0-9_]+\b", _alert_rules_text()))
 
     assert referenced, "the rules file references no whoopmcp_ metric at all"
@@ -1649,13 +1428,7 @@ def test_the_rules_file_has_a_rule_for_each_alert_the_issue_names() -> None:
 
 
 def test_the_webhook_silence_rule_compares_against_the_members_own_baseline() -> None:
-    """A dead webhook integration and a member on holiday look identical.
-
-    So the silence rule has to be a comparison against that member's own
-    history, not a fixed threshold -- which means a range-vector aggregation
-    over ``whoopmcp_webhook_last_delivery_age_seconds`` rather than a bare
-    ``> 86400``.
-    """
+    """A dead webhook integration and a member on holiday look identical."""
     text = _alert_rules_text()
     silence_rules = [
         block

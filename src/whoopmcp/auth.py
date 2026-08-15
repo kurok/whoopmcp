@@ -1,11 +1,7 @@
 """OAuth 2.0 against WHOOP, plus local token storage.
 
-WHOOP implements the authorization-code grant. Its docs describe no PKCE
-support, so the client secret is required for the code exchange and this
-server is a *confidential* client running on the user's own machine. Access
-tokens last one hour; a refresh token is only issued when the ``offline``
-scope is part of the authorisation request.
-
+WHOOP requires the client secret (no PKCE) -- this is a confidential client.
+Access tokens last 1 hour; a refresh token needs the ``offline`` scope.
 Docs: https://developer.whoop.com/docs/developing/oauth/
 """
 
@@ -33,15 +29,13 @@ from whoopmcp.config import Config
 from whoopmcp.crypto import SealError, seal, unseal
 
 AUTHORIZE_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
-TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"  # noqa: S105 -- an endpoint URL, not a credential value  # nosec B105
-#: The one non-GET endpoint WHOOP exposes to an OAuth client. Lives here,
-#: not in client.py -- see revoke_upstream's docstring for why.
+TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"  # noqa: S105 -- URL, not a credential  # nosec B105
+#: The one non-GET endpoint WHOOP exposes; lives here, not client.py (see revoke_upstream).
 USER_ACCESS_URL = "https://api.prod.whoop.com/developer/v2/user/access"
 
 logger = logging.getLogger("whoopmcp.auth")
 
-#: Refresh this many seconds before the token actually expires, so a request
-#: that is in flight when the clock ticks over does not 401.
+#: Refresh this many seconds early so an in-flight request doesn't 401 at expiry.
 EXPIRY_SKEW_SECONDS = 60
 
 
@@ -52,22 +46,12 @@ class AuthError(RuntimeError):
 class GrantAlreadyGoneError(AuthError):
     """An ``AuthError`` raised only when there is nothing left to revoke.
 
-    Two producing sites, both below: ``access_token`` when there is no
-    stored token at all, and ``_do_refresh`` when WHOOP rejects the refresh
-    token as ``invalid_grant`` (the member revoked the grant in WHOOP's own
-    app settings, or an operator already ran ``whoop_logout``/``logout``).
-    Both mean the upstream grant is already gone -- not that revocation
-    failed -- so a caller of ``revoke_and_forget`` that wants "nothing to
-    revoke" to count as revoke-step success (issue #65: ``__main__.py``'s
-    ``_delete_member``/``_erase_member``) can catch this narrower type
-    specifically and continue, while still treating a plain ``AuthError``
-    (e.g. ``revoke_upstream``'s own non-2xx-response path, a genuine
-    transport failure) as a real failure that must abort.
-
-    Subclassing ``AuthError`` rather than introducing an unrelated type
-    means every existing ``except AuthError`` elsewhere in this codebase
-    keeps catching this exactly as before -- this widens the taxonomy
-    without changing what any current call site sees.
+    Raised by ``access_token`` (no stored token) and ``_do_refresh``
+    (WHOOP rejects refresh as ``invalid_grant``) -- the grant is already
+    gone, not that revocation failed. Lets ``revoke_and_forget`` callers
+    (#65) treat "nothing to revoke" as success while still catching a plain
+    ``AuthError`` as a real failure. Subclasses ``AuthError`` so existing
+    ``except AuthError`` sites keep working unchanged.
     """
 
 
@@ -142,41 +126,11 @@ class TokenStore(Protocol):
 def atomic_write_text(path: Path, contents: str) -> None:
     """Write ``contents`` to ``path`` atomically, mode 0600.
 
-    Not auth-specific despite living here: ``FileTokenStore`` and
-    ``EncryptedFileTokenStore`` share it below so the write-then-rename
-    atomicity -- and the 0600 permissions that are the whole point of both
-    classes' promise -- exist in exactly one place, and ``__main__.py``'s
-    ``_export_member`` (#68) reuses it too, for the same reason: a
-    data-subject export is the same category of sensitive text as a token,
-    and deserves the same no-world-readable-window guarantee rather than a
-    second, duplicated implementation of it.
-
-    Write-then-rename means a crash mid-write cannot truncate a good
-    record. The temp file's name must be unpredictable, not just its
-    permissions: for ``_export_member`` the parent directory is whatever
-    the operator passed to ``--out``, which may be shared or world-writable,
-    and a guessable name (e.g. one derived from ``path`` itself) lets
-    another user pre-create it -- as a symlink, before this call ever
-    runs -- and have the content delivered wherever they point it instead.
-    ``tempfile.mkstemp`` closes that: it picks a name nothing else could
-    have predicted and creates it with ``O_EXCL`` at mode 0600 in one
-    atomic step, so pre-creation can't win and no separate chmod is needed.
-    The content is written through that file descriptor directly, never by
-    reopening ``path`` or the temp name -- reopening by path would
-    reintroduce the same symlink-following race this exists to close.
-    ``os.replace`` then swaps the temp file onto ``path`` as an atomic,
-    non-dereferencing rename: if ``path`` itself is already a symlink, the
-    symlink is what gets replaced, not the file it points to.
-
-    The data is ``fsync``ed before the rename, and the parent directory
-    after it (issue #136). Without the first, the rename can reach disk
-    before the bytes do, so a power loss leaves an empty or partial file
-    exactly where a good token used to be -- rename-after-write is atomic
-    against a *process* crash on its own, but not against the machine
-    losing power. Without the second, the rename itself may not be durable.
-    The directory sync is POSIX-only: Windows cannot open a directory for
-    ``fsync``, and its rename durability is the filesystem's business
-    rather than something this function can request.
+    Shared by the token stores and ``_export_member`` (#68). Uses ``mkstemp``
+    (unpredictable name, O_EXCL) so a symlink can't be pre-planted at the temp
+    path; writes go through that fd only, never reopening ``path``, and
+    ``os.replace`` doesn't follow symlinks. fsyncs data before rename, and the
+    directory after (#136, POSIX-only) for crash/power-loss durability.
     """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent)
@@ -201,18 +155,13 @@ def atomic_write_text(path: Path, contents: str) -> None:
 class FileTokenStore:
     """Stores the token as JSON in the state directory, mode 0600.
 
-    The directory is created 0700. This is the default because it works with
-    no extra dependencies, but it does mean a plaintext refresh token on disk
-    -- see PRIVACY.md, and prefer ``KeyringTokenStore`` where available.
-
-    **On Windows this offers no protection.** Windows uses ACLs, not POSIX
-    modes, and ``Path.touch(mode=...)`` is effectively ignored there -- the
-    file lands at 0666. Use ``WHOOPMCP_TOKEN_BACKEND=keyring`` on Windows;
-    ``save`` warns once if you do not.
+    Default backend: no extra deps, but the refresh token sits in plaintext
+    on disk (see PRIVACY.md; prefer ``KeyringTokenStore``). **Windows: no
+    protection** -- ACLs ignore the POSIX mode, file lands at 0666; use
+    ``WHOOPMCP_TOKEN_BACKEND=keyring`` there instead (``save`` warns once).
     """
 
-    #: POSIX modes are advisory at best on Windows, so the 0600 promise below
-    #: holds only off it.
+    #: POSIX modes are advisory on Windows; the 0600 promise holds only off it.
     _MODES_ENFORCED = os.name != "nt"
 
     def __init__(self, path: Path) -> None:
@@ -226,10 +175,8 @@ class FileTokenStore:
             # Missing file means not logged in, which is normal.
             return None
         except (OSError, UnicodeDecodeError) as exc:
-            # A file that exists but cannot be read (permission denied, is a directory,
-            # etc.) must become AuthError so callers that catch AuthError to redact or
-            # degrade a failure (doctor's store check, export-member) are aware. This
-            # matches the contract documented on KeyringTokenStore.load (issue #137).
+            # Unreadable (perm denied, is a dir, etc.) -> AuthError so callers
+            # (doctor, export-member) can catch it; contract matches #137.
             raise AuthError(f"token file at {self._path} is unreadable: {exc}") from exc
         try:
             return Token.from_json(raw)
@@ -253,20 +200,10 @@ class FileTokenStore:
 
 
 #: One re-entrant lock per token path, shared by every ``EncryptedFileTokenStore``
-#: instance addressing that path in this process (#132).
-#:
-#: ``load`` is a writer -- it re-seals a record found under an older key version
-#: -- and ``server.py`` runs ``load`` in a thread for every ``/ready`` poll while
-#: a refresh may be completing on the event loop. Without this, the two can
-#: interleave: the loader reads token X, the refresh saves Y, and the loader's
-#: re-seal writes X back over it.
-#:
-#: Re-entrant because ``_reseal_if_unchanged`` holds it across its compare and
-#: then calls ``save``, which takes it again.
-#:
-#: Keyed by ``Path``, whose equality is by path components, so two instances
-#: constructed with equal paths share one lock. The registry is never pruned; a
-#: process addresses a handful of token paths at most.
+#: on that path in this process (#132): without it, ``load``'s background
+#: re-seal can race a concurrent refresh's ``save`` and overwrite it with a
+#: stale token. Re-entrant since ``_reseal_if_unchanged`` holds it across
+#: ``save``. Keyed by ``Path``; registry is never pruned (few paths per process).
 _TOKEN_PATH_LOCKS: dict[Path, threading.RLock] = {}
 _TOKEN_PATH_LOCKS_GUARD = threading.Lock()
 
@@ -282,31 +219,20 @@ def _lock_for_token_path(path: Path) -> threading.RLock:
 
 
 class EncryptedFileTokenStore:
-    """Like ``FileTokenStore``, but the token is sealed (AES-256-GCM, via
-    ``crypto.seal``/``unseal``) before it touches disk, so what's actually
-    written is an envelope -- key version, nonce, ciphertext -- never the
-    plaintext ``Token`` JSON ``FileTokenStore`` writes.
+    """Like ``FileTokenStore``, but sealed (AES-256-GCM) before it touches disk --
+    the envelope carries key version/nonce/ciphertext, never plaintext JSON.
 
-    Rotation is lazy, not big-bang: ``load`` re-seals a record under
-    ``current_version`` immediately after successfully reading one sealed
-    under an older version, so a record migrates to the new key the next
-    time it's read rather than needing a forced bulk pass. Both the old and
-    new key simply need to stay present in ``keys`` for as long as any
-    record sealed under the old one hasn't yet been read -- there is no
-    other downtime requirement.
-
-    This is a new, explicit ``token_backend`` value (``"encrypted-file"``)
-    rather than a change to plain ``"file"``, because it requires key
-    material ``"file"`` does not: an operator who wants it opts in by
-    setting the key env vars and flipping the backend.
+    Rotation is lazy: ``load`` re-seals a record under ``current_version``
+    right after reading an older-versioned one; both keys must stay in
+    ``keys`` until every old-sealed record is read once. Separate
+    ``token_backend="encrypted-file"`` value since it needs key material
+    ``"file"`` doesn't.
     """
 
     _MODES_ENFORCED = os.name != "nt"
 
-    #: Bound into the AEAD tag so a sealed *token* envelope can never be
-    #: swapped for some other record type sealed with the same key and have
-    #: it still authenticate -- defense in depth beyond the key-version
-    #: binding crypto.seal already does on its own.
+    #: Binds the AEAD tag to "token" so a same-keyed envelope of another
+    #: record type can't be swapped in and still authenticate (defense in depth).
     _ASSOCIATED_DATA = b"whoopmcp.token"
 
     def __init__(self, path: Path, keys: Mapping[int, bytes], current_version: int) -> None:
@@ -314,25 +240,18 @@ class EncryptedFileTokenStore:
         self._keys = keys
         self._current_version = current_version
         self._warned = False
-        #: Separate from `_warned` above on purpose -- that flag belongs to
-        #: `save`'s Windows-mode warning. Sharing it would let either
-        #: warning suppress the other the first time either condition
-        #: fires.
+        #: Separate from `_warned` (save's Windows warning) so one warning
+        #: firing doesn't suppress the other.
         self._reseal_warned = False
 
     def load(self) -> Token | None:
         """Return the stored token, or ``None`` if nothing is stored.
 
-        A record sealed under an older key version is normally re-sealed
-        under ``current_version`` before being returned (see the lazy
-        rotation note below). If that re-seal itself fails -- most likely
-        because the operator has not yet supplied the current version's key
-        -- the record is still perfectly decryptable, so it is returned
-        unrotated rather than turning a half-configured key set into an
-        outage. That failure is logged (once per instance) naming the
-        missing version so it is diagnosable; it never raises out of
-        `load`, and never touches the file, unlike a direct `save` call
-        (see `save`'s own docstring note).
+        A record sealed under an older key version is re-sealed under
+        ``current_version`` before returning. If that re-seal fails (e.g.
+        missing key), the record is still returned unrotated -- never raises
+        out of `load` -- rather than turning a half-configured key set into
+        an outage. Logged once per instance.
         """
         try:
             raw_bytes = self._path.read_bytes()
@@ -340,16 +259,12 @@ class EncryptedFileTokenStore:
             # Missing file means not logged in, which is normal.
             return None
         except OSError as exc:
-            # A file that exists but cannot be read (permission denied, is a directory,
-            # etc.) must become AuthError so callers that catch AuthError to redact or
-            # degrade a failure (doctor's store check, export-member) are aware. This
-            # matches the contract documented on KeyringTokenStore.load (issue #137).
+            # Unreadable (perm denied, is a dir, etc.) -> AuthError so callers
+            # (doctor, export-member) can catch it; contract matches #137.
             raise AuthError(f"token file at {self._path} is unreadable: {exc}") from exc
 
-        # Bytes, not text, and decoded explicitly here: the compare below needs
-        # the exact on-disk bytes to be byte-exact, and `read_text` would both
-        # translate newlines and raise `UnicodeDecodeError` -- which is not
-        # `AuthError`, so it would escape this class's documented contract.
+        # Bytes not text: the later compare needs byte-exact data, and
+        # read_text's UnicodeDecodeError wouldn't match this class's AuthError contract.
         try:
             raw = raw_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -363,8 +278,8 @@ class EncryptedFileTokenStore:
         try:
             plaintext = unseal(envelope, self._keys, associated_data=self._ASSOCIATED_DATA)
         except SealError as exc:
-            # SealError never carries the plaintext or the key (see
-            # crypto.unseal's own contract) -- neither does this message.
+            # SealError never carries plaintext/key (crypto.unseal's contract);
+            # neither does this message.
             raise AuthError(f"token file at {self._path} failed to decrypt") from exc
 
         try:
@@ -373,25 +288,13 @@ class EncryptedFileTokenStore:
             raise AuthError(f"token file at {self._path} is unreadable: {exc}") from exc
 
         if envelope.get("v") != self._current_version:
-            # Lazy rotation: this record was sealed under an older key
-            # version than the one now current. Re-seal it right away so
-            # every read after this one uses the new key -- no forced bulk
-            # re-encrypt pass, no downtime; the old key just needs to
-            # remain in `keys` until every such record has been touched
-            # once.
+            # Lazy rotation: re-seal under current_version now so future reads
+            # use the new key; old key stays in `keys` until all are touched.
             try:
                 self._reseal_if_unchanged(token, raw_bytes)
             except (SealError, OSError) as exc:
-                # Two ways this fails, and neither is a reason to deny the
-                # caller a token that just decrypted perfectly well:
-                # `SealError` when the current key is missing (a
-                # half-completed rotation, or a misconfigured environment),
-                # and `OSError` when the write itself cannot land -- a full
-                # disk, a read-only state directory, a permission change
-                # under us (issue #135). Availability wins: serve it
-                # unrotated and try again on the next load. Contrast with
-                # `save` itself, which must keep raising for a direct
-                # caller (see its docstring).
+                # Missing key or write failure (#135): availability wins --
+                # serve unrotated, retry next load. Contrast `save`, which raises.
                 if not self._reseal_warned:
                     self._reseal_warned = True
                     logger.warning(
@@ -406,63 +309,21 @@ class EncryptedFileTokenStore:
         return token
 
     def _reseal_if_unchanged(self, token: Token, raw_at_read: bytes) -> None:
-        """Re-seal ``token`` only if the file still holds exactly the bytes
-        ``load`` read (#132).
+        """Re-seal ``token`` only if the file still holds the bytes ``load`` read (#132).
 
-        ``load`` is a writer: during a pending rotation it re-seals whatever it
-        just read. ``server.py:448`` runs ``load`` in a thread for every
-        ``/ready`` poll, and ``whoop_auth_status``, ``doctor.py`` and
-        ``__main__.py`` load too. So a loader can read token X, a refresh can
-        complete X -> Y and save Y, and the loader's re-seal can then write X
-        back -- leaving a refresh token WHOOP has already rotated away, and an
-        ``invalid_grant`` on the next restart.
-
-        (That is older than it looks. The re-seal-on-load has been here since
-        tokens were first encrypted at rest, in the same commit that added
-        ``EncryptedFileTokenStore``; #103 only widened the ``except`` around it
-        so a missing key stops raising. #132's text -- and this docstring's
-        first draft -- both blamed #103 for introducing the failure mode. Git
-        history says otherwise, and a wrong attribution sends the next reader to
-        the wrong commit.)
-
-        Two mechanisms, because the two threat models are different:
-
-        **Within this process, a lock.** ``_TOKEN_PATH_LOCKS`` serialises the
-        compare-and-save here against every ``save`` on the same path, which
-        closes the interleaving above completely -- and that is the scenario the
-        issue actually describes, since ``/ready``'s thread and the refresh share
-        one process. A ``threading.Lock`` has none of the drawbacks a file lock
-        would: nothing platform-specific, nothing to leave behind on a crash,
-        no NFS semantics.
-
-        **Across processes, a byte-for-byte compare, which is best effort.** A
-        changed file means some other writer got there first and theirs is newer,
-        so this skips; the record it left behind gets re-sealed by a later load.
-        The compare and the ``os.replace`` inside ``save`` are not one atomic
-        step, so a *cross-process* write landing between them is still lost --
-        and the residual window is not small. Measured on this machine, roughly
-        two thirds of the span from ``load``'s read to the rename sits after the
-        compare, because ``seal``, ``mkstemp``, the write and the ``fsync`` are
-        all on that side of it; on a filesystem with honest ``fsync`` it is
-        milliseconds. Closing that needs cross-process locking, which this
-        module does not attempt anywhere -- multi-process refresh is already
-        documented as unsound (see ``RefreshLock`` and ``server.py``'s "Known
-        limitation"). Saying the compare narrows the window would be
-        overstating it: what the compare buys cross-process is that the common
-        sequential interleaving is caught, not that the race is gone.
-
-        The reason skipping is always safe: **a re-seal is never required for
-        correctness.** It migrates a record to the current key; the record was
-        already decryptable without it, and a later ``load`` migrates it just as
-        well. Deferring only extends how long the old key must stay in ``keys``,
-        which the class docstring already requires.
+        Prevents: loader reads X, a refresh saves Y, loader's re-seal
+        overwrites Y with stale X. Same-process races are fully closed by
+        ``_TOKEN_PATH_LOCKS``; cross-process is only a best-effort byte
+        compare -- the window between compare and ``save``'s rename is NOT
+        closed cross-process (multi-process refresh is already unsound,
+        see ``RefreshLock``). Skipping is always safe: a later ``load``
+        re-seals it, and re-seal is never required for correctness.
         """
         with _lock_for_token_path(self._path):
             try:
                 current = self._path.read_bytes()
             except FileNotFoundError:
-                # Deleted under us -- a logout, or an operator clearing state.
-                # Re-creating it here would resurrect exactly what they removed.
+                # Deleted under us (logout, or state cleared) -- don't resurrect it.
                 logger.debug(
                     "skipping lazy re-seal at %s: the file is gone, so re-creating it "
                     "would resurrect a credential something just removed",
@@ -481,12 +342,9 @@ class EncryptedFileTokenStore:
     def save(self, token: Token) -> None:
         """Seal ``token`` and write it to disk.
 
-        Unlike the lazy re-seal inside `load` above, a `SealError` here --
-        e.g. the current key version is missing -- is never swallowed: it
-        propagates. A direct `save` (as `Authenticator.exchange_code` makes
-        right after a successful token exchange) is the only copy of a
-        freshly obtained token there is; degrading that to a warning would
-        silently lose it instead of merely deferring a rotation.
+        Unlike `load`'s lazy re-seal, a `SealError` here (e.g. missing key)
+        is never swallowed -- it propagates, since a direct `save` may be
+        the only copy of a freshly obtained token.
         """
         if not self._MODES_ENFORCED and not self._warned:
             self._warned = True
@@ -504,8 +362,7 @@ class EncryptedFileTokenStore:
             current_version=self._current_version,
             associated_data=self._ASSOCIATED_DATA,
         )
-        # Held across the write so a concurrent lazy re-seal in another thread
-        # cannot land between this save's compare-equivalent and its rename
+        # Held across the write so a concurrent re-seal can't land mid-save
         # (#132). See `_TOKEN_PATH_LOCKS`.
         with _lock_for_token_path(self._path):
             atomic_write_text(self._path, json.dumps(envelope))
@@ -524,9 +381,8 @@ class KeyringTokenStore:
         try:
             import keyring
         except ImportError as exc:
-            # Covered deterministically since #198: tests stub
-            # sys.modules["keyring"] to None, so this branch no longer
-            # depends on which extras the environment happens to lack.
+            # Deterministic since #198: tests stub sys.modules["keyring"]=None,
+            # not dependent on the environment's actual extras.
             raise AuthError(
                 "WHOOPMCP_TOKEN_BACKEND=keyring requires the extra: pip install 'whoopmcp[keyring]'"
             ) from exc
@@ -535,14 +391,10 @@ class KeyringTokenStore:
     def load(self) -> Token | None:
         """Return the stored token, or ``None`` if the keychain holds none.
 
-        A corrupt entry raises ``AuthError``, matching the file-backed stores
-        (issue #137). Without this the raw ``JSONDecodeError``/``KeyError``
-        escaped, breaking the ``TokenStore.load`` contract of ``Token | None``
-        or ``AuthError`` -- and callers that catch ``AuthError`` to redact a
-        failure, such as ``doctor``'s store check, never saw it.
-
-        The message deliberately does not include the offending value: unlike
-        a file path, the entry itself is the credential.
+        A corrupt entry raises ``AuthError`` (matches file-backed stores, #137)
+        instead of a raw ``JSONDecodeError``/``KeyError`` escaping. The message
+        never includes the offending value -- unlike a file path, the entry
+        itself is the credential.
         """
         raw = self._keyring.get_password(self.SERVICE, self.USERNAME)
         if not raw:
@@ -556,17 +408,13 @@ class KeyringTokenStore:
             ) from exc
 
     def save(self, token: Token) -> None:
-        # No atomicity guarantee of our own here, unlike FileTokenStore's
-        # write-then-replace: this passes straight through to the OS keychain's
-        # own set_password, and keyring's API doesn't document a swap-on-success
-        # contract the way a filesystem rename gives us. Whatever atomicity this
-        # has comes from the backend, not from anything written here.
+        # No atomicity of our own (unlike FileTokenStore's write-then-replace):
+        # passes straight to set_password; whatever atomicity exists is the backend's.
         self._keyring.set_password(self.SERVICE, self.USERNAME, token.to_json())
 
     def clear(self) -> None:
-        # Every keyring backend spells "no such entry" differently, and a
-        # logout that fails because there was nothing to remove has still
-        # achieved what the caller wanted.
+        # Every backend spells "no such entry" differently; failing here
+        # would be wrong since a logout with nothing to remove still succeeded.
         try:
             self._keyring.delete_password(self.SERVICE, self.USERNAME)
         except Exception as exc:
@@ -575,13 +423,12 @@ class KeyringTokenStore:
 
 def build_store(config: Config) -> TokenStore:
     """Pick a token store based on configuration."""
-    if config.token_backend == "keyring":  # noqa: S105 -- a backend name, not a credential value  # nosec B105
+    if config.token_backend == "keyring":  # noqa: S105 -- backend name  # nosec B105
         return KeyringTokenStore()
-    if config.token_backend == "encrypted-file":  # noqa: S105 -- a backend name, not a credential value  # nosec B105
+    if config.token_backend == "encrypted-file":  # noqa: S105 -- backend name  # nosec B105
         if config.token_encryption_key_version is None:
-            # Config.from_env() already refuses to produce a config with
-            # token_backend="encrypted-file" and no key version, so this
-            # only fires for a Config built by hand rather than from_env.
+            # Config.from_env() already rejects this combo; only fires for a
+            # hand-built Config.
             raise AuthError(
                 "token_backend='encrypted-file' requires token_encryption_key_version "
                 "and at least one entry in token_encryption_keys"
@@ -597,9 +444,8 @@ def build_store(config: Config) -> TokenStore:
 def build_authorize_url(config: Config, *, state: str | None = None) -> tuple[str, str]:
     """Return ``(url, state)`` for the browser step of the OAuth flow.
 
-    The caller must retain ``state`` and reject any callback that does not
-    echo it back -- that check is what stops a third party from feeding us
-    their own authorization code.
+    Caller must retain ``state`` and reject any callback that doesn't echo
+    it back -- this is what stops a third party feeding us their own code.
     """
     state = state or secrets.token_urlsafe(32)
     query = urlencode(
@@ -617,9 +463,8 @@ def build_authorize_url(config: Config, *, state: str | None = None) -> tuple[st
 def _raise_for_token_error(response: httpx.Response) -> None:
     """Turn a non-2xx token-endpoint response into an AuthError.
 
-    Only WHOOP's own ``error``/``error_description`` fields are echoed back
-    -- never the request we sent, since that is where the client secret and
-    any refresh/authorization code live.
+    Only WHOOP's ``error``/``error_description`` are echoed -- never the
+    request itself, which carries the client secret and auth/refresh code.
     """
     if response.is_success:
         return
@@ -644,19 +489,12 @@ def _is_invalid_grant(response: httpx.Response) -> bool:
 
 
 def _supersedes(current: Token, token: Token) -> bool:
-    """Whether ``current`` (freshly read from the store) represents a
-    genuinely different grant than ``token`` (the caller's own copy) --
-    i.e. whether someone else has already won a refresh race `token`'s
-    caller is only now catching up to.
+    """Whether ``current`` (from the store) is a genuinely different grant
+    than ``token`` -- i.e. someone else already won a refresh race.
 
-    Compared by credential identity (access token + refresh token) rather
-    than full ``Token`` equality on purpose: ``expires_at`` is *expected*
-    to differ between a caller's about-to-expire copy and a genuinely
-    fresher store entry for the exact same grant, and a caller does not
-    always reconstruct ``scopes`` byte-for-byte. Comparing every field
-    would make this fire on a caller's own, not-yet-superseded token
-    purely because time has passed since they last read it; only the
-    credential itself changing means someone else has actually refreshed.
+    Compares credential identity (access+refresh token), not full equality:
+    ``expires_at``/``scopes`` can differ harmlessly for the same grant, so
+    comparing every field would misfire on a caller's own token.
     """
     current_credential = (current.access_token, current.refresh_token)
     token_credential = (token.access_token, token.refresh_token)
@@ -666,16 +504,11 @@ def _supersedes(current: Token, token: Token) -> bool:
 async def revoke_upstream(access_token: str, config: Config) -> None:
     """``DELETE /v2/user/access``: revoke this grant on WHOOP's side.
 
-    client.py's own module docstring explains why ``WhoopClient`` deliberately
-    never calls this: revoking a grant is a decision a user makes for
-    themselves, through WHOOP's own settings, not something an LLM-driven
-    tool should be able to trigger. That reasoning holds for the MCP tool
-    surface -- it does NOT hold for an *operator*-initiated deletion, which
-    is the only caller of this function (via ``Authenticator
-    .revoke_and_forget``, itself only reachable from the ``delete-member``
-    CLI subcommand in ``__main__.py``, never a tool ``server.py`` registers).
-    Living here rather than on ``WhoopClient`` is what keeps this call out
-    of reach of the MCP tool surface, structurally -- not an oversight.
+    Deliberately never called by ``WhoopClient``/the MCP tool surface --
+    revoking a grant is the user's decision via WHOOP's own settings, not an
+    LLM-triggerable action. Only reachable from the ``delete-member`` CLI
+    subcommand, via ``Authenticator.revoke_and_forget``. Living here (not on
+    ``WhoopClient``) keeps it structurally out of tool reach.
     """
     async with httpx.AsyncClient(timeout=config.request_timeout) as client:
         response = await client.delete(
@@ -690,28 +523,14 @@ async def revoke_upstream(access_token: str, config: Config) -> None:
 class RefreshLock(Protocol):
     """Serialises concurrent refreshes to exactly one in flight at a time.
 
-    Deliberately just a mutex, not asyncio.Lock by name: hosted mode (#27,
-    #30) needs one that holds across processes, and should be able to
-    supply it here without any change to Authenticator.
+    Just a mutex (not asyncio.Lock by name) so hosted mode (#27, #30) can
+    supply a cross-process one without changing Authenticator.
 
-    Caution for whoever builds that cross-process implementation (#27
-    prototyped one, SQLite-file-lock backed, and removed it before merge):
-    a lock alone is not sufficient. refresh() below coordinates within one
-    process via a private asyncio.Future -- the lock only guards "is a
-    refresh already in flight," and is released before the network call
-    completes, relying on that Future (with no cross-process equivalent)
-    to make every other in-process caller await the SAME request rather
-    than starting their own. A cross-process RefreshLock that is merely
-    held-then-released around that same check, without also covering the
-    network call itself, does not stop two separate processes from each
-    independently completing a refresh with the same about-to-rotate
-    refresh token -- which reproduces the exact credential-destroying race
-    this whole mechanism exists to prevent, just across processes instead
-    of within one. Closing that gap for real means either holding the lock
-    across the network request (a change to this method, which the
-    original ask for this Protocol explicitly wanted to avoid) or a
-    compare-and-swap against a shared store keyed on the token's own
-    identity (needs #13). See #27 for the discovery and reasoning.
+    Warning for a future cross-process impl: a lock alone is not enough --
+    refresh() releases it before the network call, relying on an in-process
+    Future to coalesce waiters. A lock not covering the network call lets two
+    processes each complete a refresh with the same rotating token, reproducing
+    the credential-destroying race this exists to prevent (needs #13 instead).
     """
 
     async def acquire(self) -> None:
@@ -750,22 +569,12 @@ class Authenticator:
         self._pending_state: str | None = None
         self._refresh_lock: RefreshLock = refresh_lock or InProcessRefreshLock()
         self._inflight_refresh: asyncio.Task[Token] | None = None
-        #: Bumped by logout()/revoke_and_forget() (issue #123). refresh()
-        #: captures this as its very first line -- before it ever awaits the
-        #: lock -- and passes it into _do_refresh, which re-checks it right
-        #: before persisting or installing a result; a mismatch means the
-        #: user's credentials were forgotten while this refresh was in
-        #: flight (or while it was merely queued and hadn't started yet), so
-        #: a token that is by then stale-by-policy must not be written back.
-        #: Capturing at refresh() entry, not inside _do_refresh, matters
-        #: because _do_refresh's task is created with asyncio.ensure_future
-        #: and does not actually start running until the event loop gets to
-        #: it -- a logout() that runs first in that same tick must still be
-        #: seen. logout() is synchronous (can't await/cancel the in-flight
-        #: task -- see its own docstring), so this, not a lock, is what
-        #: closes the race: plain int mutation needs nothing else on a
-        #: single event loop, since nothing can interleave between the
-        #: capture and the check without an `await` in between.
+        #: Bumped by logout()/revoke_and_forget() (#123). refresh() captures
+        #: this before acquiring the lock, and _do_refresh re-checks it before
+        #: persisting -- a mismatch means logout happened mid-flight, so a
+        #: stale-by-policy token must not be written back. Must be captured
+        #: at refresh() entry, not inside _do_refresh's task, since the task
+        #: doesn't start until the event loop schedules it.
         self._credential_epoch = 0
 
     def start_login(self) -> str:
@@ -777,24 +586,11 @@ class Authenticator:
     def verify_state(self, state: str) -> None:
         """Reject a callback whose ``state`` does not match the pending login.
 
-        issue #120: OAuth's security BCP requires ``state`` to be single-use,
-        so a *successful* verification clears ``_pending_state`` -- a second
-        call with the same value then fails exactly as an unknown state does,
-        the same way it would after a fresh ``start_login()``. Consuming the
-        state here rather than in ``exchange_code`` means a failed exchange
-        (e.g. WHOOP rejects the code) does not leave the state usable for a
-        retry: the caller must run ``start_login`` again. That is intentional
-        (D3) -- the state has already done its one job of authenticating this
-        callback, and a fresh login is the correct BCP-compliant recovery, not
-        a bug.
-
-        A *mismatched* state does NOT clear ``_pending_state``. That is not an
-        oversight: the state is 32 bytes from `secrets.token_urlsafe`, so
-        there is nothing an attacker can brute-force by guessing, and a
-        genuine login is still in progress. If a wrong value cleared it too,
-        anyone who can reach the callback URL could kill someone else's
-        legitimate in-flight login by sending one bad ``state`` -- clearing
-        only on success avoids handing out that denial-of-service for free.
+        State is single-use (#120 BCP): success clears ``_pending_state``, so
+        a retry needs a fresh ``start_login()``. A mismatch does NOT clear it
+        -- clearing on any wrong guess would let an attacker who can reach the
+        callback URL kill someone else's in-flight login (DoS); the 32-byte
+        state can't be brute-forced anyway.
         """
         if self._pending_state is None:
             raise AuthError("no login in progress; call start_login first")
@@ -817,18 +613,8 @@ class Authenticator:
             )
         _raise_for_token_error(response)
         token = Token.from_response(response.json())
-        # Install before persisting (issue #134). By this point WHOOP has
-        # already minted the grant: if `save` raises -- a full disk, a
-        # read-only state directory, a `SealError` from a half-configured
-        # key set -- then persisting failed, but the grant is live upstream
-        # regardless. Assigning first means this process still holds the
-        # only copy, so the session keeps working and `revoke_and_forget`
-        # can still kill the grant. The alternative loses the sole handle on
-        # a live, refreshable credential and leaves the user retrying,
-        # minting a fresh grant each time.
-        #
-        # The exception still propagates: the caller must know the token was
-        # not written and will not survive a restart.
+        # Install before persisting (#134): if save() fails, the grant is
+        # still live upstream and usable this session; exception still propagates.
         self._token = token
         self._store.save(token)
         return token
@@ -836,46 +622,15 @@ class Authenticator:
     async def refresh(self, token: Token) -> Token:
         """Renew an expired token using its refresh token.
 
-        Single-flighted two ways. A store-recheck after acquiring
-        self._refresh_lock short-circuits a caller that arrives once a PRIOR
-        round has already resolved successfully -- another caller may have
-        refreshed past `token` while this one waited for the lock, and
-        re-reading the shared store (rather than an in-process cache) is what
-        will let a future cross-process lock (#27, #30) work here too without
-        changing this method, since a different process's win is only
-        visible through the store. But a store-recheck alone only catches a
-        *successful* prior round: a failed one clears the store to None,
-        which leaves a caller arriving mid-flight nothing to short-circuit
-        on. So callers who arrive WHILE a round is still running instead
-        coalesce onto self._inflight_refresh, a shared asyncio.Task --
-        awaiting it delivers the winner's exception to every waiter just as
-        it would the winner's result, so a failed refresh (e.g.
-        invalid_grant) does not get retried by everyone who was waiting on
-        it.
+        Single-flighted two ways: a store-recheck after the lock catches a
+        round that already succeeded; concurrent callers instead coalesce
+        onto ``self._inflight_refresh`` (a shared Task) so a failed round
+        isn't retried by every waiter. The lock covers only the check/create
+        step, released before the network call.
 
-        The lock is only held for the brief "check the store, then
-        create-or-reuse the shared task" step -- the network call itself
-        happens with the lock released, so waiters merely await the same
-        task rather than blocking each other on it. Clearing the finished
-        task back out of self._inflight_refresh does not need the lock
-        either: it is plain synchronous code with no `await` between the
-        identity check and the assignment, so nothing can interleave between
-        them -- whichever waiter's continuation runs first clears it, and the
-        rest see it is already gone.
-
-        The credential epoch (issue #123) is captured here, as the very
-        first line, before the lock is even acquired -- not inside
-        _do_refresh. _do_refresh's task is merely *created* with
-        asyncio.ensure_future; it does not start running until the event
-        loop schedules it, so a logout() that happens to run first in that
-        same tick (e.g. a sibling `whoop_logout` tool call ready in the same
-        loop iteration) would otherwise land before the epoch was ever
-        captured, and _do_refresh would capture the already-bumped,
-        post-logout epoch -- passing its own check and resurrecting a
-        forgotten grant. The same reasoning covers a caller that suspends on
-        the contended lock above and, once through, finds the store
-        recheck's `current` gone (a prior round failed and cleared it): the
-        epoch was still fixed before any of that could happen.
+        Epoch (#123) is captured here, before the lock -- not inside
+        ``_do_refresh``, whose task only starts once scheduled, so a
+        same-tick ``logout()`` must still be visible.
         """
         epoch = self._credential_epoch
         await self._refresh_lock.acquire()
@@ -886,18 +641,9 @@ class Authenticator:
                 if not current.expired:
                     self._token = current
                     return current
-                # issue #122 (D1): `current` is a genuinely different
-                # (fresher) grant than `token`, just one that has itself
-                # expired -- it is still the right thing to refresh, unlike
-                # `token`, which is the caller's own stale copy. Refresh
-                # `current` instead of falling through to
-                # _do_refresh(token, ...), which would send WHOOP a refresh
-                # token it has already rotated past. `token` itself is kept
-                # unchanged and passed through as `original`: D2's
-                # invalid_grant classification needs to know what the
-                # CALLER's own view of "current" was, not which credential we
-                # opportunistically substituted in here -- see _do_refresh's
-                # own comment.
+                # #122 D1: `current` is fresher but also expired -- refresh it,
+                # not `token` (already rotated past). Keep `original`=token for
+                # D2's invalid_grant classification below.
                 refresh_target = current
             if self._inflight_refresh is None:
                 self._inflight_refresh = asyncio.ensure_future(
@@ -914,16 +660,10 @@ class Authenticator:
                 self._inflight_refresh = None
 
     async def _do_refresh(self, token: Token, epoch: int, *, original: Token) -> Token:
-        # `epoch` is captured by our caller, refresh(), before it even
-        # acquires the refresh lock -- not here. See refresh()'s own
-        # docstring for why capturing it inside this coroutine would be too
-        # late to close issue #123's race.
-        #
-        # `token` is the credential actually sent to WHOOP below -- ordinarily
-        # the caller's own, but D1 (refresh()) substitutes in a store token
-        # that supersedes-but-has-expired instead. `original` is always the
-        # caller's own, unsubstituted token, and exists only for the
-        # invalid_grant branch's D2 classification below.
+        # `epoch` is captured by refresh() before the lock, not here (see
+        # refresh()'s docstring, #123). `token` is what's sent to WHOOP (D1
+        # may substitute a fresher-but-expired store token); `original` is
+        # always the caller's own, used only for D2's classification below.
         async with httpx.AsyncClient(timeout=self._config.request_timeout) as client:
             try:
                 response = await client.post(
@@ -937,59 +677,33 @@ class Authenticator:
                     },
                 )
             except httpx.RequestError:
-                # #31: a refresh that never got a response at all -- never
-                # counted as invalid_grant/token_endpoint_error, both of
-                # which need an actual response to classify.
+                # #31: no response at all, so it can't be classified as
+                # invalid_grant/token_endpoint_error (both need a response).
                 metrics.record_token_refresh_failure("network_error")
                 raise
         if response.status_code == 400 and _is_invalid_grant(response):
             metrics.record_token_refresh_failure("invalid_grant")
-            # issue #122: invalid_grant means WHOOP rejected `token` -- it
-            # does NOT by itself mean the user's grant is gone. WHOOP rotates
-            # refresh tokens on use, so a rejection usually just means the
-            # credential sent was superseded by a rotation another (or this)
-            # process already completed and saved.
-            #
-            # D2 asks: does the store still hold the token that failed? That
-            # comparison must be against `original` -- the caller's own,
-            # unsubstituted view of "current" -- not `token`. When D1 has
-            # substituted in the store's own (expired) token and WHOOP
-            # rejects it too, comparing the store against `token` would
-            # always read as "unchanged" (nothing else touched the store
-            # between the substitution and this check), misclassifying an
-            # opportunistic refresh of someone else's rotation as the
-            # caller's own grant being gone. Comparing against `original`
-            # instead asks the question that actually matters here: has the
-            # store moved past what the caller itself knew, at all -- which
-            # is true whenever D1 substituted, regardless of whether that
-            # substituted attempt then failed too.
+            # #122: invalid_grant doesn't mean the grant is gone -- WHOOP
+            # rotates refresh tokens on use, so this may be a superseded
+            # credential. D2 compares the store against `original` (caller's
+            # view), not `token` (may be D1's substituted copy), else a
+            # substitution misclassifies as "grant gone".
             stored = self._store.load()
             if stored is None or not _supersedes(stored, original):
-                # Genuine case: the store holds nothing, or still holds
-                # exactly the credential the caller itself knew about --
-                # WHOOP's rejection describes the grant itself, so clear it.
+                # Genuine case: store matches what the caller knew -- the
+                # rejection describes the grant itself, so clear it.
                 self._store.clear()
                 self._token = None
-                # GrantAlreadyGoneError, not plain AuthError: the grant is
-                # gone, not merely unreachable -- see that class's own
-                # docstring.
+                # GrantAlreadyGoneError: gone, not merely unreachable.
                 raise GrantAlreadyGoneError(
                     "WHOOP rejected the refresh token (invalid_grant); it will not become "
                     "valid on retry -- run whoop_login to re-authorise"
                 )
-            # The store had already moved on to a different, fresher
-            # credential than the caller's own before this call even started
-            # -- this rejection describes a stale (or opportunistically
-            # substituted) token, not necessarily the store's current state,
-            # which may still be live at WHOOP. Do not touch the store or
-            # self._token: clearing here could destroy a fresher credential,
-            # and GrantAlreadyGoneError here is exactly what #65's
-            # erase-member/delete-member catch as "revoke succeeded" (issue
-            # #122) -- reporting a revoke that never happened while the grant
-            # is still live. Raise a plain AuthError instead; the next
-            # refresh()/access_token() call re-reads the store and picks up
-            # whatever is actually current via the recheck at the top of
-            # refresh() -- no automatic retry from in here.
+            # Store already moved past the caller's view before this call
+            # started -- don't clear (could destroy a fresher credential).
+            # Must be plain AuthError, not GrantAlreadyGoneError: #65's
+            # erase/delete-member would misread that as "revoke succeeded"
+            # while the grant is still live.
             raise AuthError(
                 "WHOOP rejected a refresh token that the local store has already superseded "
                 "with a fresher one; the grant may still be live -- retry the operation"
@@ -997,36 +711,24 @@ class Authenticator:
         try:
             _raise_for_token_error(response)
         except AuthError:
-            # #31: any other non-2xx from the token endpoint. Not inside
-            # _raise_for_token_error itself -- exchange_code shares that
-            # helper, and a counter there would conflate first-login
-            # failures with refresh failures.
+            # #31: counter lives here, not in _raise_for_token_error itself,
+            # since exchange_code shares that helper (would conflate login/refresh).
             metrics.record_token_refresh_failure("token_endpoint_error")
             raise
         try:
             new_token = Token.from_response(response.json())
         except (AuthError, ValueError):
-            # #31: a 2xx response whose body isn't the token shape expected
-            # -- either response.json() itself failing (not JSON at all) or
-            # Token.from_response's own AuthError for a JSON body missing
-            # the fields it needs.
+            # #31: 2xx but malformed body -- not JSON, or missing fields.
             metrics.record_token_refresh_failure("malformed_response")
             raise
         if epoch == self._credential_epoch:
             self._store.save(new_token)
             self._token = new_token
         else:
-            # issue #123: logout()/revoke_and_forget() forgot the
-            # credentials while this refresh was in flight. WHOOP has
-            # already rotated the refresh token upstream regardless, but per
-            # D2 that is not a reason to write this one back to the store or
-            # install it as the session credential -- the user asked to
-            # forget, and a store that repopulates itself after logout is
-            # worse than one that never had a logout. The caller of *this*
-            # refresh still gets `new_token` back (below) rather than an
-            # exception: it is a genuinely valid token, and it was the
-            # store/session state the interleaved logout invalidated, not
-            # this particular call.
+            # #123: logout() ran mid-flight. WHOOP already rotated the token
+            # upstream, but don't write it back or install it -- a store that
+            # repopulates after logout is worse than none. Caller still gets
+            # `new_token` (it's genuinely valid); only session state was invalidated.
             logger.info(
                 "discarding a token refresh that completed after logout(); "
                 "not persisting or installing it"
@@ -1040,8 +742,7 @@ class Authenticator:
             self._token = self._store.load()
         token = self._token
         if token is None:
-            # GrantAlreadyGoneError, not plain AuthError: see that class's
-            # own docstring -- this is "nothing to revoke", not a failure.
+            # GrantAlreadyGoneError: "nothing to revoke", not a failure.
             raise GrantAlreadyGoneError(
                 "no stored credentials found; run whoop_login to authenticate"
             )
@@ -1059,27 +760,18 @@ class Authenticator:
         self._store.clear()
         self._token = None
         self._pending_state = None
-        # issue #123: bump so any refresh already in flight discards its
-        # result instead of writing it back once it completes -- see
-        # _credential_epoch's comment in __init__. revoke_and_forget calls
-        # this method too, so it needs no bump of its own (D3).
+        # #123: bump so any in-flight refresh discards its result on completion.
+        # revoke_and_forget calls this method too, so needs no bump of its own (D3).
         self._credential_epoch += 1
 
     async def revoke_and_forget(self) -> None:
         """Revoke this grant upstream, then forget the local token.
 
-        The operator-initiated counterpart to ``logout``: where ``logout``
-        only forgets, this also calls ``revoke_upstream`` first, so the
-        grant is actually revoked rather than merely no-longer-remembered
-        here. Deliberately unreachable from the MCP tool surface -- see
-        ``revoke_upstream``'s own docstring -- so its only caller is the
-        ``delete-member`` CLI subcommand (``__main__.py``), never a tool
-        ``server.py`` registers.
-
-        Refreshes first if the stored token is expired, since WHOOP's
-        revoke endpoint needs a live access token, not a dead one -- the
-        whole point of deleting a member is to kill the grant, not to fail
-        quietly because the access token had already expired.
+        Operator-only counterpart to ``logout``: also calls ``revoke_upstream``
+        first, so the grant is actually revoked, not just forgotten locally.
+        Unreachable from the MCP tool surface -- only the ``delete-member``
+        CLI subcommand calls it. Refreshes first if expired, since revoke
+        needs a live access token.
         """
         access_token = await self.access_token()
         await revoke_upstream(access_token, self._config)

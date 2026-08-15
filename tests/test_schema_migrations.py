@@ -1,9 +1,4 @@
-"""Tests for issue #105: webhook_events.whoop_user_id NOT NULL constraint migration.
-
-Tests the schema migration that makes whoop_user_id NOT NULL, preventing invisible
-rows in export and erasure operations, plus the pre-flight check and signature
-tightening. These tests are written before the migration is implemented.
-"""
+"""Tests for issue #105: webhook_events.whoop_user_id NOT NULL migration (v4->v5)."""
 
 from __future__ import annotations
 
@@ -23,18 +18,13 @@ from whoopmcp.store import (
 
 # Test 1: A fresh store has the NOT NULL constraint
 def test_fresh_store_webhook_events_whoop_user_id_has_not_null_constraint() -> None:
-    """PRAGMA table_info(webhook_events) reports notnull=1 for whoop_user_id.
-
-    This test will FAIL on current main (where the column is nullable).
-    """
+    """PRAGMA table_info reports notnull=1 for whoop_user_id (fails on current main)."""
     conn = open_store(":memory:")
 
     try:
-        # Get column info for webhook_events table
         pragma_result = conn.execute("PRAGMA table_info(webhook_events)").fetchall()
 
         # pragma_result format: (cid, name, type, notnull, dflt_value, pk)
-        # Find the whoop_user_id column
         whoop_user_id_col = None
         for row in pragma_result:
             if row[1] == "whoop_user_id":  # row[1] is the column name
@@ -53,11 +43,7 @@ def test_fresh_store_webhook_events_whoop_user_id_has_not_null_constraint() -> N
 
 # Test 2: Inserting NULL into whoop_user_id raises an error
 def test_inserting_null_whoop_user_id_raises() -> None:
-    """After the migration, attempting to insert a NULL whoop_user_id
-    should raise sqlite3.IntegrityError at the database level.
-
-    This test will FAIL on current main (where NULL is allowed).
-    """
+    """Inserting NULL whoop_user_id raises sqlite3.IntegrityError (fails on current main)."""
     conn = open_store(":memory:")
 
     try:
@@ -83,17 +69,8 @@ def test_inserting_null_whoop_user_id_raises() -> None:
 
 # Test 3: The upgrade path preserves all data
 def test_migration_v4_to_v5_preserves_all_webhook_events_data() -> None:
-    """Build a v4-shaped store by running migrations 1-4 manually, populate it
-    with webhook_events and other table data for multiple members, then run
-    open_store() which will apply the v5 migration. Assert that every row
-    survives with identical values and the version is 5.
-
-    This test builds the v4 fixture from the committed migration strings,
-    not hand-written DDL, so it cannot drift from the real schema.
-    """
-    # A file-based db is needed (an in-memory one can't be reopened), so
-    # this builds a v4 fixture from the committed migration strings inside
-    # a tempfile, then reopens it via ``open_store`` to trigger v5.
+    """Migrating a populated v4 store to v5 preserves every row and bumps user_version to 5."""
+    # File-based (not in-memory) db so it can be reopened via open_store to trigger v5.
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -222,15 +199,7 @@ def test_migration_v4_to_v5_preserves_all_webhook_events_data() -> None:
 
 # Test 4: D2 pre-flight check - database unchanged if NULL rows exist
 def test_migration_v4_to_v5_pre_flight_fails_without_changing_database() -> None:
-    """A v4 store containing one NULL-user row should trigger open_store()
-    to raise an error naming the count, and the database must remain completely
-    unchanged: still version 4, the NULL row still present, column still nullable.
-
-    This test verifies the pre-flight check works correctly and does not
-    partially migrate.
-
-    This test will FAIL on current main (no pre-flight check exists yet).
-    """
+    """open_store() rejects a NULL-row v4 store, leaving the db untouched."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -280,8 +249,7 @@ def test_migration_v4_to_v5_pre_flight_fails_without_changing_database() -> None
 
         conn.close()
 
-        # Step 2: Try to open_store() which should fail in pre-flight
-        # (test will FAIL if no pre-flight check is implemented)
+        # open_store() should fail in pre-flight (no check yet on current main)
         with pytest.raises(Exception) as exc_info:
             open_store(db_path)
 
@@ -315,28 +283,11 @@ def test_migration_v4_to_v5_pre_flight_fails_without_changing_database() -> None
 
 # Test 5: Schema equivalence - rebuilt table matches fact #3 DDL (except constraint)
 def test_migration_v5_schema_matches_v4_except_not_null() -> None:
-    """The v5 table definition must be identical to v4 except for the
-    NOT NULL constraint on whoop_user_id. This ensures no column order,
-    type, or default was accidentally changed.
-
-    Compares PRAGMA table_info and sqlite_master DDL against fact #3.
-    """
+    """v5's webhook_events DDL matches v4 exactly except whoop_user_id gains NOT NULL."""
     conn = open_store(":memory:")
 
     try:
-        # Fact #3's exact v4 DDL for webhook_events was:
-        #   CREATE TABLE webhook_events (
-        #       trace_id TEXT NOT NULL PRIMARY KEY,
-        #       whoop_user_id INTEGER,
-        #       event_type TEXT NOT NULL,
-        #       event_body TEXT NOT NULL,
-        #       status TEXT NOT NULL DEFAULT 'pending',
-        #       attempt_count INTEGER NOT NULL DEFAULT 0,
-        #       created_at TEXT NOT NULL,
-        #       processed_at TEXT
-        #   )
-
-        # Expected v5 DDL (same but whoop_user_id NOT NULL)
+        # Expected v5 DDL (same as v4 but whoop_user_id NOT NULL)
         expected_v5_ddl_pattern = """CREATE TABLE webhook_events (
     trace_id TEXT NOT NULL PRIMARY KEY,
     whoop_user_id INTEGER NOT NULL,
@@ -389,18 +340,13 @@ def test_migration_v5_schema_matches_v4_except_not_null() -> None:
 
 # Test 6: No regression - export and erasure still work for normal rows
 def test_migration_v5_export_and_erasure_unchanged_for_normal_rows() -> None:
-    """After migration to v5, export_member_data and erase_member_data
-    should still work correctly for normal (non-NULL) webhook_events rows.
-
-    Tests that the migration did not break existing export/erasure functionality.
-    """
+    """export_member_data and erase_member_data still work for normal rows after v5."""
     conn = open_store(":memory:")
 
     try:
         member_id = 900001
 
-        # Insert some webhook events using the store function
-        # (using direct SQL since insert_webhook_event may be under test too)
+        # Insert via direct SQL since insert_webhook_event may itself be under test
         conn.execute(
             """
             INSERT INTO webhook_events (
@@ -466,11 +412,7 @@ def test_migration_v5_export_and_erasure_unchanged_for_normal_rows() -> None:
 
 # Test 7: Re-running migration is safe
 def test_migration_v5_is_idempotent_and_handles_leftover_temp_table() -> None:
-    """Re-running _migrate on an already-v5 store is a no-op.
-    A leftover temp table from an aborted run does not block a retry.
-
-    This ensures the migration can be safely retried without corruption.
-    """
+    """Re-running the v5 migration is a no-op; a leftover temp table doesn't block retry."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -490,12 +432,7 @@ def test_migration_v5_is_idempotent_and_handles_leftover_temp_table() -> None:
         )
         conn.close()
 
-        # Now the case the `DROP TABLE IF EXISTS` in _SCHEMA_V5 exists for: a
-        # leftover `webhook_events_old` from a run that aborted mid-rebuild.
-        # This has to be set up on a **v4** store, because on an already-v5
-        # store migration 5 never runs and the guard is never reached -- and
-        # it has to use the migration's real temp-table name, or it collides
-        # with nothing and proves nothing.
+        # Sets up a leftover webhook_events_old on a v4 store to test the DROP TABLE guard.
         v4_path = f"{tmpdir}/leftover.db"
         raw = sqlite3.connect(v4_path)
         for version in range(1, 5):
@@ -531,16 +468,7 @@ def test_migration_v5_is_idempotent_and_handles_leftover_temp_table() -> None:
 
 # Test 8: Function signature tightening - insert_webhook_event parameter is int
 def test_insert_webhook_event_signature_requires_int_not_optional() -> None:
-    """Verify that insert_webhook_event's whoop_user_id parameter annotation
-    is now `int`, not `int | None`, so mypy can catch attempts to pass None.
-
-    store.py has `from __future__ import annotations` (PEP 563), so raw
-    `inspect.signature(...).parameters[...].annotation` is always the
-    unevaluated string `"int"` / `"int | None"` -- comparing it to the
-    actual `int` type would never hold regardless of the real signature.
-    `typing.get_type_hints` resolves the string against the function's
-    module globals, giving back the real evaluated type.
-    """
+    """whoop_user_id annotation is int, not int | None, per typing.get_type_hints."""
     hints = typing.get_type_hints(insert_webhook_event)
     annotation = hints["whoop_user_id"]
 

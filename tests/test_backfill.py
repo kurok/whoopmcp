@@ -1,21 +1,4 @@
-"""Tests for the resumable, throttled history backfill (issue #14).
-
-Written ahead of the implementation. The contract under test:
-
-- ``whoopmcp.backfill.run_backfill(conn, client, config, whoop_user_id)``
-  walks every collection (recoveries, sleeps, cycles, workouts) newest-first
-  via the WHOOP API's own ``nextToken`` cursor, upserts every record through
-  the store, and checkpoints into ``sync_state`` only after a page has been
-  fully committed -- so an interrupted run resumes exactly where it stopped
-  and never re-requests an already-committed page.
-- Every page fetch goes through the REAL RateLimiter at
-  ``RequestPriority.BACKFILL``, so an interactive request is never starved
-  behind queued backfill pages and two concurrent backfills share one budget.
-- The whole thing is gated on ``Config.cache_enabled`` (the resolved-blocker
-  decision): ``BackfillDisabledError`` before any network or store touch.
-
-Every HTTP call is mocked with respx; the real WHOOP API is never called.
-"""
+"""Tests for the resumable, throttled history backfill (issue #14)."""
 
 from __future__ import annotations
 
@@ -64,12 +47,7 @@ EMPTY_PAGE: dict[str, Any] = {"records": [], "next_token": None}
 
 
 class FakeClock:
-    """A controllable clock for testing rate-limit logic without real sleeps.
-
-    Same shape as test_client.py's helper: ``.now`` has the
-    ``Callable[[], float]`` signature RateLimiter/WhoopClient expect and
-    ``.advance()`` moves it forward instantly.
-    """
+    """A controllable clock for testing rate-limit logic without real sleeps."""
 
     def __init__(self, start: float = 0.0) -> None:
         self._now = start
@@ -105,11 +83,7 @@ def make_auth(config: Config) -> Authenticator:
 
 
 def make_record(entity: str, n: int) -> dict[str, Any]:
-    """One WHOOP record acceptable to the entity's real store upsert.
-
-    Recoveries carry no id of their own in the v2 API -- ``upsert_recovery``
-    keys on ``record["cycle_id"]``; every other entity keys on ``record["id"]``.
-    """
+    """One WHOOP record acceptable to the entity's real store upsert."""
     if entity == "recoveries":
         return {"cycle_id": n, "created_at": "2026-01-01T00:00:00Z", "score_state": "SCORED"}
     return {"id": n, "start": "2026-01-01T00:00:00Z", "score_state": "SCORED"}

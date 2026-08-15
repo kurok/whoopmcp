@@ -1,36 +1,8 @@
-"""Prometheus exposition for issue #31: sync lag, webhook health, rate
-budget, token failures.
+"""Prometheus exposition (#31): sync lag, webhook health, rate budget, token failures.
 
-Once other people depend on this server, the failures that matter are
-silent: a member's sync stops, webhooks stop arriving, a refresh token dies
--- none of these raise anywhere a human is watching until someone asks a
-question and gets a confidently stale answer. This module is the counter
-and gauge state those failures move, plus the hand-rolled renderer that
-turns it into the standard text exposition format (no ``prometheus_client``
-dependency -- the metric set is small and fixed, and the only labels are an
-opaque member reference or a closed, fixed vocabulary, so escaping needs are
-trivial).
-
-Boundary: this module owns two things and nothing else -- the process-local
-counter/gauge state, and turning it (plus a store connection) into
-exposition text. It must never import ``server.py``; ``server.py`` imports
-this module to serve ``/metrics``, and a reverse import would make that a
-cycle. It has no knowledge of routes, auth, or HTTP at all.
-
-Member labels (``member_ref``) are a keyed HMAC-SHA256 of the WHOOP user id,
-truncated -- never the raw id, an email, or an unsalted hash (WHOOP ids are
-modest integers, so an unsalted digest is reversible by enumeration in
-seconds). If ``Config.metrics_member_salt`` is unset, every per-member
-series is withheld entirely rather than falling back to a weaker id --
-health data in a metric label is a real leak, not a cardinality nuisance.
-
-Multi-worker caveat (documented, not solved -- see
-``server.create_streamable_http_app``'s own docstring for the analogous
-token-refresh limitation): every counter and the rate-budget gauge here are
-process-local module state. Under streamable-http with more than one
-uvicorn worker, each process has its own copy, and a single scrape only ever
-sees whichever worker happened to answer it. Building cross-process
-aggregation is out of scope for this issue.
+Never import server.py (would cycle). member_ref is keyed HMAC-SHA256 of the WHOOP user id,
+truncated, never raw/unsalted (ids are enumerable) -- withheld if metrics_member_salt unset.
+Counters/gauges are process-local; a multi-worker scrape sees only one worker's copy.
 """
 
 from __future__ import annotations
@@ -55,29 +27,21 @@ TOKEN_REFRESH_FAILURE_CAUSES: tuple[str, ...] = (
 )
 
 #: Fixed vocabulary for `whoopmcp_webhook_signature_failures_total{reason}`.
-#: Derived at the rejection site in `webhooks.py` from header presence and
-#: the timestamp-skew check only -- never from the signing secret or the
-#: body, so the reason breakdown reveals nothing a forger could use.
+#: From header presence/timestamp skew only -- never the secret or body (no leak to a forger).
 WEBHOOK_REJECTION_REASONS: tuple[str, ...] = (
     "missing_header",
     "stale_timestamp",
     "bad_signature",
 )
 
-#: Hex characters of the keyed HMAC kept in `member_ref`. Long enough that
-#: truncation doesn't meaningfully weaken the HMAC, short enough to keep
-#: exposition text readable.
+#: Hex chars kept from the keyed HMAC in `member_ref` (long enough not to weaken it).
 _MEMBER_REF_LENGTH = 16
 
 Labels = dict[str, str]
 _CoverageFn = Callable[[sqlite3.Connection, int], tuple[str | None, str | None]]
 
 #: (entity label, store accessor) pairs behind `whoopmcp_data_freshness_seconds`.
-#: `get_recovery_coverage` returns `(MIN(created_at), MAX(created_at))`;
-#: the other three return `(MIN(start), MAX(end))` over a *nullable* `end`,
-#: so for sleep/cycle/workout the "latest" is the newest *completed* record
-#: -- an in-progress one, `end IS NULL`, is invisible to `MAX(end)`. Kept in
-#: the HELP text for `whoopmcp_data_freshness_seconds`, not just here.
+#: sleep/cycle/workout use nullable `end`, so an in-progress record is invisible to MAX(end).
 _FRESHNESS_SOURCES: tuple[tuple[str, _CoverageFn], ...] = (
     ("recovery", store.get_recovery_coverage),
     ("sleep", store.get_sleep_coverage),
@@ -119,9 +83,7 @@ _counters = _Counters()
 def reset() -> None:
     """Drop every process-local counter/gauge back to its initial state.
 
-    For test isolation -- this module's state is process-local by design
-    (see the module docstring's multi-worker caveat), so nothing here is
-    reset automatically between requests or between test cases.
+    For test isolation -- nothing here resets automatically between requests/tests.
     """
     global _counters
     _counters = _Counters()
@@ -138,8 +100,7 @@ def record_webhook_accepted() -> None:
 
 
 def record_rate_limited() -> None:
-    """Called once per retried 429, from `client.py`'s retry loop body. Noise,
-    not an incident -- see `record_rate_limit_exhausted` for that."""
+    """Called per retried 429 from `client.py`'s retry loop -- noise, not an incident."""
     _counters.rate_limited += 1
 
 
@@ -149,11 +110,8 @@ def record_rate_limit_exhausted() -> None:
 
 
 def record_token_refresh_failure(cause: str) -> None:
-    """Called from `auth.py`'s `_do_refresh` failure sites only -- never from
-    the shared `_raise_for_token_error` (`exchange_code` also uses it, and a
-    counter there would conflate first-login failures with refresh
-    failures), and never from `access_token`'s "no stored credentials"
-    `GrantAlreadyGoneError` (a fresh install, not a revoked grant)."""
+    """Called from `auth.py`'s `_do_refresh` failure sites only -- never `_raise_for_token_error`
+    (would conflate login failures) or a fresh-install `GrantAlreadyGoneError`."""
     _counters.refresh_failures[cause] = _counters.refresh_failures.get(cause, 0) + 1
 
 
@@ -166,25 +124,17 @@ def publish_rate_budget(
 ) -> None:
     """How the live `RateLimiter` hands its budget to the exporter.
 
-    A `custom_route` handler cannot reach `AppContext` and therefore cannot
-    reach the `RateLimiter` `lifespan()` builds (see
-    `server._check_token_store_reachable`'s docstring for why no
-    `custom_route` handler can reach the lifespan context at all) -- so the
-    limiter pushes its budget into this module's process-local state at the
-    end of `acquire()` and `reconcile()`, rather than the exporter pulling
-    from a limiter it has no way to reach.
+    `custom_route` handlers can't reach `AppContext`/the lifespan `RateLimiter`, so the limiter
+    pushes its budget here at the end of `acquire()`/`reconcile()` instead of being pulled.
     """
     _counters.rate_budget = RateBudget(minute_remaining, minute_limit, day_remaining, day_limit)
 
 
 def member_ref(whoop_user_id: int, salt: str) -> str:
-    """The only member-derived string that may ever appear in exposition
-    output: a truncated, keyed HMAC-SHA256 of the id.
+    """The only member-derived string in exposition output: truncated, keyed HMAC-SHA256 of the id.
 
-    Keyed, not a plain digest: WHOOP user ids are modest integers, so an
-    unsalted hash is reversible by enumeration in seconds -- not opaque, and
-    exactly the leak issue #31 forbids. Stable for a given (id, salt) pair,
-    so a per-member time series has continuity to alert a baseline against.
+    Keyed, not a plain digest -- WHOOP ids are small ints, so unsalted hashing is reversible by
+    enumeration in seconds (the leak #31 forbids). Stable per (id, salt) for time-series continuity.
     """
     digest = hmac.new(salt.encode("utf-8"), str(whoop_user_id).encode("utf-8"), hashlib.sha256)
     return digest.hexdigest()[:_MEMBER_REF_LENGTH]
@@ -198,12 +148,8 @@ def _parse_iso(value: str) -> datetime:
 def _age_seconds(now: datetime, timestamp: str) -> float:
     """Seconds between `timestamp` and `now`, floored at 0.
 
-    A negative value here would only ever mean clock skew between the
-    caller's `now` and whatever wrote `timestamp` (e.g. a delivery recorded
-    by the real wall clock, rendered against a caller-supplied `now`) --
-    never a real "delivered in the future". An "age" gauge that goes
-    negative reads as broken instrumentation, so it is clamped rather than
-    surfaced as-is.
+    A negative value means clock skew, never "delivered in the future" -- clamped rather than
+    surfaced as a broken-looking negative gauge.
     """
     return max(0.0, (now - _parse_iso(timestamp)).total_seconds())
 
@@ -243,17 +189,12 @@ class _Renderer:
 
 
 def render(conn: sqlite3.Connection, config: Config, *, now: datetime | None = None) -> str:
-    """The whole exposition text: every counter/gauge this process holds,
-    plus the store-backed gauges read fresh from `conn`.
+    """The whole exposition text: every counter/gauge this process holds, plus store-backed
+    gauges read fresh from `conn`.
 
-    Fixed-vocabulary counters and the rate-budget gauges are always
-    exported, pre-initialised to 0/their current value, even from an empty
-    store -- so `rate()` has a zero baseline to compare the very first
-    failure against. The per-member store-backed gauges are the deliberate
-    exception: a series is only emitted for a member/entity that actually
-    has a record, because a 0-valued "seconds since last delivery" would
-    read as "just delivered", exactly the healthy-looking silence this issue
-    exists to catch.
+    Fixed-vocab counters/rate-budget gauges always export (pre-initialised to 0) for a zero
+    baseline. Per-member gauges are the exception: omitted with no record, since a 0 there
+    would misread as "just delivered".
     """
     current = now if now is not None else datetime.now(UTC)
     renderer = _Renderer()
@@ -306,10 +247,7 @@ def render(conn: sqlite3.Connection, config: Config, *, now: datetime | None = N
 
     budget = _counters.rate_budget
     if budget is None:
-        # No RateLimiter has published a snapshot yet (nothing has been
-        # acquired or reconciled in this process) -- report full local
-        # budget from configuration rather than omitting the series, so it
-        # still has the zero-history baseline every always-on metric needs.
+        # No snapshot published yet -- fall back to configured budget for a zero baseline.
         minute_remaining = minute_limit = config.rate_limit_per_minute
         day_remaining = day_limit = config.rate_limit_per_day
     else:

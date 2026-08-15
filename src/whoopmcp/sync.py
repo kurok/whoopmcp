@@ -1,48 +1,7 @@
-"""Incremental sync from an ``updated_at`` high-water mark (#15).
-
-Once #14's backfill has a user's full history, keeping it current should
-cost almost nothing. ``run_sync`` walks the same four paginated collections
-backfill does (recoveries, sleeps, cycles, workouts) -- reusing
-``backfill.BACKFILL_ENTITIES`` rather than redefining an identical spec --
-but forward from each collection's own high-water ``updated_at`` mark instead
-of from the beginning of history. In steady state that costs exactly one
-request per collection: the page WHOOP returns is empty, ``next_token`` is
-``None``, and nothing is written.
-
-``updated_at``, deliberately not ``created_at``: recoveries and sleeps are
-rescored after the fact, and a ``created_at`` cursor would silently miss
-every correction -- see the issue's own Notes.
-
-**Coexistence with #14's backfill.** ``sync_state`` (``store.py``) is already
-owned by backfill: its row, keyed on the bare entity name (e.g.
-``"recoveries"``), holds WHOOP's own opaque ``nextToken`` as ``cursor`` while
-``outcome == "in_progress"``, and ``None``/``outcome == "complete"`` once a
-one-shot import finishes. This module's progress is a different shape
-entirely -- a JSON blob (``since``/``next_token``/``high_water_seen``/
-``previous_mark``) mid-run, a bare ISO-8601 high-water mark once complete --
-and must never be written to, or read from, that same row: doing
-so would have backfill resume a stalled import using sync's high-water mark
-as if it were WHOOP's cursor, or have sync treat backfill's terminal
-``cursor=None``/``outcome="complete"`` as "nothing synced yet". The fix is a
-distinct entity-key namespace, ``_incremental_entity_key`` (``f"{name}:incremental"``,
-e.g. ``"recoveries:incremental"``) -- zero schema change, since
-``get_sync_state``/``set_sync_state`` already key purely on the free-form
-``entity`` TEXT column. ``backfill.py`` is untouched by this module entirely.
-
-Every page fetch runs at ``RequestPriority.INTERACTIVE`` (the default): unlike
-backfill, a sync run is short (bounded by "what changed recently", not "all
-of history") and is either triggered by a user waiting on ``whoop_sync`` or
-would, once a scheduler exists (there is none yet -- #35), be a routine
-foreground refresh rather than a background bulk import. There is no strong
-reason found to prefer ``RequestPriority.BACKFILL`` here.
-
-Gated on ``Config.cache_enabled`` exactly like ``backfill.BackfillDisabledError``:
-PRIVACY.md promises the persistent store is off by default, and this module
-is the second bulk writer (after backfill) that would otherwise break that
-promise. Unlike backfill, ``whoop_sync`` (the MCP tool wrapper in
-``server.py``) is sanctioned for the tool surface -- it is non-destructive,
-upserts only -- so its wrapper catches ``SyncDisabledError`` and returns a
-plain, non-error tool result rather than letting it propagate.
+"""Incremental sync from an `updated_at` high-water mark (#15). Walks
+backfill's four collections forward from each one's own mark (not
+`created_at` -- records get rescored), under its own `sync_state` key
+namespace (`f"{name}:incremental"`) so it never collides with backfill's row.
 """
 
 from __future__ import annotations
@@ -57,21 +16,14 @@ from whoopmcp.client import MAX_PAGE_SIZE, Page, RequestPriority, WhoopAPIError,
 from whoopmcp.config import Config
 from whoopmcp.store import get_sync_state, set_sync_state
 
-#: Overlap margin subtracted from the previous high-water mark before every
-#: request -- exact-boundary comparisons eventually drop a record to clock
-#: skew (the issue's own Notes), and upsert idempotency makes re-fetching a
-#: minute's worth of already-seen records free to absorb.
+#: Overlap subtracted from the prior high-water mark before each request --
+#: exact-boundary comparison can drop a record to clock skew; idempotent
+#: upsert makes re-fetching a minute of already-seen records free.
 _OVERLAP_SECONDS = 60.0
 
-#: The concrete ``since`` bound a first-ever sync (no prior high-water mark,
-#: no in-progress resume) records and requests with. "Walk full history" --
-#: the resolved answer for a never-synced entity, since idempotent upsert
-#: makes doing so safe even without backfill having run first -- still needs
-#: a real value here, not a bare ``None``: an interrupted first run must
-#: resume with the exact same ``since`` its first page used (see the module
-#: docstring's cursor shape), and an epoch-old lower bound is functionally
-#: unbounded against any real WHOOP record while staying a concrete,
-#: round-trippable string.
+#: `since` bound for a first-ever sync (no prior mark): idempotent upsert
+#: makes a full-history walk safe, and a concrete epoch value (not `None`)
+#: lets an interrupted first run resume with the exact same bound.
 _EPOCH_SINCE = "1970-01-01T00:00:00+00:00"
 
 
@@ -81,36 +33,24 @@ class SyncDisabledError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class EntitySyncResult:
-    """One entity's outcome from a single ``run_sync`` call."""
+    """One entity's outcome from a single `run_sync` call."""
 
-    #: Records upserted during this call (0 in the steady-state case).
+    #: Records upserted this call (0 in steady state).
     count: int
-    #: The high-water ``updated_at`` mark now on record for this entity, or
-    #: ``None`` if nothing has ever been synced for it.
+    #: High-water `updated_at` mark on record, or None if never synced.
     high_water_mark: str | None
-    #: Records stored but refused as mark candidates -- unparseable, or dated
-    #: implausibly far ahead (#186). Reported because a run that refused
-    #: something must not read as a clean one: both otherwise show the same
-    #: ``count`` and the same unchanged cursor.
+    #: Records stored but refused as mark candidates -- unparseable or
+    #: implausibly future-dated (#186); distinguishes a refusal from a clean run.
     skipped_implausible: int = 0
-    #: Why this entity did not sync, or ``None`` if it did (#187). Set means
-    #: nothing was fetched and this entity's stored cursor is untouched, so the
-    #: next run retries it from exactly where it was.
+    #: Why this entity didn't sync, or None if it did (#187); cursor is untouched.
     error: str | None = None
-    #: Whether this run abandoned a stored resume ``next_token`` WHOOP rejected
-    #: and re-walked from its own ``since`` instead (#201). Reported for the
-    #: same reason ``skipped_implausible`` is: a run that recovered from a dead
-    #: cursor must not read as an ordinary clean one.
+    #: Whether a stale stored resume token was dropped and re-walked (#201).
     dropped_stale_cursor: bool = False
 
 
 def _incremental_entity_key(name: str) -> str:
-    """The ``sync_state`` entity key this module owns for collection ``name``.
-
-    Deliberately distinct from the bare entity name (``name`` itself), which
-    ``backfill.py`` owns -- see this module's own docstring for why the two
-    must never collide.
-    """
+    """The `sync_state` key this module owns for collection `name` --
+    deliberately distinct from the bare name, which `backfill.py` owns."""
     return f"{name}:incremental"
 
 
@@ -119,36 +59,19 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-#: How far ahead of local time a record's ``updated_at`` may sit and still be
-#: trusted to advance the high-water mark.
-#:
-#: Some skew is normal -- WHOOP's clock and this host's are independent, and an
-#: NTP-synced pair is within seconds -- so the bound cannot be "not after now"
-#: without rejecting perfectly good records. Five minutes is far outside any
-#: real skew while being far inside any value that could strand the cursor: a
-#: mark five minutes ahead costs at most those few minutes of forward progress
-#: on the next run, whereas a mark set to 2099 costs everything, forever (#186).
-#:
-#: The number is a judgement, not a derivation. Raising it widens the window in
-#: which a bogus timestamp can still poison the mark; lowering it risks refusing
-#: legitimate records on a host whose clock drifts.
+#: How far ahead of local time an `updated_at` may sit and still advance the
+#: high-water mark. Some skew is normal (independent clocks); 5 min is wide
+#: enough to allow it but tight enough that a bogus far-future value (#186)
+#: can't poison the mark -- costs a few minutes of progress, not everything.
 _MAX_CLOCK_SKEW_SECONDS = 300
 
 
 def _is_plausible_mark(value: str, *, now: datetime) -> bool:
-    """Whether ``value`` may advance the high-water mark.
+    """Whether `value` may advance the high-water mark.
 
-    Two ways to fail. It may not parse at all -- the mark is whatever string a
-    record carried, and nothing validates that before it is stored -- and the
-    parse is guarded rather than allowed to raise, because raising here would
-    turn a malformed record into a crash mid-run, which is strictly worse than
-    the stale mark this function exists to prevent. It may also sit implausibly
-    far in the future, which is the poisoning case: once such a value becomes
-    the mark, every later run asks WHOOP for a window starting in the future,
-    gets nothing, and writes the same value back -- reporting success forever
-    while syncing nothing.
-
-    A refused record is still stored. Only its claim on the cursor is denied.
+    Fails if unparseable (guarded, never raises) or implausibly future-dated --
+    a poisoned mark would make every later run request a future window forever.
+    A refused record is still stored; only its claim on the cursor is denied.
     """
     try:
         parsed = datetime.fromisoformat(value)
@@ -160,27 +83,12 @@ def _is_plausible_mark(value: str, *, now: datetime) -> bool:
 
 
 def _usable_resume_mark(mark: str, *, now: datetime) -> str | None:
-    """``mark`` if it is usable as a starting point, otherwise ``None``.
+    """`mark` if usable, else None -- the read-side recovery half of #186.
 
-    This is the recovery half of #186. Refusing to *write* a poisoned mark
-    protects installations that have not been bitten yet; it does nothing for a
-    database that already holds one, and such a cursor never revises itself --
-    every run starts in the future, finds nothing, and writes the same value
-    back. Discarding it on read is what lets an already-poisoned installation
-    heal on its next run.
-
-    ``None``, not the present, because a poisoned mark tells us nothing about
-    when it stopped being true, so clamping to now would silently skip every
-    record that arrived while it was wrong. ``None`` means "no mark", which
-    sends the next run through ``_EPOCH_SINCE`` and re-walks the history --
-    lossless, and safe for exactly the reason the module docstring already gives
-    for a never-synced entity: the upserts are idempotent, so a full walk costs
-    requests rather than correctness.
-
-    It is also what the *write* side already does with this class of failure --
-    a run that cannot establish a mark leaves the cursor ``None`` and the next
-    run re-walks. Returning the present here would have given one bug two
-    contradictory recovery policies, the read side being the lossy one.
+    Discarding (not clamping to now) a poisoned mark on read is what lets an
+    already-poisoned installation heal: `None` re-walks from `_EPOCH_SINCE`,
+    lossless since upserts are idempotent. Clamping to now would silently skip
+    records that arrived while the mark was wrong.
     """
     if _is_plausible_mark(mark, now=now):
         return mark
@@ -188,12 +96,10 @@ def _usable_resume_mark(mark: str, *, now: datetime) -> str | None:
 
 
 def _apply_overlap(high_water_mark: str, overlap_seconds: float) -> str:
-    """``high_water_mark`` shifted back by ``overlap_seconds``, same ISO 8601 shape.
+    """`high_water_mark` shifted back by `overlap_seconds`, same ISO 8601 shape.
 
-    ``datetime.fromisoformat`` accepts both the trailing ``Z`` WHOOP's own
-    payloads use and the ``+00:00`` offset this store's own ``_now()``
-    writes (supported directly since Python 3.11), so either shape a stored
-    mark could be in round-trips correctly.
+    `fromisoformat` accepts both WHOOP's trailing `Z` and this store's `+00:00`
+    (Python 3.11+), so either stored shape round-trips correctly.
     """
     parsed = datetime.fromisoformat(high_water_mark)
     return (parsed - timedelta(seconds=overlap_seconds)).isoformat()
@@ -205,14 +111,12 @@ async def run_sync(
     config: Config,
     whoop_user_id: int,
 ) -> dict[str, EntitySyncResult]:
-    """Sync ``whoop_user_id``'s recoveries, sleeps, cycles and workouts forward.
+    """Sync recoveries, sleeps, cycles and workouts forward.
 
-    Raises ``SyncDisabledError`` -- before touching the network or the store
-    -- unless ``config.cache_enabled`` is set, exactly mirroring
-    ``backfill.BackfillDisabledError``. Any fetch or upsert failure
-    propagates without advancing the interrupted entity's high-water mark,
-    so a re-run resumes from the last fully-committed page rather than
-    skipping it.
+    Raises `SyncDisabledError` before touching network/store unless
+    `config.cache_enabled` is set. A fetch/upsert failure propagates without
+    advancing that entity's mark, so a re-run resumes from the last committed
+    page.
     """
     if not config.cache_enabled:
         raise SyncDisabledError(
@@ -224,20 +128,11 @@ async def run_sync(
         try:
             results[spec.name] = await _sync_entity(conn, client, whoop_user_id, spec)
         except Exception as exc:
-            # Isolated per entity (#187). The four are independent walks over
-            # independent tables, so one failing says nothing about the others:
-            # before this, a single bad entity aborted the loop and denied sync
-            # to every entity after it in `BACKFILL_ENTITIES`, making the blast
-            # radius an accident of ordering rather than of the fault.
-            #
-            # Broad on purpose. What must not happen is a *new* failure mode
-            # taking down three healthy entities because it was not on a list,
-            # and a per-entity fault is data-scoped by construction -- the
-            # failing entity's own cursor is left untouched, so its next run
-            # retries from exactly where it was. `asyncio.CancelledError` is a
-            # BaseException and so still propagates: a cancelled run is not a
-            # partial success, and pretending otherwise would report a sync that
-            # never finished as one that did.
+            # Isolated per entity (#187): one failing must not deny sync to
+            # entities after it in the list. Broad on purpose -- an unlisted
+            # failure mode must not take down healthy entities either.
+            # `CancelledError` is a BaseException and still propagates: a
+            # cancelled run is not a partial success.
             results[spec.name] = EntitySyncResult(
                 count=0, high_water_mark=None, error=f"{type(exc).__name__}: {exc}"
             )
@@ -252,45 +147,30 @@ async def _sync_entity(
     *,
     overlap_seconds: float = _OVERLAP_SECONDS,
 ) -> EntitySyncResult:
-    """Walk one collection forward from its high-water ``updated_at`` mark.
+    """Walk one collection forward from its high-water `updated_at` mark.
 
-    Per page: fetch (resuming from any in-progress cursor), upsert every
-    record, track the run's own maximum observed ``updated_at``, and only
-    then commit ``sync_state`` -- as a JSON blob (``since``/``next_token``/
-    ``high_water_seen``) while more pages remain, or a bare ISO-8601 mark
-    once the walk is exhausted. A failure mid-page leaves the previous
-    checkpoint in place, so the interrupted page is re-fetched (never
-    skipped) on the next run.
+    Per page: fetch, upsert, track max observed `updated_at`, then commit
+    `sync_state` (JSON blob mid-walk, bare ISO mark once exhausted). A failure
+    mid-page leaves the prior checkpoint in place, so it is re-fetched next run.
     """
     key = _incremental_entity_key(spec.name)
     state = get_sync_state(conn, whoop_user_id, key)
-    # One reading of the clock for the whole run: every plausibility check below
-    # is then made against the same instant, so two records in one page cannot
-    # be judged against different `now`s.
+    # One clock reading for the whole run, so all plausibility checks use the
+    # same `now`.
     now = datetime.now(UTC)
 
     if state is not None and state["outcome"] == "in_progress":
-        # Resume verbatim: the same `since` bound this run started with, and
-        # the max `updated_at` already committed by an earlier page of this
-        # same run -- never re-derived from a (possibly stale) prior mark.
-        #
-        # `fallback_mark` is NOT `high_water_seen`: a run that so far has
-        # only committed empty-but-paginated pages has `high_water_seen ==
-        # None` mid-run, and a crash right there must not let the eventual
-        # resumed completion regress the ALREADY-ON-RECORD mark to `None`.
-        # `previous_mark` -- this run's starting point, before any page of
-        # it committed anything -- is carried through the JSON cursor
-        # itself for exactly this reason, rather than re-read from the
-        # (already overwritten) prior `sync_state` row.
+        # Resume verbatim: same `since`, max `updated_at` already committed.
+        # `fallback_mark` != `high_water_seen`: an empty-pages-so-far run has
+        # `high_water_seen == None` mid-run, so `previous_mark` (this run's own
+        # starting mark) is carried in the cursor to avoid regressing to None.
         resume = json.loads(state["cursor"])
         since: str | None = resume["since"]
         next_token: str | None = resume["next_token"]
         high_water_seen: str | None = resume["high_water_seen"]
         fallback_mark: str | None = resume["previous_mark"]
-        # An `in_progress` row can carry a poisoned value just as a `complete`
-        # one can, and #186 asks for recovery on the *next* run. Clamping only
-        # the fresh branch left a resumed run requesting a future window and
-        # re-persisting the poison, so recovery took two runs instead of one.
+        # An in_progress row can be poisoned too (#186); clamp here too or a
+        # resumed run re-persists the poison for another cycle.
         if since is not None and not _is_plausible_mark(since, now=now):
             since = _EPOCH_SINCE
         if high_water_seen is not None and not _is_plausible_mark(high_water_seen, now=now):
@@ -300,8 +180,7 @@ async def _sync_entity(
     else:
         previous_mark = state["cursor"] if state is not None else None
         if previous_mark is not None:
-            # Heal a cursor that is already poisoned on disk (#186), before it
-            # is used to build this run's window.
+            # Heal a poisoned cursor already on disk (#186) before use.
             previous_mark = _usable_resume_mark(previous_mark, now=now)
         since = (
             _apply_overlap(previous_mark, overlap_seconds)
@@ -310,19 +189,15 @@ async def _sync_entity(
         )
         next_token = None
         high_water_seen = None
-        # A no-op run (nothing new since `previous_mark`) must not regress
-        # the stored mark back to `None` -- fall back to what was already
-        # on record.
+        # A no-op run must not regress the stored mark to None.
         fallback_mark = previous_mark
 
     fetch = getattr(client, spec.list_method)
     count = 0
     skipped_implausible = 0
     dropped_stale_cursor = False
-    # True only while the token in play is the STORED one -- i.e. on the first
-    # fetch of a resumed run. Every later token was minted by WHOOP moments
-    # earlier in this same run, and a failure there keeps #187's semantics
-    # (report, leave the checkpoint, retry verbatim next run).
+    # True only for the first fetch of a resumed run (the STORED token); later
+    # tokens are minted by WHOOP this run and keep #187's retry semantics.
     token_is_stored_resume = next_token is not None
     while True:
         try:
@@ -333,22 +208,11 @@ async def _sync_entity(
                 priority=RequestPriority.INTERACTIVE,
             )
         except WhoopAPIError as exc:
-            # The healing half of #201, the cursor counterpart of #186's mark
-            # recovery. A stored resume token is the one piece of resume state
-            # whose validity this server does not control: an interrupted run
-            # can sit idle for days before the next whoop_sync, and a token
-            # WHOOP has expired (or stopped understanding) is a persistent
-            # 4xx. Leaving the checkpoint untouched -- the right call for a
-            # transient fault -- replays the same dead token verbatim on
-            # every later run, forever, with no CLI to clear it: the entity's
-            # sync is wedged until someone hand-edits sqlite. So a 4xx on
-            # exactly that first, stored-token fetch drops the token and
-            # re-walks from this run's own `since` (already clamped plausible
-            # above), which is lossless for the reason the module docstring
-            # gives for a never-synced entity: idempotent upserts make a
-            # re-walk cost requests, not correctness. A 5xx is WHOOP falling
-            # over, not a verdict on the token -- still raised, still retried
-            # verbatim next run.
+            # Cursor-recovery half of #201 (counterpart to #186's mark
+            # recovery): a stored resume token WHOOP now 4xxs on would
+            # otherwise wedge this entity forever with no way to clear it.
+            # Drop it and re-walk from `since` (lossless: upserts are
+            # idempotent). A 5xx is not a verdict on the token -- still raised.
             if token_is_stored_resume and 400 <= exc.status < 500:
                 token_is_stored_resume = False
                 next_token = None
@@ -362,15 +226,10 @@ async def _sync_entity(
             updated_at = record.get("updated_at")
             if updated_at is not None:
                 updated_at = str(updated_at)
-                # Checked after the upsert above, deliberately: the record is
-                # the member's data and is kept regardless. What is refused is
-                # only its claim on the cursor.
-                # Plausibility parses; the max below compares strings. They
-                # can pick different records when offsets or precision differ,
-                # but only ever a *chronologically earlier* one -- so the mark
-                # can lag and re-fetch, never overshoot. And since the check
-                # runs per record before the string enters the max, an
-                # implausible value cannot reach it either way.
+                # Checked after upsert: the record is kept regardless, only its
+                # cursor claim is refused. String-max vs parsed-plausibility can
+                # pick different records on format mismatch, but only ever a
+                # chronologically earlier one -- the mark can lag, never overshoot.
                 if not _is_plausible_mark(updated_at, now=now):
                     skipped_implausible += 1
                 elif high_water_seen is None or updated_at > high_water_seen:

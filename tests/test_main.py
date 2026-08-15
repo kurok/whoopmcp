@@ -551,15 +551,7 @@ _TOKEN_RESPONSE = {
 
 
 def _pin_login_state(monkeypatch: pytest.MonkeyPatch, state: str = _STATE) -> str:
-    """Pin the state ``start_login()`` generates so a test can paste it back.
-
-    ``build_authorize_url`` mints a fresh ``secrets.token_urlsafe(32)`` per
-    login, and the value lives only on the ``Authenticator`` instance the
-    handler builds (``_pending_state``) -- a test has no other way to know
-    what to echo. Patched at the module attribute the handler's own
-    ``start_login`` looks up at call time, and it still delegates to the real
-    implementation, so the URL under test is the real URL.
-    """
+    """Pin the state ``start_login()`` generates so a test can paste it back."""
     from whoopmcp import auth as auth_module
 
     real_build_authorize_url = auth_module.build_authorize_url
@@ -572,14 +564,7 @@ def _pin_login_state(monkeypatch: pytest.MonkeyPatch, state: str = _STATE) -> st
 
 
 class _Prompts:
-    """A ``builtins.input`` stand-in that answers each prompt from a queue.
-
-    Positional, not prompt-text-matching: D2 puts the prompt on stderr, so
-    ``input()`` may well be called with no argument at all and there is no
-    text to match on. Running out of answers is an assertion failure rather
-    than a hang -- a test that blocks on real stdin is the one outcome this
-    class exists to make impossible.
-    """
+    """A ``builtins."""
 
     def __init__(self, *answers: str) -> None:
         self._answers = list(answers)
@@ -595,14 +580,7 @@ class _Prompts:
 
 
 def _authorize_url_removed(captured: pytest.CaptureResult[str]) -> str:
-    """stdout+stderr with the printed authorize URL masked out.
-
-    The authorize URL necessarily carries ``state`` as a query parameter --
-    that is the whole mechanism, and the user has to open it -- so D6's
-    "never echo the state" is asserted against everything *except* that one
-    URL. The code is asserted absent from the raw text, unmasked: nothing
-    can justify the code appearing anywhere.
-    """
+    """stdout+stderr with the printed authorize URL masked out."""
     return re.sub(re.escape(AUTHORIZE_URL) + r"\S*", "<authorize-url>", captured.out + captured.err)
 
 
@@ -693,15 +671,7 @@ def test_login_subcommand_prompts_separately_when_the_paste_parses_to_neither(
 def test_login_subcommand_never_exchanges_a_code_whose_state_does_not_match(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """D4, and the security-relevant assertion of this whole section.
-
-    A mismatched state is the signal that a third party may be feeding us
-    their own authorization code, so the code must never be spent at all.
-    The assertion is therefore the ABSENCE of the exchange -- zero hits on
-    the token route -- not the nonzero exit code: an implementation that
-    exchanged the code and then discarded the token would satisfy an
-    exit-code-only check while having already burned the code upstream.
-    """
+    """D4, and the security-relevant assertion of this whole section."""
     _set_required_env_and_state_dir(monkeypatch, tmp_path)
     _pin_login_state(monkeypatch)
     config = Config.from_env()
@@ -785,15 +755,7 @@ def test_main_dispatches_the_login_subcommand(
 def test_login_subcommand_never_echoes_the_code_or_the_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """D6, across a success path and a failure path.
-
-    An authorization code is a credential; keeping it out of places it does
-    not belong is the entire point of this subcommand, and terminal
-    scrollback and CI logs are two of those places. So neither value may
-    appear on stdout or stderr -- not in a success message, not inside an
-    error message, not in a log line. The state is checked against
-    everything except the authorize URL itself, which has to carry it.
-    """
+    """D6, across a success path and a failure path."""
     _set_required_env_and_state_dir(monkeypatch, tmp_path)
     _pin_login_state(monkeypatch)
     pasted = f"https://localhost:8443/callback?code={_CODE}&state={_STATE}"
