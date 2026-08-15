@@ -90,8 +90,13 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF", "S"]
 # S101 (assert) is the point of a test file, and its fixtures legitimately
 # assign literal tokens/secrets (S105/S106) that are never real credentials --
 # both are noise here but stay live for src/, where a hardcoded credential
-# would be a real finding.
-"tests/*" = ["S101", "S105", "S106"]
+# would be a real finding. S608 (string-built SQL) is likewise noise here and
+# only here: the tenancy tests deliberately construct hostile SQL literals to
+# prove the store rejects them, and explicit `+` concatenation of those
+# literals (the CodeQL-recommended replacement for implicit concatenation in
+# a list) is what trips it. It stays live for src/, where string-built SQL
+# against caller input would be a real finding.
+"tests/*" = ["S101", "S105", "S106", "S608"]
 
 [tool.mypy]
 python_version = "3.13"

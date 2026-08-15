@@ -780,7 +780,7 @@ def _soft_delete(conn: Any, table: str, whoop_user_id: int, resource_id: str) ->
     comment about avoiding a store getter/setter that "could itself filter
     member data" for this kind of test setup."""
     conn.execute(
-        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608
+        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",
         ("2026-08-05T00:00:00Z", whoop_user_id, resource_id),
     )
     conn.commit()

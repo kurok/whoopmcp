@@ -197,7 +197,7 @@ def _soft_delete(conn: Any, table: str, resource_id: str) -> None:
     own ``_soft_delete`` and tests/test_webhook_processing.py's rationale for
     not routing test setup through a store getter/setter."""
     conn.execute(
-        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",  # noqa: S608
+        f"UPDATE {table} SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",
         ("2026-08-09T00:00:00Z", WHOOP_USER_ID, resource_id),
     )
     conn.commit()
