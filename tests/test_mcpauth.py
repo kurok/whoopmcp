@@ -1154,8 +1154,21 @@ async def test_expiry_with_a_hostile_comparison_cannot_buy_acceptance(
     """
 
     class AlwaysNewer:
+        # The attack is __gt__ returning True; the other three exist only to
+        # make the ordering protocol complete (CodeQL py/incomplete-ordering)
+        # and stay consistent with the "always newer" story rather than
+        # weakening it.
         def __gt__(self, other: object) -> bool:
             return True
+
+        def __ge__(self, other: object) -> bool:
+            return True
+
+        def __lt__(self, other: object) -> bool:
+            return False
+
+        def __le__(self, other: object) -> bool:
+            return False
 
     token = AccessToken.model_construct(
         token="token-hostile-expiry",

@@ -400,7 +400,7 @@ def test_erase_member_data_deletes_rows_from_every_erasure_table(
 
     for table in sorted(store._ERASURE_TABLES):
         rows = store_conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608 -- table from a fixed internal frozenset, never user input
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_A,),
         ).fetchall()
         assert rows == [], f"erase_member_data left rows behind in {table}"
@@ -416,7 +416,7 @@ def test_erase_member_data_never_touches_another_members_rows(
 
     for table in sorted(store._ERASURE_TABLES):
         rows = store_conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_B,),
         ).fetchall()
         assert rows != [], (
@@ -515,7 +515,7 @@ def test_erase_member_subcommand_revokes_upstream_and_deletes_everything(
     conn = store_module.open_store(config.cache_path)
     for table in sorted(store_module._ERASURE_TABLES):
         rows = conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (42,),
         ).fetchall()
         assert rows == [], f"erase-member left rows behind in {table}"
@@ -618,7 +618,7 @@ def test_erase_member_subcommand_deletes_locally_when_refresh_hits_invalid_grant
     conn = store_module.open_store(config.cache_path)
     for table in sorted(store_module._ERASURE_TABLES):
         rows = conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (42,),
         ).fetchall()
         assert rows == [], f"erase-member left rows behind in {table} after invalid_grant"
@@ -668,12 +668,12 @@ def test_erase_member_subcommand_skips_revoke_for_an_unattributable_token(
     conn = store_module.open_store(config.cache_path)
     for table in sorted(store_module._ERASURE_TABLES):
         a_rows = conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_A,),
         ).fetchall()
         assert a_rows == [], f"erase-member left MEMBER_A rows behind in {table}"
         b_rows = conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_B,),
         ).fetchall()
         assert b_rows != [], f"erase-member for A wrongly removed B's rows in {table}"
@@ -723,7 +723,7 @@ def test_erase_member_subcommand_still_aborts_on_a_genuine_transport_failure(
     conn = store_module.open_store(config.cache_path)
     for table in sorted(store_module._ERASURE_TABLES):
         rows = conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (42,),
         ).fetchall()
         assert rows != [], f"a failed revoke must not erase {table}"
@@ -1664,7 +1664,7 @@ def test_erase_member_and_links_atomic_rolls_back_on_link_deletion_failure(
     # (the whole transaction rolled back)
     for table in sorted(store._ERASURE_TABLES):
         rows = store_conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_A,),
         ).fetchall()
         assert rows != [], f"{table} should still have rows (transaction rolled back)"
@@ -1688,7 +1688,7 @@ def test_erase_member_and_links_atomic_happy_path(
     # All health data is gone
     for table in sorted(store._ERASURE_TABLES):
         rows = store_conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_A,),
         ).fetchall()
         assert rows == [], f"erase_member_and_links_atomically left rows in {table}"
@@ -1733,7 +1733,7 @@ def test_erase_member_and_links_atomic_mid_health_data_failure(
     # Nothing was persisted; everything is still there
     for table in sorted(store._ERASURE_TABLES):
         rows = store_conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_A,),
         ).fetchall()
         assert rows != [], f"{table} should still have rows (failed transaction rolled back)"
@@ -1774,7 +1774,7 @@ def test_erase_member_and_links_atomic_no_99_regression(
     # The transaction was rolled back, so nothing is persisted
     for table in sorted(store._ERASURE_TABLES):
         rows = store_conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_A,),
         ).fetchall()
         assert rows != [], f"{table} should still have rows (rolled back)"
@@ -1814,7 +1814,7 @@ def test_erase_member_and_links_atomic_rolls_back_on_real_sqlite_failure(
 
     for table in sorted(store._ERASURE_TABLES):
         rows = store_conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_A,),
         ).fetchall()
         assert rows != [], f"{table} should still have rows (transaction rolled back)"
@@ -1839,7 +1839,7 @@ def test_direct_callers_of_erase_member_data_still_commit_on_success(
     # Data is erased (committed)
     for table in sorted(store._ERASURE_TABLES):
         rows = store_conn.execute(
-            f"SELECT * FROM {table} WHERE whoop_user_id = ?",  # noqa: S608
+            f"SELECT * FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_A,),
         ).fetchall()
         assert rows == [], f"erase_member_data should have deleted rows in {table}"

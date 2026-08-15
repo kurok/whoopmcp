@@ -905,14 +905,14 @@ def test_unscoped_update_fails_closed_and_rolls_back_on_every_tenant_scoped_tabl
     with pytest.raises(store.UnscopedQueryError):
         store._execute_scoped(
             conn,
-            f"UPDATE {table_name} SET {timestamp_column} = 'UNSCOPED-HACK'",  # noqa: S608 -- table_name/timestamp_column come only from the fixed _UNSCOPED_WRITE_TARGETS dict above, never external input
+            f"UPDATE {table_name} SET {timestamp_column} = 'UNSCOPED-HACK'",
         )
 
     # Simulate a later, unrelated legitimate write committing the connection --
     # the rejected statement's mutation must not ride along, on any table.
     conn.commit()
     hacked = conn.execute(
-        f"SELECT COUNT(*) FROM {table_name} WHERE {timestamp_column} = 'UNSCOPED-HACK'"  # noqa: S608 -- same fixed dict, test-only
+        f"SELECT COUNT(*) FROM {table_name} WHERE {timestamp_column} = 'UNSCOPED-HACK'"
     ).fetchone()[0]
     assert hacked == 0, f"{table_name}: unscoped UPDATE's mutation survived a later commit"
     conn.close()
@@ -1589,7 +1589,7 @@ def test_update_with_a_non_restrictive_whoop_user_id_predicate_is_rejected(
     with pytest.raises(store.UnscopedQueryError):
         store._execute_scoped(
             conn,
-            f"UPDATE {table_name} SET {column} = '{_HACK_MARKER}' WHERE {predicate}",  # noqa: S608 -- table_name comes from store._TENANT_SCOPED_TABLES, column from store._RETENTION_TIMESTAMP_COLUMNS, predicate from the fixed list above; never external input
+            f"UPDATE {table_name} SET {column} = '{_HACK_MARKER}' WHERE {predicate}",
             predicate_params,
         )
 
@@ -1597,7 +1597,7 @@ def test_update_with_a_non_restrictive_whoop_user_id_predicate_is_rejected(
     # unrelated commit to persist (#69's rollback property, on this path too).
     conn.commit()
     hacked = conn.execute(
-        f"SELECT COUNT(*) FROM {table_name} WHERE {column} = ?",  # noqa: S608 -- same fixed sources, test-only
+        f"SELECT COUNT(*) FROM {table_name} WHERE {column} = ?",
         (_HACK_MARKER,),
     ).fetchone()[0]
     assert hacked == 0, (
@@ -1632,18 +1632,18 @@ def test_delete_with_a_non_restrictive_whoop_user_id_predicate_is_rejected(
     _, seed = _UNSCOPED_WRITE_TARGETS[table_name]
     conn = store_conn
     seed(conn)
-    before = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]  # noqa: S608 -- table_name from store._TENANT_SCOPED_TABLES
+    before = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
     assert before == 1, f"{table_name}: seeder must leave exactly one row to be deleted"
 
     with pytest.raises(store.UnscopedQueryError):
         store._execute_scoped(
             conn,
-            f"DELETE FROM {table_name} WHERE {predicate}",  # noqa: S608 -- table_name from store._TENANT_SCOPED_TABLES, predicate from the fixed list above
+            f"DELETE FROM {table_name} WHERE {predicate}",
             predicate_params,
         )
 
     conn.commit()
-    after = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]  # noqa: S608 -- same fixed source, test-only
+    after = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
     assert after == 1, (
         f"{table_name}: a non-restrictive DELETE predicate ({predicate}) removed rows"
     )
@@ -1792,7 +1792,7 @@ def test_every_store_writer_still_works(store_conn: sqlite3.Connection) -> None:
     store.erase_member_data(conn, MEMBER_A)
     for table in sorted(store._ERASURE_TABLES):
         rows = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE whoop_user_id = ?",  # noqa: S608 -- table from store._ERASURE_TABLES
+            f"SELECT COUNT(*) FROM {table} WHERE whoop_user_id = ?",
             (MEMBER_A,),
         ).fetchone()[0]
         assert rows == 0, f"erase_member_data left rows behind in {table}"
@@ -1868,11 +1868,11 @@ def _seed_retention_fixture(conn: sqlite3.Connection) -> None:
     for table in sorted(store._ERASURE_TABLES):
         column = store._RETENTION_TIMESTAMP_COLUMNS[table]
         conn.execute(
-            f"UPDATE {table} SET {column} = ? WHERE whoop_user_id = ?",  # noqa: S608 -- table/column from store._ERASURE_TABLES and store._RETENTION_TIMESTAMP_COLUMNS
+            f"UPDATE {table} SET {column} = ? WHERE whoop_user_id = ?",
             (stale, MEMBER_A),
         )
         conn.execute(
-            f"UPDATE {table} SET {column} = ? WHERE whoop_user_id = ?",  # noqa: S608 -- same fixed sources
+            f"UPDATE {table} SET {column} = ? WHERE whoop_user_id = ?",
             (fresh, MEMBER_B),
         )
     conn.commit()
@@ -1897,9 +1897,7 @@ def test_enforce_retention_deletes_exactly_what_it_deleted_before(
 
     assert counts == _EXPECTED_RETENTION_COUNTS
     survivors = {
-        table: conn.execute(
-            f"SELECT whoop_user_id FROM {table} ORDER BY 1"  # noqa: S608 -- table from store._ERASURE_TABLES
-        ).fetchall()
+        table: conn.execute(f"SELECT whoop_user_id FROM {table} ORDER BY 1").fetchall()
         for table in sorted(store._ERASURE_TABLES)
     }
     assert survivors == {table: [(MEMBER_B,)] for table in sorted(store._ERASURE_TABLES)}, (
@@ -2551,13 +2549,13 @@ def test_member_equality_depth_is_checked_not_merely_position() -> None:
     nested_rejected = [
         "DELETE FROM recoveries WHERE whoop_user_id != ? AND (0 OR whoop_user_id = ?)",
         "UPDATE recoveries SET score_state='X' WHERE whoop_user_id != ? "
-        "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+        + "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
         # The rest are genuinely restrictive and rejected anyway -- fail-closed.
         # Pinned so the cost of the depth requirement stays visible: a future
         # caller that parenthesises its member predicate will be rejected, and
         # should be written unparenthesised rather than have this loosened.
         "DELETE FROM recoveries WHERE whoop_user_id IN "
-        "(SELECT whoop_user_id FROM sleeps WHERE whoop_user_id = ?)",
+        + "(SELECT whoop_user_id FROM sleeps WHERE whoop_user_id = ?)",
         "DELETE FROM recoveries WHERE (whoop_user_id = ?)",
         "DELETE FROM recoveries WHERE (whoop_user_id = ? AND deleted_at IS NULL)",
         "DELETE FROM recoveries WHERE deleted_at IS NULL AND (whoop_user_id = ?)",
@@ -2574,9 +2572,9 @@ def test_member_equality_depth_is_checked_not_merely_position() -> None:
         "DELETE FROM recoveries WHERE whoop_user_id = ?",
         "UPDATE sleeps SET deleted_at = ? WHERE whoop_user_id = ? AND resource_id = ?",
         "SELECT raw_json FROM recoveries WHERE (score_state = ? OR score_state = ?) "
-        "AND whoop_user_id = ?",
+        + "AND whoop_user_id = ?",
         "SELECT raw_json FROM recoveries WHERE whoop_user_id = ? "
-        "AND resource_id IN (SELECT resource_id FROM sleeps)",
+        + "AND resource_id IN (SELECT resource_id FROM sleeps)",
     ]
     for sql in depth_zero_accepted:
         assert store._statement_restricts_to_one_member(sql), (
@@ -2813,13 +2811,13 @@ def test_stripped_regions_become_separators_not_deletions(
 
     glued = [
         "SELECT raw_json FROM recoveries EXCEPT/**/SELECT raw_json FROM recoveries "
-        "WHERE whoop_user_id = ?",
+        + "WHERE whoop_user_id = ?",
         "SELECT raw_json FROM recoveries/**/EXCEPT SELECT raw_json FROM recoveries "
-        "WHERE whoop_user_id = ?",
+        + "WHERE whoop_user_id = ?",
         "SELECT raw_json FROM recoveries UNION/**/ALL SELECT raw_json FROM recoveries "
-        "WHERE whoop_user_id = ?",
+        + "WHERE whoop_user_id = ?",
         "SELECT raw_json FROM recoveries/**/UNION SELECT raw_json FROM recoveries "
-        "WHERE whoop_user_id = ?",
+        + "WHERE whoop_user_id = ?",
     ]
     for sql in glued:
         with pytest.raises(store.UnscopedQueryError):
@@ -2931,11 +2929,11 @@ def test_earlier_tenancy_exploits_stay_closed_after_the_154_restructure() -> Non
         "UPDATE recoveries SET whoop_user_id = ? WHERE whoop_user_id IS NOT NULL",
         # #129: fragment nested in a subquery after a widening top-level predicate
         "UPDATE recoveries SET score_state='X' WHERE whoop_user_id != ? "
-        "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+        + "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
         # #131: stray ) inside a quoted identifier desynchronising the depth count
         "UPDATE recoveries SET score_state='X' WHERE whoop_user_id != ? "
-        "AND resource_id = (SELECT max(resource_id) FROM recoveries AS [q)]) "
-        "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
+        + "AND resource_id = (SELECT max(resource_id) FROM recoveries AS [q)]) "
+        + "AND EXISTS (SELECT 1 FROM recoveries r2 WHERE r2.whoop_user_id = ?)",
     ]
     for sql in must_reject:
         assert not store._statement_restricts_to_one_member(sql), (

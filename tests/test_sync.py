@@ -578,7 +578,7 @@ async def test_whoop_sync_tool_refuses_when_cache_disabled_and_proceeds_when_ena
     # cache_enabled check after an initial write would still pass every
     # assertion above).
     for table in COLLECTION_PATHS:
-        rows = disabled_conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchall()  # noqa: S608
+        rows = disabled_conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchall()
         assert rows == [], f"{table} must stay empty when the store is disabled"
     disabled_conn.close()
 
@@ -620,7 +620,7 @@ async def test_run_sync_refuses_when_cache_disabled_and_proceeds_when_enabled(
             await run_sync(conn, client, disabled_config, USER_ID)
     assert respx.calls.call_count == 0
     for table in COLLECTION_PATHS:
-        rows = conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchall()  # noqa: S608
+        rows = conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchall()
         assert rows == [], f"{table} must stay empty when the store is disabled"
 
     enabled_config = make_config(tmp_path / "enabled")
