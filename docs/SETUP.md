@@ -83,22 +83,26 @@ Edit the config file:
 {
   "mcpServers": {
     "whoop": {
-      "command": "uvx",
-      "args": ["whoopmcp"],
+      "command": "/path/to/whoopmcp/.venv/bin/whoopmcp",
       "env": {
         "WHOOP_CLIENT_ID": "your-client-id",
         "WHOOP_CLIENT_SECRET": "your-client-secret",
         "WHOOP_REDIRECT_URI": "whoopmcp://callback",
-        "WHOOPMCP_SCOPES": "read:recovery read:sleep read:cycles read:workout offline"
+        "WHOOPMCP_SCOPES": "read:recovery read:sleep read:cycles read:workout read:body_measurement offline"
       }
     }
   }
 }
 ```
 
-Restart Claude Desktop. Note that your client secret now sits in a plaintext
-config file — that is how MCP client configuration works today, so give the
-file the same care you would an SSH key.
+Restart Claude Desktop. `command` points at the entry point inside the
+clone's own virtualenv (the package is not yet on PyPI — see README's
+Install section), and the scope list above includes every scope the shipped
+tools use except `read:profile`; add it if you want `get_profile`, at the
+cost of the one scope carrying directly identifying information. Note that
+your client secret now sits in a plaintext config file — that is how MCP
+client configuration works today, so give the file the same care you would
+an SSH key.
 
 ### Claude Code
 
@@ -171,13 +175,15 @@ see the reconciliation backstop below.
    find the webhook endpoint URL field and point it at this server's
    publicly-reachable `https://<host>/webhooks/whoop`.
 2. That route only responds to anything other than a `404` when the server
-   is actually serving it. It needs all three of:
+   is actually serving it. It needs both of:
    - `--transport streamable-http` (webhooks arrive as an ordinary inbound
      HTTP POST; `stdio` has nothing listening for one),
-   - `WHOOPMCP_WEBHOOKS_ENABLED=true`,
-   - `WHOOPMCP_CACHE=true` -- webhook processing writes the fetched
-     resource into the persistent store; without it there is nowhere for
-     the result to go.
+   - `WHOOPMCP_WEBHOOKS_ENABLED=true`.
+
+   `WHOOPMCP_CACHE` need not be set separately: enabling webhooks already
+   forces the persistent on-disk store (`Config.store_is_ephemeral` is
+   false whenever webhooks are enabled), because the consumer must survive
+   a restart to be worth anything.
 3. `/webhooks/whoop` also enforces its own inbound rate limit, independent
    of the outbound WHOOP API budget above -- checked before the body is
    even read, so a flood costs neither that nor a signature check.
@@ -295,8 +301,10 @@ Off by default, same precedent as `WHOOPMCP_WEBHOOKS_ENABLED`:
   are modest integers, and an unsalted digest is reversible by enumeration
   in seconds.
 
-Both require `WHOOPMCP_CACHE=true`: the gauges are read from the same
-persistent store every other cache-backed tool uses.
+Neither needs `WHOOPMCP_CACHE=true` on its own: `/metrics` is only reachable
+under `streamable-http`, and outside default local stdio mode the store
+already persists to disk regardless of that variable — the gauges read from
+the same store every other cache-backed tool uses.
 
 Every worker process under a multi-worker streamable-http deployment holds
 its own counters; a single scrape only ever sees whichever worker answered
