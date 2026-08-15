@@ -1,10 +1,4 @@
-"""Streamable-HTTP transport tests (issue #27).
-
-Covers what test_server.py's in-process `call_tool()` path cannot: the actual
-ASGI app returned by `streamable_http_app()`, the `/health` and `/ready`
-routes registered on it, and the registered tool set as seen over a real MCP
-JSON-RPC exchange against that app rather than the in-process call path.
-"""
+"""Streamable-HTTP transport tests (issue #27)."""
 
 from __future__ import annotations
 
@@ -91,12 +85,7 @@ async def test_ready_returns_503_when_token_store_raises(http_env: None, tmp_pat
 async def test_liveness_and_readiness_are_computed_independently(
     http_env: None, tmp_path: Path
 ) -> None:
-    """/health stays 200 while /ready reports 503 at the same time.
-
-    Proves the two are genuinely separate checks, not one aliasing the
-    other: liveness ("the process can respond") must hold even while
-    readiness ("this dependency is reachable") does not.
-    """
+    """/health stays 200 while /ready reports 503 at the same time."""
     (tmp_path / "token.json").write_text("{not json", encoding="utf-8")
     app = build_server().streamable_http_app()
 
@@ -118,37 +107,7 @@ async def test_liveness_and_readiness_are_computed_independently(
 async def test_tool_set_matches_expected_over_the_streamable_http_asgi_app(
     http_env: None,
 ) -> None:
-    """The same EXPECTED_TOOLS registry, reachable over real HTTP JSON-RPC.
-
-    The installed mcp SDK does ship its own streamable-http client machinery
-    (mcp.client.streamable_http.streamable_http_client + mcp.client.session),
-    but its only entry point takes an ``httpx2.AsyncClient`` -- httpx2 is a
-    separate PyPI package from httpx (confirmed: both live side by side under
-    .venv/lib/*/site-packages/, with their own independent ASGITransport
-    classes), present here only because ``mcp`` pulls it in transitively.
-    Wiring the SDK's client into this in-process ASGI test would mean
-    constructing an ``httpx2.AsyncClient(transport=httpx2.ASGITransport(...))``
-    -- exactly the undeclared-dependency reliance this issue's design
-    explicitly ruled out for ``starlette.testclient.TestClient``, for the
-    same reason. So this drives the wire protocol directly over httpx (the
-    project's own declared dependency): a real `initialize` handshake,
-    `notifications/initialized`, then `tools/list` -- the same three calls
-    any MCP client makes, just without the SDK's client-side plumbing on top.
-
-    ``json_response=True`` sidesteps SSE-stream parsing, which nothing here
-    needs to exercise. DNS-rebinding protection is disabled because it
-    validates the request's Host header against real hostnames -- meaningless
-    for an in-process ASGI transport that never opens a socket -- verified
-    empirically: the default (host="127.0.0.1") rejects httpx's default
-    "http://test" base_url with a 421.
-
-    Starlette's own lifespan isn't driven by httpx.ASGITransport (it only
-    ever sends "http" scope messages), so the session manager's task group
-    would otherwise never start -- entering ``app.router.lifespan_context``
-    directly (public Starlette API, not an mcp-internal one) is the
-    dependency-free equivalent of what a real ASGI server does before routing
-    any request to the app.
-    """
+    """The same EXPECTED_TOOLS registry, reachable over real HTTP JSON-RPC."""
     app = build_server().streamable_http_app(
         json_response=True,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),

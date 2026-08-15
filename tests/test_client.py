@@ -44,17 +44,7 @@ class FakeClock:
 
 
 def fast_forwarding_clock() -> Callable[[], float]:
-    """A clock that jumps far ahead on every call.
-
-    Any `_wait_seconds` poll loop driven by this clock sees the deadline
-    already passed on its very first check, so it exits after one real
-    `_POLL_INTERVAL_SECONDS` tick regardless of the computed backoff or
-    Retry-After duration. For tests (mostly pre-dating issue #11) that only
-    care about the final outcome after a 429's retries exhaust, not the
-    exact wait timing -- without this, `_get`'s now-real retry-with-backoff
-    loop would drive several genuine multi-second sleeps against the real
-    system clock every time one of those tests runs.
-    """
+    """A clock that jumps far ahead on every call."""
     state = {"now": 0.0}
 
     def _clock() -> float:
@@ -232,13 +222,7 @@ async def test_get_with_401_twice_gives_up_and_raises_error(
 async def test_get_with_429_and_rate_limit_reset_header(
     config: Config, auth: Authenticator
 ) -> None:
-    """Test 4: 429 with X-RateLimit-Reset header raises RateLimitedError.
-
-    Every mocked response carries the same header, so the retries added by
-    issue #11 don't change the final result -- just how long it takes to get
-    there against a real clock. A fast-forwarding clock keeps this test at
-    its pre-#11 speed.
-    """
+    """Test 4: 429 with X-RateLimit-Reset header raises RateLimitedError."""
     reset_time = 1700000000.0
     respx.get(f"{BASE_URL}/v2/user/profile/basic").mock(
         return_value=httpx.Response(
@@ -260,10 +244,7 @@ async def test_get_with_429_and_rate_limit_reset_header(
 async def test_get_with_429_without_rate_limit_reset_header(
     config: Config, auth: Authenticator
 ) -> None:
-    """Test 5: 429 without X-RateLimit-Reset raises RateLimitedError with None.
-
-    Fast-forwarding clock: see test_get_with_429_and_rate_limit_reset_header.
-    """
+    """Test 5: 429 without X-RateLimit-Reset raises RateLimitedError with None."""
     respx.get(f"{BASE_URL}/v2/user/profile/basic").mock(
         return_value=httpx.Response(429, json={"error": "rate_limited"})
     )
@@ -280,10 +261,7 @@ async def test_get_with_429_without_rate_limit_reset_header(
 async def test_get_with_429_and_unparseable_rate_limit_reset_header(
     config: Config, auth: Authenticator
 ) -> None:
-    """A malformed X-RateLimit-Reset header must not crash the error path.
-
-    Fast-forwarding clock: see test_get_with_429_and_rate_limit_reset_header.
-    """
+    """A malformed X-RateLimit-Reset header must not crash the error path."""
     respx.get(f"{BASE_URL}/v2/user/profile/basic").mock(
         return_value=httpx.Response(
             429,
@@ -380,13 +358,7 @@ async def test_paginate_stops_at_max_records_without_fetching_next_page(
 
 @respx.mock
 async def test_error_messages_do_not_leak_tokens(config: Config, auth: Authenticator) -> None:
-    """Test 9: Error messages don't contain the bearer token string.
-
-    The refresh itself must succeed here (mirroring the 401-twice scenario),
-    so the raised error is client.py's own WhoopAPIError, built from the API
-    response -- not auth.py's AuthError, which is already covered by its own
-    leak tests and isn't what this issue's error-mapping code produces.
-    """
+    """Test 9: Error messages don't contain the bearer token string."""
     respx.get(f"{BASE_URL}/v2/user/profile/basic").mock(
         return_value=httpx.Response(401, json={"error": "Unauthorized"})
     )

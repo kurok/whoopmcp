@@ -83,13 +83,7 @@ def test_median_of_nothing_is_an_error() -> None:
 
 
 def test_standardized_effect_size_happy_path() -> None:
-    """Cohen's d between two normal distributions with known values.
-
-    Counts are 8 rather than the 5 this test originally used, because #183 gave
-    the function a per-group floor of ``MIN_EFFECT_SAMPLES``. The expected value
-    is untouched: with equal group sizes and equal standard deviations the
-    pooled variance is independent of n, so d stays 2.53.
-    """
+    """Cohen's d between two normal distributions with known values."""
     # Both groups: stdev^2 = 2.5, means 3 and 7.
     # pooled_variance = ((8-1)*2.5 + (8-1)*2.5) / (8+8-2) = 35 / 14 = 2.5
     # pooled_stdev = sqrt(2.5) ~ 1.581
@@ -134,13 +128,7 @@ def test_standardized_effect_size_zero_pooled_stdev() -> None:
 
 
 def test_standardized_effect_size_rejects_two_per_group() -> None:
-    """Cohen's d raises InsufficientDataError when count < MIN_EFFECT_SAMPLES per group.
-
-    This test covers the case from issue #183: two observations per group
-    produce a d = 16.26, which is numerically correct but unstable and
-    misleading without a floor. MIN_EFFECT_SAMPLES = 8 matches the module's
-    established convention (MIN_CORRELATION_SAMPLES, MIN_TREND_SAMPLES).
-    """
+    """Cohen's d raises InsufficientDataError when count < MIN_EFFECT_SAMPLES per group."""
     with pytest.raises(
         InsufficientDataError, match="at least 8 observations per group"
     ) as exc_info:
@@ -151,11 +139,7 @@ def test_standardized_effect_size_rejects_two_per_group() -> None:
 
 
 def test_standardized_effect_size_boundary_exactly_min_samples_per_group() -> None:
-    """Cohen's d succeeds when BOTH groups have exactly MIN_EFFECT_SAMPLES observations.
-
-    This is the lower boundary: exactly 8 observations per group should work,
-    as that is the minimum stable threshold the module accepts elsewhere.
-    """
+    """Cohen's d succeeds when BOTH groups have exactly MIN_EFFECT_SAMPLES observations."""
     result = standardized_effect_size(
         mean_a=61.0,
         stdev_a=1.5,
@@ -169,11 +153,7 @@ def test_standardized_effect_size_boundary_exactly_min_samples_per_group() -> No
 
 
 def test_standardized_effect_size_boundary_one_below_min_group_a() -> None:
-    """Cohen's d raises when group A has fewer than MIN_EFFECT_SAMPLES observations.
-
-    Asymmetric boundary check: a floor checked only on one group is a real bug.
-    This test verifies the floor is enforced on group A independently.
-    """
+    """Cohen's d raises when group A has fewer than MIN_EFFECT_SAMPLES observations."""
     with pytest.raises(InsufficientDataError):
         standardized_effect_size(
             mean_a=61.0,
@@ -186,11 +166,7 @@ def test_standardized_effect_size_boundary_one_below_min_group_a() -> None:
 
 
 def test_standardized_effect_size_boundary_one_below_min_group_b() -> None:
-    """Cohen's d raises when group B has fewer than MIN_EFFECT_SAMPLES observations.
-
-    Asymmetric boundary check: a floor checked only on one group is a real bug.
-    This test verifies the floor is enforced on group B independently.
-    """
+    """Cohen's d raises when group B has fewer than MIN_EFFECT_SAMPLES observations."""
     with pytest.raises(InsufficientDataError):
         standardized_effect_size(
             mean_a=61.0,
@@ -203,12 +179,7 @@ def test_standardized_effect_size_boundary_one_below_min_group_b() -> None:
 
 
 def test_standardized_effect_size_no_regression_above_floor() -> None:
-    """Cohen's d still works correctly for reasonable sample sizes above the floor.
-
-    Regression test: ensure that adding the MIN_EFFECT_SAMPLES floor does not
-    change the computed value for sizes that pass the floor (n=10 per group).
-    This uses a known pair of distributions to verify the coefficient is stable.
-    """
+    """Cohen's d still works correctly for reasonable sample sizes above the floor."""
     # Group A: mean=3, stdev=sqrt(2.5) (matches test_standardized_effect_size_happy_path)
     # Group B: mean=7, stdev=sqrt(2.5)
     # With n=10 per group, should compute the same d as the existing test
@@ -366,13 +337,7 @@ def test_extract_metric_all_metrics() -> None:
 
 
 def test_extract_metric_skips_explicit_null_values() -> None:
-    """A SCORED record with explicit null for the requested metric is skipped.
-
-    This is issue #182: the docstring promises "skipping nulls", but the
-    implementation only checked for missing keys/score dicts, not for
-    explicit None values. A record with score["hrv_rmssd_milli"] = None
-    should be skipped, and the remaining records should produce a result.
-    """
+    """A SCORED record with explicit null for the requested metric is skipped."""
     records = [
         scored_record("2026-08-01T06:00:00Z", hrv=48.5),
         # Middle record: SCORED state but explicit None for hrv
@@ -399,11 +364,7 @@ def test_extract_metric_skips_explicit_null_values() -> None:
 
 
 def test_summarize_skips_records_with_null_metrics() -> None:
-    """summarize() skips SCORED records with explicit null for the metric.
-
-    All analysis entry points share _filtered_records(), so the fix applies
-    uniformly. This test verifies summarize() specifically handles nulls.
-    """
+    """summarize() skips SCORED records with explicit null for the metric."""
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     records = [
         scored_record(
@@ -437,13 +398,7 @@ def test_summarize_skips_records_with_null_metrics() -> None:
 
 
 def test_trend_skips_records_with_null_metrics() -> None:
-    """trend() skips SCORED records with an explicit null for the metric.
-
-    Nine records, one nulled, leaving eight -- exactly ``MIN_TREND_SAMPLES``.
-    Seeding only eight would leave seven after the skip and raise
-    ``InsufficientDataError``, which would look like the guard working while
-    actually testing the sample floor.
-    """
+    """trend() skips SCORED records with an explicit null for the metric."""
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     records = [
         scored_record(
@@ -542,20 +497,7 @@ def test_correlate_lag_sweep_skips_records_with_null_metrics() -> None:
 
 
 def test_every_consumer_of_the_shared_filter_is_covered_above() -> None:
-    """Pin which functions the null guard actually protects (#182).
-
-    ``_filtered_records`` is the single place the SCORED-and-key-present filter
-    lives, so the guard covers exactly its callers -- and only those. It is
-    tempting to also list ``find_streaks`` and the outliers path, but both take
-    ``RollingPoint`` sequences rather than raw records and never reach this
-    filter, so a test naming them would assert nothing about it. (An earlier
-    draft of this file had exactly that: a test called
-    ``test_find_streaks_skips_records_with_null_metrics`` that in fact called
-    ``extract_metric``.)
-
-    This reads the source rather than trusting the list, so a function added
-    later that starts consuming the filter fails here until it is covered too.
-    """
+    """Pin which functions the null guard actually protects (#182)."""
     source = Path(analysis.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
 
@@ -587,13 +529,7 @@ def test_every_consumer_of_the_shared_filter_is_covered_above() -> None:
 
 
 def test_extract_metric_all_null_raises_insufficient_data_error() -> None:
-    """When every SCORED record has null for the metric, it behaves like an
-    empty result set and raises InsufficientDataError, not TypeError.
-
-    This tests the broader contract: null values should never cause TypeError,
-    they should be skipped like missing values. An all-null set degrades to
-    the empty-set case and raises the appropriate error.
-    """
+    """When every SCORED record has null for the metric, it behaves like an"""
     records = [
         {
             "id": 12353,
@@ -630,11 +566,7 @@ def test_extract_metric_all_null_raises_insufficient_data_error() -> None:
 
 
 def test_extract_metric_non_numeric_values_are_skipped() -> None:
-    """Non-numeric non-null values (dict, list, non-numeric string) are skipped.
-
-    A dict, list, or unparseable string cannot be converted to float and should
-    be skipped rather than raising TypeError.
-    """
+    """Non-numeric non-null values (dict, list, non-numeric string) are skipped."""
     records = [
         scored_record("2026-08-01T06:00:00Z", hrv=48.5),
         # Non-numeric dict
@@ -675,11 +607,7 @@ def test_extract_metric_non_numeric_values_are_skipped() -> None:
 
 
 def test_extract_metric_numeric_strings_are_still_accepted() -> None:
-    """REGRESSION: numeric strings like "60.0" are still accepted and converted.
-
-    The fix must preserve the existing ability to convert numeric strings,
-    which float() handles naturally.
-    """
+    """REGRESSION: numeric strings like "60."""
     records = [
         scored_record("2026-08-01T06:00:00Z", recovery_score=60.0),
         # Numeric string
@@ -794,12 +722,7 @@ def test_summarize_days_missing_duplicate_dates() -> None:
 
 
 def test_trend_uses_timestamps_not_index() -> None:
-    """Trend computes slope per day using actual timestamps, not record index.
-
-    If the records are on days 0, 1, 5, 6, 7, 8, 9, 10 (unevenly spaced) with values
-    increasing by 10 per day, an index-based slope would compute wrong.
-    The timestamp-based slope should detect 10.0 per day.
-    """
+    """Trend computes slope per day using actual timestamps, not record index."""
     # Days 0,1,5,6,7,8,9,10 with values 0,10,50,60,70,80,90,100 (all 10.0 per day)
     # True slope per day = 10.0
     # Index-based would give (0+10+50+60+70+80+90+100) / 8 mean, then slope over index 0-7 = wrong
@@ -915,15 +838,7 @@ def test_trend_excludes_unscored_records() -> None:
 
 
 def test_correlate_joins_on_cycle_id() -> None:
-    """Two record sets joined on cycle_id -> only matched pairs correlated.
-
-    MIN_CORRELATION_SAMPLES=8, so this needs >=8 *matched* pairs to succeed
-    at all -- a version of this test with only 2 or 3 matches would just be
-    testing test_correlate_insufficient_samples over again. Cycle_id 9 (A)
-    and 100 (B) are unmatched on the other side; if the join were actually a
-    concatenation, count would be 9 or 10 instead of 8, and strain=999.0
-    would drag the correlation toward zero.
-    """
+    """Two record sets joined on cycle_id -> only matched pairs correlated."""
     records_a = [
         scored_record(f"2026-08-{i:02d}T06:00:00Z", recovery_score=float(i * 10), cycle_id=i)
         for i in range(1, 10)  # cycle_id 1..9
@@ -962,12 +877,7 @@ def test_correlate_insufficient_samples() -> None:
 
 
 def test_correlate_falls_back_to_calendar_day() -> None:
-    """Records without cycle_id join on calendar day from created_at.
-
-    Uses "hrv" (not "strain") on the B side deliberately: "hrv" is not a
-    cycle-sourced metric, so an own "id" on the record must NOT be used as a
-    join key -- only the calendar-day fallback should apply here.
-    """
+    """Records without cycle_id join on calendar day from created_at."""
     # Both records have no cycle_id, so they fall back to calendar day matching
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     # Create 8+ matching pairs on the same calendar day but different times
@@ -1038,11 +948,7 @@ def test_correlate_sufficient_matched_pairs() -> None:
 
 
 def test_correlate_result_gains_spearman_r_unchanged_otherwise() -> None:
-    """correlate() keeps every existing field's exact behavior; spearman_r is additive.
-
-    Reuses test_correlate_joins_on_cycle_id's own fixture and assertions
-    verbatim, then checks the one new field.
-    """
+    """correlate() keeps every existing field's exact behavior; spearman_r is additive."""
     records_a = [
         scored_record(f"2026-08-{i:02d}T06:00:00Z", recovery_score=float(i * 10), cycle_id=i)
         for i in range(1, 10)
@@ -1076,32 +982,14 @@ def test_spearman_perfect_negative_relationship() -> None:
 
 
 def test_spearman_handles_tied_ranks() -> None:
-    """Ties are resolved by average rank, matching a hand-computed value.
-
-    xs = [1, 2, 2, 3] -> ranks [1, 2.5, 2.5, 4] (the two 2s share the average
-    of positions 2 and 3). ys = [10, 20, 20, 40] -> ranks [1, 2.5, 2.5, 4],
-    the identical rank pattern, so Spearman's rho is exactly 1.0.
-    """
+    """Ties are resolved by average rank, matching a hand-computed value."""
     xs = [1.0, 2.0, 2.0, 3.0]
     ys = [10.0, 20.0, 20.0, 40.0]
     assert spearman(xs, ys) == pytest.approx(1.0)
 
 
 def test_spearman_ties_diverge_from_a_no_tie_series() -> None:
-    """A hand-computed, non-trivial tied case: ranks differ from raw values.
-
-    xs = [10, 20, 20, 30] -> ranks [1, 2.5, 2.5, 4] (the two 20s tie for
-    positions 2 and 3, averaging to 2.5).
-    ys = [5, 1, 9, 2]      -> ascending order is 1, 2, 5, 9, so ranks are
-    [3, 1, 4, 2] (5 is 3rd-smallest, 1 is smallest, 9 is largest, 2 is
-    2nd-smallest) -- ys has no ties of its own.
-    Spearman = pearson([1, 2.5, 2.5, 4], [3, 1, 4, 2]).
-    mean(rank_x) = 2.5, mean(rank_y) = 2.5.
-    dx = [-1.5, 0, 0, 1.5]; dy = [0.5, -1.5, 1.5, -0.5]
-    sum(dx*dy) = -0.75 + 0 + 0 - 0.75 = -1.5
-    sum(dx^2) = 2.25+0+0+2.25 = 4.5; sum(dy^2) = 0.25+2.25+2.25+0.25 = 5.0
-    rho = -1.5 / (sqrt(4.5) * sqrt(5.0)) = -1.5 / sqrt(22.5) ~= -0.31623
-    """
+    """A hand-computed, non-trivial tied case: ranks differ from raw values."""
     xs = [10.0, 20.0, 20.0, 30.0]
     ys = [5.0, 1.0, 9.0, 2.0]
     assert spearman(xs, ys) == pytest.approx(-1.5 / (4.5**0.5 * 5.0**0.5), rel=1e-6)
@@ -1139,30 +1027,7 @@ def test_spearman_diverges_from_pearson_on_nonlinear_monotonic_series() -> None:
 
 
 def test_lag_sweep_sign_convention_positive_lag_is_metric_a_leading() -> None:
-    """THE SIGN TEST. Write this first; the sign is the easiest thing to get
-    backwards (per the issue's own warning).
-
-    `lag_days=L` must pair metric_a's value on date D with metric_b's value
-    on date D+L -- a positive lag means metric_a's date precedes metric_b's.
-
-    Fixture: a 14-value series with deliberately low self-similarity at
-    every shift except 0 (verified by hand, chars below), so a correlation
-    can only be strong at the ONE lag where metric_b is an exact date-
-    shifted copy of metric_a -- unlike a plain monotonic series, whose
-    autocorrelation is close to 1.0 at every lag and can't discriminate the
-    sign at all.
-
-    values = [18, 32, 4, 79, 58, 24, 90, 16, 95, 84, 45, 11, 30, 35]
-    metric_a: dates 2026-08-01 .. 2026-08-14, value[i] on day i.
-    metric_b: dates 2026-08-02 .. 2026-08-15, value[i] on day (i+1) -- i.e.
-    metric_b's date D+1 carries metric_a's own value from date D, for every
-    i. So metric_a[D] and metric_b[D+1] are IDENTICAL by construction: lag
-    = +1 must be a perfect r = 1.0. Independently computed via Python's
-    `statistics.correlation` outside this test (not reusing pearson/
-    spearman under test): lag=+1 -> r=1.0 (n=14), lag=0 -> r~=-0.117 (n=13),
-    lag=-1 -> r~=0.058 (n=12), lag=-2 -> r~=-0.095 (n=11), lag=+2 ->
-    r~=-0.117 (n=13). Only lag=+1 is anywhere close to a real relationship.
-    """
+    """THE SIGN TEST."""
     values = [18.0, 32.0, 4.0, 79.0, 58.0, 24.0, 90.0, 16.0, 95.0, 84.0, 45.0, 11.0, 30.0, 35.0]
     base = datetime(2026, 8, 1, tzinfo=UTC)
 
@@ -1356,23 +1221,7 @@ def test_default_lag_sweep_is_plus_minus_three_days() -> None:
 
 
 def test_trend_computes_r_squared_on_synthetic_series() -> None:
-    """r_squared, slope, and first/last all match hand-computed values.
-
-    Series: day 0-7 with values 10,12,14,16,18,20,22,24 (exactly value = 2*day + 10).
-    Expected slope: 2.0 per day (diff is always 2 per 1 day).
-    Expected r_squared: 1.0 (perfect linear relationship).
-
-    Hand computation for slope (least squares):
-    xs = [0, 1, 2, 3, 4, 5, 6, 7], ys = [10, 12, 14, 16, 18, 20, 22, 24]
-    mean(xs) = 3.5, mean(ys) = 17
-    numerator = ((-3.5)*(-7) + (-2.5)*(-5) + (-1.5)*(-3) + (-0.5)*(-1)
-               + (0.5)*(1) + (1.5)*(3) + (2.5)*(5) + (3.5)*(7))
-              = 24.5 + 12.5 + 4.5 + 0.5 + 0.5 + 4.5 + 12.5 + 24.5 = 84
-    denominator = 12.25 + 6.25 + 2.25 + 0.25 + 0.25 + 2.25 + 6.25 + 12.25 = 42
-    slope = 84 / 42 = 2.0
-
-    r_squared = pearson(xs, ys)^2 = 1.0^2 = 1.0 (since it's perfectly linear)
-    """
+    """r_squared, slope, and first/last all match hand-computed values."""
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     records = [
         scored_record(
@@ -1405,12 +1254,7 @@ def test_trend_r_squared_is_one_on_perfectly_linear_series() -> None:
 
 
 def test_trend_r_squared_is_low_on_pure_noise() -> None:
-    """A deterministic no-correlation series gives low r_squared.
-
-    Series: day 0-7 with values [1,2,1,2,1,2,1,2] (alternating).
-    This has zero correlation with day index: mean(value) = 1.5, and the
-    oscillation has no linear trend component even with 8 points.
-    """
+    """A deterministic no-correlation series gives low r_squared."""
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     # Alternating pattern: no linear correlation with day
     values = [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0]
@@ -1428,19 +1272,7 @@ def test_trend_r_squared_is_low_on_pure_noise() -> None:
 
 
 def test_trend_of_a_constant_series_reports_zero_slope_not_a_refusal() -> None:
-    """A perfectly constant series is a flat trend, not insufficient data.
-
-    Ten nights at exactly 100% sleep performance is a plausible input for a
-    metric capped at 100 -- and there are ten observations, well past
-    MIN_TREND_SAMPLES. Before #199 this raised InsufficientDataError out of
-    pearson ("correlation is undefined when a series is constant"), which
-    metric_trend then relayed as an "insufficient_data" refusal about
-    correlation for a request about a trend. Only the correlation
-    coefficient is undefined here; the slope is exactly 0, and r_squared is
-    0.0 by the convention documented at the guard -- a flat line explains
-    none of the (nonexistent) variance, banding to "negligible" rather than
-    to a "perfect fit".
-    """
+    """A perfectly constant series is a flat trend, not insufficient data."""
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     records = [
         scored_record(
@@ -1461,13 +1293,7 @@ def test_trend_of_a_constant_series_reports_zero_slope_not_a_refusal() -> None:
 
 
 def test_trend_fit_quality_describes_r_squared_in_words() -> None:
-    """fit_quality bands r_squared into a word, per the issue's explicit
-    "describe the fit in words in the response" scope bullet -- r_squared
-    alone is the number, fit_quality is the words, neither replaces the
-    other.
-
-    A perfectly linear series (r_squared == 1.0) must band to "strong".
-    """
+    """fit_quality bands r_squared into a word, per the issue's explicit"""
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     records = [
         scored_record(
@@ -1482,12 +1308,7 @@ def test_trend_fit_quality_describes_r_squared_in_words() -> None:
 
 
 def test_trend_rolling_7d_respects_minimum_periods() -> None:
-    """rolling_7d has no entry for the first 6 calendar days of the series.
-
-    Create 10 consecutive daily records (days 0-9).
-    rolling_7d should have no entry for days 0-5 (not yet 7 calendar days elapsed).
-    The first rolling_7d entry should be for day 6 (dates show 7 calendar days have passed).
-    """
+    """rolling_7d has no entry for the first 6 calendar days of the series."""
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     records = [
         scored_record(
@@ -1518,19 +1339,7 @@ def test_trend_rolling_7d_respects_minimum_periods() -> None:
 
 
 def test_trend_rolling_windows_computed_by_date_not_row_count() -> None:
-    """Rolling windows use calendar date range, not row count -- and the
-    minimum-periods clock restarts after a gap at least as long as the
-    window itself, rather than staying pinned to the series' very first date.
-
-    Records: days 0-4 (daily), a 19-day gap, then days 24-33 (daily). The
-    gap (20 days between day 4 and day 24) is bigger than the 7-day window,
-    so no point from before it could ever fall inside a post-gap window --
-    which means the immediately-post-gap points (24-29) must get NO
-    rolling_7d entry at all, exactly as if day 24 were itself the start of
-    a new series. Only once 6 more calendar days have elapsed *within the
-    post-gap run* (day 30) does a real, full 7-day window exist, and its
-    value must come only from days 24-30 -- never from the pre-gap cluster.
-    """
+    """Rolling windows use calendar date range, not row count -- and the"""
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     records = []
 
@@ -1584,10 +1393,7 @@ def test_trend_rolling_windows_computed_by_date_not_row_count() -> None:
 
 
 def test_trend_below_min_samples_raises_insufficient_data_error() -> None:
-    """A series with 7 or fewer SCORED records raises InsufficientDataError.
-
-    Tests with exactly MIN_TREND_SAMPLES - 1 = 7 records.
-    """
+    """A series with 7 or fewer SCORED records raises InsufficientDataError."""
     base_date = datetime(2026, 8, 1, tzinfo=UTC)
     records = [
         scored_record(
@@ -1658,12 +1464,7 @@ def _gapped_points(days: list[int], values: list[float], base: date) -> list[Rol
 
 
 def test_rolling_z_scores_flags_a_known_anomaly() -> None:
-    """One deliberate spike inserted into an otherwise-flat 30-day series.
-
-    The spike day itself must cross |z| >= 2; every other post-warm-up day
-    (including days immediately adjacent to the spike, whose own windows
-    are pulled slightly by it) must not.
-    """
+    """One deliberate spike inserted into an otherwise-flat 30-day series."""
     values = [50.0] * 30
     values[20] = 90.0
     daily = _daily_points(date(2026, 1, 1), values)
@@ -1687,16 +1488,7 @@ def test_rolling_z_scores_flags_a_known_anomaly() -> None:
 
 
 def test_rolling_z_scores_does_not_flag_a_slow_seasonal_drift() -> None:
-    """A genuine, sustained level shift ("a slow seasonal drift") over the
-    last 30 days of a 180-day series must not read as a month of outliers
-    under a ROLLING z-score, even though a naive GLOBAL mean/stdev
-    computed over the whole series -- calculated inline right here, not
-    just asserted about -- flags nearly every one of those 30 days.
-
-    This is the acceptance criterion's own discriminating test: it proves
-    the CONTRAST between a global and a rolling approach on one shared
-    fixture, not just that the rolling result looks quiet in isolation.
-    """
+    """A genuine, sustained level shift ("a slow seasonal drift") over the"""
     baseline = [50.0] * 150
     shifted = [65.0] * 30
     values = baseline + shifted

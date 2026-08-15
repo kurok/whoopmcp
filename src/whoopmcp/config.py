@@ -1,9 +1,7 @@
 """Runtime configuration, resolved from the environment.
 
-Everything the server needs to know is read once at startup. MCP servers are
-launched by the client (Claude Desktop, Cursor, ...) as a subprocess with no
-TTY, so environment variables are the only configuration channel that works
-everywhere -- there is nowhere to prompt.
+Read once at startup. MCP servers run as a subprocess with no TTY, so env
+vars are the only configuration channel that works everywhere.
 """
 
 from __future__ import annotations
@@ -22,13 +20,11 @@ TokenBackend = Literal["file", "keyring", "encrypted-file"]
 Transport = Literal["stdio", "streamable-http"]
 
 #: Matches WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N>, capturing N. Only consulted
-#: when token_backend == "encrypted-file" -- the file/keyring backends have
-#: no key material and are unaffected by these variables being unset.
+#: when token_backend == "encrypted-file".
 _KEY_VERSION_VAR_RE = re.compile(r"^WHOOPMCP_TOKEN_ENCRYPTION_KEY_V(\d+)$")
 
-#: Scopes requested during authorisation. ``offline`` is what makes WHOOP
-#: return a refresh token; without it the grant dies after one hour and the
-#: user has to re-authorise through the browser every session.
+#: Scopes requested during authorisation. `offline` is required for WHOOP to
+#: return a refresh token; without it the grant dies in an hour.
 DEFAULT_SCOPES: tuple[str, ...] = (
     "read:profile",
     "read:body_measurement",
@@ -53,75 +49,7 @@ def _default_state_dir() -> Path:
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Resolved server configuration.
-
-    Attributes:
-        client_id: OAuth client id from the WHOOP developer dashboard.
-        client_secret: OAuth client secret. WHOOP does not document PKCE
-            support, so the secret is required for the code exchange.
-        redirect_uri: Must match a redirect URL registered on the WHOOP app
-            exactly. WHOOP documents ``https://`` and custom-scheme URIs only.
-        scopes: Scopes to request at authorisation time.
-        token_backend: Where the refresh token lives.
-        state_dir: Directory for the token file and any cache.
-        cache_enabled: Whether responses may be cached on disk.
-        request_timeout: Per-request timeout in seconds.
-        rate_limit_per_minute: Local budget for requests/minute, mirroring
-            WHOOP's documented default.
-        rate_limit_per_day: Local budget for requests/day, mirroring WHOOP's
-            documented default.
-        transport: "stdio" (default, what MCP clients launch) or
-            "streamable-http" (#27).
-        http_host: Bind host for the streamable-http transport.
-        http_port: Bind port for the streamable-http transport.
-        webhooks_enabled: Whether the `/webhooks/whoop` receiver (#17) is
-            registered at all. Off by default: the route is public and
-            unauthenticated by construction, so an operator who hasn't set
-            up a WHOOP webhook subscription shouldn't have it exposed.
-        webhook_timestamp_skew_seconds: How far a webhook's
-            `X-WHOOP-Signature-Timestamp` may drift from now, in either
-            direction, before it's rejected even with a valid signature.
-            Bounds the window a captured, correctly-signed request can be
-            replayed in.
-        webhook_rate_limit_per_minute: Cap on `/webhooks/whoop` requests per
-            minute, checked before the body is read or the signature
-            verified -- independent of `rate_limit_per_minute` above, which
-            is the outbound WHOOP budget; a shared counter would let an
-            inbound flood spend that budget too (#17). `120` is roughly
-            2/sec sustained: comfortably above legitimate WHOOP volume even
-            at a ten-member cap with retries and simultaneous multi-member
-            events, while still blunting a flood. `0` or negative disables
-            inbound limiting entirely.
-        token_encryption_keys: Key-version -> 32-byte AES-256-GCM key,
-            parsed from `WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N>` variables.
-            Only populated (and only required) when `token_backend` is
-            `"encrypted-file"`. Every version named here must stay present
-            for as long as any on-disk record was sealed under it -- see
-            `auth.EncryptedFileTokenStore`, which re-seals a record under
-            the current version lazily, on its next read.
-        token_encryption_key_version: Which version in
-            `token_encryption_keys` new writes seal under. Only meaningful
-            alongside `token_backend == "encrypted-file"`.
-        backfill_floor_date: Inclusive lower bound for `whoopmcp backfill`
-            (#14), an ISO 8601 date or datetime string passed straight
-            through as the WHOOP API's own `start` parameter. Unset (the
-            default) means no floor: walk until history is exhausted. Kept
-            as a string because `client.build_collection_params` and the
-            store's convention throughout is ISO strings, not datetimes.
-        metrics_token: Bearer token required on `/metrics` (#31). Unset (the
-            default) means the route 404s and exports nothing -- off unless
-            explicitly configured, the same precedent `webhooks_enabled`
-            establishes, since `/metrics` would otherwise hand per-member
-            health telemetry to anyone who can reach the port.
-        metrics_member_salt: HMAC key for deriving `/metrics`' opaque
-            `member_ref` label from a WHOOP user id (#31). Deliberately not
-            `client_secret`: that value is also the webhook signing secret,
-            so rotating it would silently reset every metrics time series at
-            the same moment it broke webhooks. Unset means every per-member
-            series is withheld entirely -- an unkeyed hash of a WHOOP user id
-            (a modest integer) would be reversible by enumeration in
-            seconds, which is not opaque, so there is no weaker fallback.
-    """
+    """Resolved server configuration. See field comments for non-obvious ones."""
 
     client_id: str
     client_secret: str = field(repr=False)
@@ -136,13 +64,30 @@ class Config:
     transport: Transport = "stdio"
     http_host: str = "127.0.0.1"
     http_port: int = 8000
+    #: Off by default: `/webhooks/whoop` (#17) is public/unauthenticated, so
+    #: it must be explicitly enabled to be exposed.
     webhooks_enabled: bool = False
+    #: How far a webhook timestamp may drift from now before rejection --
+    #: bounds the window a captured, signed request can be replayed in.
     webhook_timestamp_skew_seconds: float = 300.0
+    #: Inbound cap on /webhooks/whoop, checked pre-signature-verification.
+    #: Independent of rate_limit_per_minute (outbound budget), so a flood
+    #: can't spend that too (#17). 0/negative disables inbound limiting.
     webhook_rate_limit_per_minute: int = 120
+    #: Key-version -> AES-256-GCM key (encrypted-file backend only). Every
+    #: version referenced by an on-disk record must stay present as long as
+    #: that record exists -- see `auth.EncryptedFileTokenStore`.
     token_encryption_keys: Mapping[int, bytes] = field(default_factory=dict, repr=False)
     token_encryption_key_version: int | None = None
     backfill_floor_date: str | None = None
+    #: Bearer token required on /metrics (#31). Unset means the route 404s --
+    #: off unless configured, since it would otherwise expose per-member
+    #: health telemetry to anyone reaching the port.
     metrics_token: str | None = field(default=None, repr=False)
+    #: HMAC key deriving /metrics' opaque member_ref (#31). Deliberately not
+    #: `client_secret` (rotating that would also reset metrics + break
+    #: webhooks). Unset withholds every per-member series -- an unkeyed hash
+    #: of a WHOOP user id would be reversible by enumeration.
     metrics_member_salt: str | None = field(default=None, repr=False)
 
     @property
@@ -155,27 +100,13 @@ class Config:
 
     @property
     def store_is_ephemeral(self) -> bool:
-        """Whether this configuration's store may only ever live in memory.
+        """Whether this config's store may only ever live in memory.
 
-        PRIVACY.md promises that in default local mode the only thing this
-        software persists is your token. ``server.lifespan()`` opening
-        ``cache_path`` unconditionally broke that promise by creating
-        ``cache.sqlite3`` and writing a principal link plus a tool-call audit
-        row into it (#74). PR #63 settled the direction: the document is the
-        contract and the code bends. So default local stdio -- no
-        ``WHOOPMCP_CACHE``, no webhooks -- gets an in-memory store instead.
-
-        Every other combination legitimately persists and keeps its
-        pre-#74 on-disk behaviour: hosted mode holds other members' data,
-        ``WHOOPMCP_CACHE`` is an explicit opt-in, and the webhook consumer
-        must survive a restart to be worth anything.
-
-        Lives here rather than in ``server.py`` because it is a pure question
-        about configuration, and both consumers (``server.lifespan`` and
-        ``doctor``) already depend on this module -- putting it in
-        ``server.py`` would make ``whoopmcp doctor`` import the entire MCP
-        server surface to answer it. Keys off ``transport``, not off which
-        ASGI app was constructed: configuration decides, not construction.
+        PRIVACY.md promises default local mode persists only the token
+        (#74); default stdio with no cache/webhooks gets an in-memory store.
+        Every other combination (hosted, WHOOPMCP_CACHE opt-in, webhooks)
+        legitimately persists. Keys off `transport`, not the constructed ASGI
+        app -- configuration decides, not construction.
         """
         return self.transport == "stdio" and not self.cache_enabled and not self.webhooks_enabled
 
@@ -201,8 +132,8 @@ class Config:
 
         redirect_uri = src["WHOOP_REDIRECT_URI"]
         if redirect_uri.startswith("http://"):
-            # WHOOP's dashboard rejects plain http, including http://localhost.
-            # Failing here beats failing halfway through a browser round-trip.
+            # WHOOP rejects plain http (even localhost); fail here, not
+            # halfway through a browser round-trip.
             raise ConfigError(
                 f"WHOOP_REDIRECT_URI must not use http:// (got {redirect_uri!r}). "
                 "WHOOP accepts https:// or a custom scheme such as whoopmcp://callback."
@@ -235,9 +166,8 @@ class Config:
             else _default_state_dir()
         )
 
-        # Validated up front, like the redirect_uri and token-backend checks
-        # above: a malformed floor should fail at startup naming the
-        # variable, not partway through a multi-minute backfill.
+        # Validated up front: a malformed floor should fail at startup, not
+        # partway through a multi-minute backfill.
         backfill_floor_date = src.get("WHOOPMCP_BACKFILL_FLOOR_DATE") or None
         if backfill_floor_date is not None:
             try:
@@ -248,10 +178,8 @@ class Config:
                     f"datetime, got {backfill_floor_date!r}"
                 ) from exc
 
-        # Parsed through _numeric_env so a malformed value is a ConfigError
-        # naming the variable, and range-checked where a bad value is worse
-        # than a startup failure -- see _require_positive for the outbound
-        # rate limits' silent-deadlock case (#200).
+        # Range-checked where a bad value is worse than a startup failure --
+        # see _require_positive for the outbound rate limits' deadlock case (#200).
         request_timeout = _numeric_env(src, "WHOOPMCP_TIMEOUT", "30", parse=float)
         _require_positive("WHOOPMCP_TIMEOUT", request_timeout)
         rate_limit_per_minute = _numeric_env(
@@ -279,10 +207,8 @@ class Config:
             http_host=src.get("WHOOPMCP_HTTP_HOST", "127.0.0.1"),
             http_port=http_port,
             webhooks_enabled=_as_bool(src.get("WHOOPMCP_WEBHOOKS_ENABLED", "false")),
-            # Malformed still fails loudly; the range is deliberately NOT
-            # checked on these two -- webhook_rate_limit_per_minute's own
-            # documented convention is "0 or negative disables inbound
-            # limiting", and the skew has no deadlock-shaped failure mode.
+            # Range deliberately NOT checked here: 0/negative disables
+            # inbound limiting by convention, and skew has no deadlock mode.
             webhook_timestamp_skew_seconds=_numeric_env(
                 src, "WHOOPMCP_WEBHOOK_TIMESTAMP_SKEW_SECONDS", "300", parse=float
             ),
@@ -308,20 +234,11 @@ def _numeric_env(
     *,
     parse: Callable[[str], float] | Callable[[str], int],
 ) -> Any:
-    """Parse a numeric environment variable, or raise ``ConfigError`` naming it.
+    """Parse a numeric env var, or raise `ConfigError` naming it (#200).
 
-    ``from_env``'s docstring has always promised ``ConfigError`` for a
-    malformed variable, and ``WHOOPMCP_BACKFILL_FLOOR_DATE`` set the precedent
-    of validating up front so a bad value fails at startup naming the
-    variable. The six numeric variables below didn't get that treatment: a
-    bare ``float()``/``int()`` escaped as a raw ``ValueError`` traceback that
-    names nothing, past every caller that degrades ``ConfigError`` gracefully
-    (``doctor``'s configuration check, the CLI's startup handling) (#200).
-
-    Safe for ``doctor`` to relay by construction: the message interpolates the
-    variable's name and its (non-secret) offending value -- every variable
-    routed through here is a timeout, port or rate number, never key material,
-    which keeps config.py's "no raise site quotes a secret" rule intact.
+    Safe for `doctor` to relay: every variable routed through here is a
+    timeout/port/rate number, never key material, so the message never
+    quotes a secret.
     """
     raw = src.get(name, default)
     try:
@@ -334,20 +251,12 @@ def _numeric_env(
 
 
 def _require_positive(name: str, value: float) -> None:
-    """Reject a non-positive numeric variable with a ``ConfigError`` naming it.
+    """Reject a non-positive numeric variable with a `ConfigError` naming it.
 
-    The sharp case is the outbound rate limits (#200): ``RateLimiter.acquire``
-    grants only while its counters are ``> 0``, so a limit of 0 -- accepted
-    without complaint before this -- built a limiter that can never grant and
-    every request hung forever, silently. The trap was baited by
-    ``webhook_rate_limit_per_minute``, whose documented convention is the
-    opposite ("0 or negative disables inbound limiting"); an operator who
-    learned that and set the *outbound* limit to 0 expecting "no limit" got a
-    server that deadlocks on its first WHOOP call. That variable therefore
-    deliberately does NOT come through here; the outbound limits, the timeout
-    and the port do, because for each of them a non-positive value has no
-    working interpretation -- a 0 timeout is not "no timeout" to httpx, and a
-    port must be 1-65535 (the port's upper bound is checked at its call site).
+    Sharp case (#200): a 0 outbound rate limit builds a `RateLimiter` that can
+    never grant, hanging every request silently forever. Deliberately NOT
+    applied to `webhook_rate_limit_per_minute`, whose convention is the
+    opposite (0/negative disables inbound limiting).
     """
     if value <= 0:
         raise ConfigError(f"{name} must be greater than 0, got {value}")
@@ -356,14 +265,11 @@ def _require_positive(name: str, value: float) -> None:
 def _parse_token_encryption_keys(
     src: Mapping[str, str], *, required: bool
 ) -> tuple[dict[int, bytes], int | None]:
-    """Collect every `WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N>` present into a
-    version -> key mapping, plus the `WHOOPMCP_TOKEN_ENCRYPTION_KEY_VERSION`
-    pointer naming which one is current.
+    """Collect every `WHOOPMCP_TOKEN_ENCRYPTION_KEY_V<N>` into a version->key
+    mapping, plus which version is current.
 
-    This parsing only becomes mandatory when ``required`` is true (i.e.
-    ``token_backend == "encrypted-file"``) -- operators on the plain "file"
-    or "keyring" backends are unaffected by these variables being unset,
-    matching every other backend-specific setting in this module.
+    Mandatory only when `required` (token_backend == "encrypted-file");
+    file/keyring backends are unaffected by these being unset.
     """
     keys: dict[int, bytes] = {}
     for name, raw in src.items():

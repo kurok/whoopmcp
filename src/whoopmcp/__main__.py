@@ -22,42 +22,18 @@ if TYPE_CHECKING:
 
 
 def _route_uvicorn_access_log_to_stderr() -> None:
-    """Send uvicorn's access log to stderr before the HTTP transport starts.
+    """Redirect uvicorn's access log to stderr before the HTTP transport starts.
 
-    PRIVACY.md states that this software's logs go to stderr and are never
-    written to a file by it. That was false in hosted mode (#126). The SDK's
-    ``run_streamable_http_async`` builds ``uvicorn.Config`` with only host, port
-    and log level -- no ``log_config`` -- and uvicorn's default config points the
-    ``uvicorn.access`` handler at ``ext://sys.stdout``. So every request line,
-    client IP included, landed on stdout: for ``/webhooks/whoop`` and ``/metrics``
-    that is the IP of someone whose health data this server holds. The trap is an
-    operator redirecting stdout to a world-readable file *because the docs say
-    nothing is logged there*.
+    Uvicorn's default sends access log lines -- client IPs included -- to
+    stdout, contradicting PRIVACY.md's stderr-only promise (#126); an operator
+    who redirects stdout trusting that promise leaks IPs of people whose
+    health data this server holds.
 
-    There is no parameter to pass. ``MCPServer.run`` forwards ``**kwargs`` to
-    ``run_streamable_http_async``, whose signature is keyword-only and fixed, so
-    a ``log_config`` cannot be threaded through. What is reachable is uvicorn's
-    module-level ``LOGGING_CONFIG``: ``uvicorn.Config.__init__`` captures that
-    dict *by reference* as its default argument, so mutating it in place here --
-    before the server is constructed -- is seen by the ``dictConfig`` call uvicorn
-    makes from inside that same ``__init__``. Verified against the installed
-    uvicorn by identity check.
-
-    **This depends on the SDK not supplying its own ``log_config``.** If it ever
-    does, ``LOGGING_CONFIG`` stops being consulted and this redirect silently
-    does nothing. ``test_sdk_still_leaves_uvicorns_log_config_to_its_default``
-    pins exactly that, by reading the SDK's own source: it is the SDK's behaviour
-    that has to be watched, and a test that builds its *own* ``uvicorn.Config``
-    cannot see a change there -- which is what an earlier version of this
-    docstring wrongly claimed was covered.
-
-    The import is function-local for locality only, not to defer anything:
-    ``mcp`` declares ``uvicorn>=0.31.1`` as a hard dependency, and importing
-    ``whoopmcp.server`` -- which ``main`` does unconditionally, before the
-    transport branch -- already pulls uvicorn into ``sys.modules`` on both
-    transports via ``sse_starlette``. Measured; an earlier version of this
-    docstring claimed the local import avoided an HTTP-only import, and that
-    benefit does not exist here.
+    No kwarg reaches uvicorn's log_config through the SDK, so this mutates
+    ``uvicorn.config.LOGGING_CONFIG`` in place before ``uvicorn.Config`` is
+    built (its ``__init__`` captures that dict by reference). Breaks silently
+    if the SDK ever supplies its own log_config -- see
+    ``test_sdk_still_leaves_uvicorns_log_config_to_its_default``.
     """
     from uvicorn.config import LOGGING_CONFIG
 
@@ -97,8 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
     )
 
-    # Not `required=True`: the default (no subcommand) is "run the server",
-    # the behaviour every test above this comment already exercises.
+    # No `required=True`: default (no subcommand) means run the server.
     subparsers = parser.add_subparsers(dest="command")
     delete_member_parser = subparsers.add_parser(
         "delete-member",
@@ -283,26 +258,21 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    # stderr, never stdout: on stdio transport stdout carries the JSON-RPC
-    # framing and a stray log line corrupts the protocol.
+    # stderr only: stdout carries JSON-RPC framing on stdio transport, and a
+    # stray log line corrupts the protocol.
     logging.basicConfig(
         level=args.log_level,
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    # doctor is dispatched ahead of the up-front Config.from_env() below,
-    # deliberately: "missing configuration" is itself one of doctor's own
-    # checks, so it must reach doctor's own reporting rather than being
-    # preempted by the generic exit-2 path every other subcommand relies on.
+    # doctor runs before Config.from_env(): missing config is itself one of
+    # doctor's own checks, not the generic exit-2 path other subcommands use.
     if args.command == "doctor":
         return _doctor()
 
-    # Validate up front rather than leaving it to the lifespan. Once the
-    # server is running the lifespan executes inside an anyio task group,
-    # which wraps whatever it raises in an ExceptionGroup -- so a bare
-    # `except ConfigError` there would miss it and the user would get a
-    # traceback instead of the one line telling them which variable is unset.
+    # Validate here, not in the lifespan: anyio wraps lifespan exceptions in
+    # an ExceptionGroup, so `except ConfigError` there would miss it.
     try:
         config = Config.from_env()
     except ConfigError as exc:
@@ -346,31 +316,14 @@ def main(argv: list[str] | None = None) -> int:
 def _revoke_before_local_deletion(
     auth: Authenticator, conn: sqlite3.Connection, whoop_user_id: int
 ) -> int | None:
-    """Shared revoke-step for ``_delete_member``/``_erase_member`` (issue #65).
+    """Shared revoke-step for ``_delete_member``/``_erase_member`` (#65).
 
-    Returns ``None`` when the caller should proceed to local deletion, or a
-    nonzero exit code when it must abort instead. Two independent things can
-    make this a no-op-but-still-proceed rather than an abort:
-
-    1. Attribution: reuses ``_export_member``'s own
-       ``all_linked_whoop_user_ids(conn) == {whoop_user_id}`` predicate
-       verbatim (see that function for why guessing is unsafe). When it does
-       not hold, the single stored token cannot be attributed to
-       ``whoop_user_id`` -- skip the upstream revoke entirely rather than
-       revoking a different member's live grant, and point the operator at
-       WHOOP's own app settings instead.
-    2. "Nothing to revoke": ``revoke_and_forget`` raising
-       ``GrantAlreadyGoneError`` (no stored credentials, or WHOOP's
-       ``invalid_grant``) means the grant is already gone, not that
-       revocation failed -- treat it as revoke-step success and continue.
-
-    A plain ``AuthError`` (e.g. ``revoke_upstream``'s own non-2xx-response
-    path -- a genuine transport/network failure) is caught here and turned
-    into a nonzero exit code, which the caller returns BEFORE any local
-    deletion runs -- the same abort-with-data-intact outcome as before this
-    helper existed, just via a return code rather than an uncaught
-    exception. The ``except GrantAlreadyGoneError`` clause must stay ordered
-    before this one: the subclass is the only ignorable case.
+    Returns ``None`` to proceed with local deletion, else a nonzero exit code
+    to abort. Skips (not aborts) the revoke if the token can't be attributed
+    to ``whoop_user_id`` -- never revoke a different member's grant.
+    ``GrantAlreadyGoneError`` (subclass of ``AuthError``) means already
+    revoked, not failure; it must stay caught before the plain ``AuthError``
+    case, which does abort with a nonzero code.
     """
     from whoopmcp.auth import AuthError, GrantAlreadyGoneError
     from whoopmcp.store import all_linked_whoop_user_ids
@@ -402,23 +355,12 @@ def _revoke_before_local_deletion(
 def _refuse_if_store_is_ephemeral(config: Config, action: str) -> int | None:
     """Shared guard for the four data-rights/retention subcommands (#101).
 
-    Returns exit code 2 when the store is guaranteed in-memory and no file
-    has ever been created for it, or ``None`` when the caller should proceed
-    to ``open_store``.
-
-    Copies ``doctor.py``'s own ``_check_store`` condition verbatim --
-    ``config.store_is_ephemeral and not config.cache_path.exists()`` -- and
-    for the same two-part reason: a user who once ran with
-    ``WHOOPMCP_CACHE=true`` has a real ``cache.sqlite3`` holding real health
-    data, and refusing to touch it here would deny a data subject their
-    erasure/export right, which is a worse bug than the one this guard
-    exists to fix. The condition therefore only refuses when the file would
-    have to be *created* to proceed; a leftover file is opened exactly as
-    before. Unlike ``_backfill``/``_replay_webhook``/``_reconcile_webhooks``'s
-    own ``not cache_enabled`` guards, the message here must never advise
-    enabling the persistent store: telling someone who asked to delete,
-    export, or erase their data (or enforce retention on it) to first turn
-    on a cache is absurd advice for this class of subcommand.
+    Returns exit code 2 if the store is ephemeral and no cache file was ever
+    created, else ``None`` to proceed to ``open_store``. A leftover file from
+    past ``WHOOPMCP_CACHE=true`` use is still opened -- refusing would deny a
+    data subject their erasure/export right. Unlike other guards' ``not
+    cache_enabled`` message, never suggest enabling caching here -- absurd
+    advice for delete/export/erase/retention.
     """
     if config.store_is_ephemeral and not config.cache_path.exists():
         print(
@@ -432,27 +374,13 @@ def _refuse_if_store_is_ephemeral(config: Config, action: str) -> int | None:
 def _delete_member(config: Config, whoop_user_id: int) -> int:
     """Handle ``whoopmcp delete-member --whoop-user-id N``.
 
-    The only caller of ``Authenticator.revoke_and_forget`` anywhere in this
-    codebase -- that primitive is not, and must never become, an MCP tool
-    (see its own docstring for why); this CLI subcommand is the operator's
-    one way to trigger it. Deletes the local token, calls WHOOP's
-    ``DELETE /v2/user/access`` so the grant is revoked upstream rather than
-    merely forgotten, and removes the local principal link. Health data,
-    webhook events, and audit rows are untouched -- that is #32's job, not
-    this one's.
-
-    Local deletion is no longer conditioned on the upstream grant still
-    being alive, nor does it revoke a token it cannot attribute to this
-    member -- see ``_revoke_before_local_deletion`` (issue #65).
-
-    If the token store cannot be read at all -- backend extra missing, key
-    retired, file unreadable -- ``consent`` degrades to the same
-    scopes-unknown shape with its own note, and the export still writes in
-    full (#188). The document is the right being exercised; the consent field
-    describes it.
-
-    Refuses -- before opening anything -- when the store is ephemeral and no
-    file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101).
+    Only caller of ``Authenticator.revoke_and_forget`` (must never become an
+    MCP tool -- see its docstring). Revokes the WHOOP grant upstream and
+    deletes the local token + principal link; health data, webhook events,
+    and audit rows are untouched (#32's job). Doesn't revoke a token it can't
+    attribute to this member -- see ``_revoke_before_local_deletion`` (#65).
+    Refuses up front if the store is ephemeral with no file yet
+    (``_refuse_if_store_is_ephemeral``, #101).
     """
     from whoopmcp.auth import Authenticator
     from whoopmcp.store import (
@@ -468,9 +396,8 @@ def _delete_member(config: Config, whoop_user_id: int) -> int:
     conn = open_store(config.cache_path)
     try:
         if not principal_is_linked_to_member(conn, whoop_user_id):
-            # Refuse rather than silently no-op-succeed: a mismatched id is
-            # far more likely to be operator error than an intentional
-            # deletion of a member with nothing linked to it.
+            # Refuse rather than no-op: a mismatched id is more likely
+            # operator error than an intentional deletion of nothing.
             print(
                 f"whoopmcp: no principal is linked to whoop-user-id {whoop_user_id}",
                 file=sys.stderr,
@@ -491,26 +418,14 @@ def _delete_member(config: Config, whoop_user_id: int) -> int:
 def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
     """Handle ``whoopmcp export-member --whoop-user-id N [--out PATH]`` (#32).
 
-    Guards with the same ``principal_is_linked_to_member`` check
-    ``_delete_member``/``_erase_member`` use, then builds the export document
-    from ``store.export_member_data`` and adds one ``consent`` field: the
-    scopes actually granted and whether a token is currently stored. The
-    token store is read directly (``auth.build_store(config).load()``), never
-    through ``Authenticator.access_token()`` -- mirroring ``whoop_auth_status``'s
-    own "read the store, never trigger a refresh" precedent -- and only its
-    ``scopes``/presence are used; the token value itself never enters the
-    document.
-
-    There is exactly one token file, but ``principal_members`` can still hold
-    links to more than one distinct WHOOP member (see
-    ``store.all_linked_whoop_user_ids``): if it ever does, nothing local
-    records which member the stored token actually belongs to, so attaching
-    its scopes to *this* member's export would risk silently misattributing
-    another member's consent. In that case ``consent.scopes`` is reported as
-    ``None`` with an explanatory note instead of guessing.
-
-    Refuses -- before opening anything -- when the store is ephemeral and no
-    file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101).
+    Adds a ``consent`` field (granted scopes + token presence) to
+    ``store.export_member_data``'s document, reading the token store
+    directly -- never via ``access_token()``, which could trigger a refresh;
+    the token value itself never enters the document. If more than one
+    member is ever linked, which one owns the token is unknown, so
+    ``consent.scopes`` is reported as ``None`` with a note rather than
+    guessed. Refuses up front if the store is ephemeral with no file yet
+    (``_refuse_if_store_is_ephemeral``, #101).
     """
     from whoopmcp.auth import AuthError, atomic_write_text, build_store
     from whoopmcp.store import (
@@ -545,27 +460,11 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
                 "token_present": token is not None,
             }
         except AuthError:
-            # Degrade rather than fail: `consent` is a convenience describing
-            # what was granted, while the document itself is the data-subject
-            # right being exercised. Letting the convenience deny the right is
-            # backwards, and that is precisely what happened before #188 -- an
-            # unreadable token store threw away a health export that had already
-            # been read successfully.
-            #
-            # `AuthError` alone is enough since #190. It was not before: the
-            # file-backed stores let a raw `OSError` escape `load()` -- a token
-            # file that exists but cannot be read -- so this caught those too.
-            # #190 made both stores honour the `Token | None` or `AuthError`
-            # contract they already documented, which is where that belongs;
-            # every caller benefits rather than just this one.
-            #
-            # The narrowness that matters is the try body rather than which
-            # exception is caught: it holds only the token read and a dict
-            # literal, so nothing in scope here could fail in a way that ought
-            # to abort the export.
+            # Degrade, don't fail: consent is a convenience, an unreadable
+            # token store (#188) must not discard an already-built export.
             document["consent"] = {
                 "scopes": None,
-                "token_present": None,  # nosec B105 -- the literal None (unknown, not a credential value)
+                "token_present": None,  # nosec B105 -- not a credential
                 "note": (
                     "the token store could not be read, so granted scopes could not be determined"
                 ),
@@ -573,7 +472,7 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
     else:
         document["consent"] = {
             "scopes": None,
-            "token_present": None,  # nosec B105 -- the literal None (unknown, not a credential value)
+            "token_present": None,  # nosec B105 -- not a credential
             "note": (
                 "more than one WHOOP member has ever been linked in this store; "
                 "which one the single locally-stored token belongs to cannot be "
@@ -583,8 +482,8 @@ def _export_member(config: Config, whoop_user_id: int, out: Path | None) -> int:
 
     payload = json.dumps(document, indent=2)
     if out is not None:
-        # #68: the same 0600, no-world-readable-window write auth.py's token
-        # stores use -- this document is the member's full health record.
+        # #68: same 0600 no-world-readable-window write as auth.py's token
+        # stores -- this is the member's full health record.
         atomic_write_text(out, payload)
     else:
         print(payload)
@@ -595,29 +494,14 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
     """Handle ``whoopmcp erase-member --whoop-user-id N`` (#32).
 
     The full data-subject erasure story: revokes the WHOOP grant upstream and
-    forgets the local token (``Authenticator.revoke_and_forget``, #30's own
-    primitive, reused verbatim rather than rebuilt), then permanently deletes
-    every row ``store.erase_member_data`` covers (health data, webhook
-    events, audit rows) plus the principal link
-    (``delete_principal_links_for_member``, also reused from #30). Guards
-    with the same mismatched-id refusal ``_delete_member`` uses, in the same
-    order -- no local deletion on a refusal.
-
-    Local deletion is no longer conditioned on the upstream grant still
-    being alive, nor does it revoke a token it cannot attribute to this
-    member -- see ``_revoke_before_local_deletion`` (issue #65).
-
-    After the erasure commits, compacts the database file to overwrite freed
-    pages (issue #100): deleted bytes are otherwise recoverable in the file
-    in free space. A failed compaction does not abort or report as erasure
-    failure (the deletes are already committed and irreversible); it prints
-    a distinct stderr message (issue #100, decision D3) and returns exit
-    code 3 -- distinct from the pre-deletion abort's 1, so callers can tell
-    "nothing was deleted" from "deleted, compaction pending" without
-    parsing stderr.
-
-    Refuses -- before opening anything -- when the store is ephemeral and no
-    file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101).
+    forgets the local token, deletes every row ``store.erase_member_data``
+    covers (health data, webhook events, audit rows) plus the principal
+    link, then compacts the database (#100) so freed pages aren't left
+    recoverable in the file. Doesn't revoke a token it can't attribute to
+    this member -- see ``_revoke_before_local_deletion`` (#65). A failed
+    compaction doesn't undo the erasure (already committed) -- prints to
+    stderr and returns exit code 3 (vs. the pre-deletion abort's 1). Refuses
+    up front if the store is ephemeral with no file yet (#101).
     """
     import sqlite3
 
@@ -665,15 +549,11 @@ def _erase_member(config: Config, whoop_user_id: int) -> int:
 def _enforce_retention(config: Config, max_age_days: int) -> int:
     """Handle ``whoopmcp enforce-retention [--max-age-days N]`` (#32).
 
-    There is no scheduler anywhere in this repository -- this subcommand IS
-    the retention job; an operator wires it into their own cron or systemd
-    timer. Prints a one-line per-table summary to stderr and never a token
-    value, since nothing here ever reads one.
-
-    Refuses -- before opening anything -- when the store is ephemeral and no
-    file exists yet; see ``_refuse_if_store_is_ephemeral`` (#101). Printing
-    the per-table summary in that case would be a false success: no
-    retention work happened against a store that does not exist.
+    No scheduler exists in this repo -- this subcommand IS the retention job;
+    an operator wires it into cron/systemd. Prints a one-line per-table
+    summary to stderr, never a token value. Refuses up front if the store is
+    ephemeral with no file yet (#101); a summary there would be a false
+    success.
     """
     from whoopmcp.store import enforce_retention, open_store
 
@@ -695,12 +575,9 @@ def _enforce_retention(config: Config, max_age_days: int) -> int:
 def _doctor() -> int:
     """Handle ``whoopmcp doctor`` (#35).
 
-    Prints one line per check to stdout -- plain, human-readable text, not
-    JSON: this is a terminal diagnostic an operator reads themselves, the
-    same audience ``enforce-retention``'s own plain summary targets. Exits 0
-    only if every check came back clean; 1 if any did not. Never 2 -- that
-    code is reserved for the bad-argument class of error the other
-    subcommands use, and doctor takes no arguments to get wrong.
+    Prints one plain line per check to stdout (a terminal diagnostic, not
+    JSON). Exits 0 only if every check passed, else 1 -- never 2, which is
+    reserved for bad-argument errors this no-argument subcommand can't have.
     """
     from whoopmcp.doctor import run_checks
 
@@ -717,14 +594,11 @@ def _doctor() -> int:
 def _backfill(config: Config, whoop_user_id: int) -> int:
     """Handle ``whoopmcp backfill --whoop-user-id N`` (#14).
 
-    Refuses -- before opening anything -- unless ``config.cache_enabled`` is
-    set: PRIVACY.md promises the persistent store is off by default, and
-    backfill is the first bulk writer that would otherwise break that
-    promise. Guards with the same ``principal_is_linked_to_member`` refusal
-    ``_delete_member`` uses ("the user is an argument, never ambient" -- the
-    id is explicit and verified against the login-written link, never
-    inferred), then runs ``backfill.run_backfill`` and prints a one-line
-    per-entity summary to stderr -- never stdout, never a token value.
+    Refuses up front unless ``config.cache_enabled`` -- PRIVACY.md promises
+    the persistent store is off by default, and this is the first bulk
+    writer that would break that promise. Guards on
+    ``principal_is_linked_to_member`` like ``_delete_member``, then runs
+    ``backfill.run_backfill`` and prints a one-line summary to stderr only.
     """
     from whoopmcp import backfill as backfill_module
     from whoopmcp.auth import Authenticator, AuthError
@@ -773,20 +647,12 @@ def _backfill(config: Config, whoop_user_id: int) -> int:
 def _replay_webhook(config: Config, trace_id: str) -> int:
     """Handle ``whoopmcp replay-webhook --trace-id ID`` (#19).
 
-    No ``--whoop-user-id`` guard, unlike ``backfill``/``erase-member``: the
-    stored event already carries its own ``whoop_user_id`` in
-    ``webhook_events``, and the #66 not-yet-actionable use case specifically
-    requires replaying an event for a member who may only just now be
-    linked. Prints only a one-line summary to stderr, never the event body
-    (never a token, never health data) -- mirrors ``webhooks.py``'s own
-    no-payload-in-logs rule.
-
-    Refuses -- before opening anything -- unless ``config.cache_enabled`` is
-    set, exactly like ``backfill``/``reconcile-webhooks``: a pending row's
-    replay fetches from WHOOP and writes into the persistent store, which
-    PRIVACY.md promises is off by default. An operator with an old store
-    file left over from an earlier ``WHOOPMCP_CACHE=true`` period must not
-    have this subcommand quietly keep writing to it after disabling caching.
+    No ``--whoop-user-id`` guard: the stored event already carries its own
+    ``whoop_user_id`` (#66 needs replay for a member only just now linked).
+    Prints only a one-line summary to stderr -- never the event body, a
+    token, or health data. Refuses up front unless ``config.cache_enabled``,
+    like ``backfill``/``reconcile-webhooks``: replay writes into the
+    persistent store, which is off by default.
     """
     from whoopmcp.auth import Authenticator, AuthError
     from whoopmcp.client import WhoopAPIError, WhoopClient
@@ -834,13 +700,11 @@ def _replay_webhook(config: Config, trace_id: str) -> int:
 def _reconcile_webhooks(config: Config, whoop_user_id: int, window_days: int) -> int:
     """Handle ``whoopmcp reconcile-webhooks --whoop-user-id N [--window-days N]`` (#19).
 
-    The periodic full-reconciliation backstop: refuses -- before opening
-    anything -- unless ``config.cache_enabled`` is set (mirrors
-    ``_backfill``'s own guard: this reads and writes the persistent store),
-    and guards with the same ``principal_is_linked_to_member`` confirmation
-    check every other operator-only subcommand uses. Prints a one-line
-    per-resource ``fetched=M closed=N`` summary to stderr -- never stdout,
-    never a token value.
+    Periodic full-reconciliation backstop for #15's incremental sync.
+    Refuses up front unless ``config.cache_enabled`` (reads/writes the
+    persistent store), and guards on ``principal_is_linked_to_member`` like
+    other operator-only subcommands. Prints a one-line per-resource summary
+    to stderr only, never a token value.
     """
     from whoopmcp.auth import Authenticator, AuthError
     from whoopmcp.client import WhoopAPIError, WhoopClient
@@ -889,10 +753,8 @@ def _reconcile_webhooks(config: Config, whoop_user_id: int, window_days: int) ->
         f"(window_days={window_days}): {summary}",
         file=sys.stderr,
     )
-    # A run that *declined* to close records must not read as a run that found
-    # nothing to close (#175) -- both show `closed=0` in the summary above, and
-    # an operator who cannot tell them apart never learns their reconciliation
-    # has been refusing to do its job.
+    # #175: a declined close must not look like nothing-to-close (both show
+    # closed=0) or an operator never learns reconciliation is refusing to act.
     for resource, result in sorted(results.items()):
         if result.withheld is not None:
             print(f"whoopmcp: {resource}: {result.withheld}", file=sys.stderr)
@@ -902,15 +764,10 @@ def _reconcile_webhooks(config: Config, whoop_user_id: int, window_days: int) ->
 def _extract_code_and_state(pasted: str) -> tuple[str | None, str | None]:
     """Parse ``code``/``state`` out of whatever the user pasted (D1, steps 1-2).
 
-    Tries ``urlparse`` first: its ``query`` reads correctly whether the
-    paste is a full redirect URL with a custom scheme or an ``https://``
-    one, since either way ``code``/``state`` are ordinary query parameters.
-    Falls back to ``parse_qs`` on the raw string for a bare
-    ``code=...&state=...`` fragment -- verified empirically that ``urlparse``
-    alone cannot read that shape: with no scheme, the whole string lands in
-    ``path`` and ``query`` comes back empty. Returns ``(None, None)`` if
-    neither yields both keys; the caller prompts separately in that case
-    (D1 step 3) rather than guessing from a partial match.
+    Tries ``urlparse().query`` first (works for full redirect URLs, any
+    scheme); falls back to ``parse_qs`` on the raw string for a bare
+    ``code=...&state=...`` fragment, since a schemeless string leaves
+    ``query`` empty. Returns ``(None, None)`` if neither yields both keys.
     """
     for query in (urlparse(pasted).query, pasted):
         parsed = parse_qs(query)
@@ -924,39 +781,15 @@ def _extract_code_and_state(pasted: str) -> tuple[str | None, str | None]:
 def _login(config: Config) -> int:
     """Handle ``whoopmcp login`` (#76).
 
-    The terminal-native counterpart to the in-chat ``whoop_login``/
-    ``whoop_complete_login`` pair, which stays exactly as it is -- some MCP
-    clients have no terminal a user can reach. Today the authorization code
-    travels through the MCP client and its model provider on its way back to
-    ``whoop_complete_login``; running the same exchange here, with no model
-    in the loop, is the entire point of this subcommand. Reuses
-    ``Authenticator`` unchanged (the OAuth exchange itself is not
-    reimplemented here) and constructs exactly one instance for the whole
-    invocation: the pending ``state`` from ``start_login`` lives only on
-    that instance, so a second ``Authenticator`` would break
-    ``verify_state``.
-
-    No localhost listener -- ``config.py`` rejects any non-``https://``
-    redirect URI outright (WHOOP's dashboard rejects plain ``http://``,
-    including ``http://localhost``), so manual paste is the only mechanism
-    the redirect scheme leaves. No browser auto-launch either, a deliberate
-    choice rather than an omission: it adds a failure mode for zero benefit
-    to the likely user of a terminal subcommand (headless box, SSH session,
-    container), and printing the URL is enough -- most terminals make it
-    clickable. Every prompt goes to stderr and is read from stdin, matching
-    this CLI's stderr-only output discipline; no TUI, no spinner, no colour.
-
-    ``verify_state`` runs strictly before ``exchange_code`` (D4): a
-    mismatched state must mean the code is never spent at all, not
-    exchanged and then discarded. ``exchange_code`` already persists to
-    whichever store ``WHOOPMCP_TOKEN_BACKEND`` selects, so there is no
-    separate save step here. Never echoes the code or the state anywhere --
-    not on success, not in an error message, not in a log line -- since an
-    authorization code is a credential; only the granted scopes are
-    reported on success, mirroring ``whoop_complete_login``'s own line.
-    Error shape copied from ``_delete_member``/``_erase_member``: catch
-    ``AuthError``, print one ``whoopmcp: ...`` line to stderr, return
-    non-zero -- never let an ``AuthError`` reach the user as a traceback.
+    Terminal counterpart to the in-chat ``whoop_login``/``whoop_complete_login``
+    pair (unchanged) -- runs the OAuth exchange with no model in the loop, one
+    ``Authenticator`` per invocation (``verify_state`` needs the same instance
+    ``start_login`` used). Redirect URI must be ``https://`` (no localhost
+    listener), so manual paste is the only path; no browser auto-launch.
+    ``verify_state`` runs strictly before ``exchange_code`` (D4) so a
+    mismatched state can't spend the code; the code/state are never echoed
+    anywhere -- they're credentials. Catches ``AuthError``, prints one stderr
+    line, returns nonzero.
     """
     from whoopmcp.auth import Authenticator, AuthError
 

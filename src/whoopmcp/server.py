@@ -1,13 +1,7 @@
 """The MCP server: tool definitions and their wiring.
 
-Built on the official Python SDK's ``MCPServer`` (the class FastMCP became in
-mcp 2.0). Every tool here is annotated read-only, because every tool here is
-read-only -- there is no write path to a user's WHOOP account in this server,
-and clients that surface ``readOnlyHint`` should be able to say so.
-
-Tool docstrings are prompt surface, not just developer documentation: they are
-what the model sees when deciding which tool to call. They state units and
-they state what the data is not (a diagnosis).
+Built on the SDK's ``MCPServer``; every tool is read-only. Docstrings here
+are prompt surface -- the model reads them when deciding what to call.
 """
 
 from __future__ import annotations
@@ -68,14 +62,8 @@ logger = logging.getLogger("whoopmcp")
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True)
 
-#: For ``whoop_sync`` (#15) alone: WHOOP itself is only ever read (GET), but
-#: the tool's entire purpose is writing upserted records to the local store,
-#: so ``read_only_hint=True`` would be factually wrong per MCP's own
-#: semantics ("does not modify its environment") -- a client that trusts the
-#: hint could auto-approve it without the confirmation a writing tool
-#: otherwise warrants. ``destructive_hint=False`` and ``idempotent_hint=True``
-#: are both accurate: every write is an upsert, and running it twice with no
-#: new upstream data is a no-op.
+#: whoop_sync (#15) writes to the local store, so read_only_hint=True would be
+#: wrong; every write is an idempotent upsert.
 SYNCS_LOCAL_STORE = ToolAnnotations(
     read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True
 )
@@ -116,11 +104,8 @@ Guidance:
 class Principal:
     """The identity a tool call runs as.
 
-    Every data/analysis tool receives this through ``AppContext`` rather than
-    resolving a user id itself -- see CONTRIBUTING.md: "the user is an
-    argument, never ambient." Single-user today; the shape is what lets a
-    second user become a change to one resolver later (#29) instead of a
-    rewrite of every tool.
+    Passed through ``AppContext`` rather than resolved per-call; see
+    CONTRIBUTING.md ("the user is an argument, never ambient").
     """
 
     user_id: int
@@ -134,20 +119,15 @@ class AppContext:
     auth: Authenticator
     client: WhoopClient
     principal: Principal | None = None
-    #: The persistent store (#13), opened by ``lifespan`` for the life of the
-    #: process. ``None`` only for a deployment/test that never opened one --
-    #: see ``resolve_member_id`` for what that means for identity resolution.
+    #: Persistent store opened by lifespan() (#13); None only if never opened.
     store_conn: sqlite3.Connection | None = None
 
 
 async def _resolve_principal(client: WhoopClient) -> Principal | None:
     """Best-effort resolve the signed-in user's identity via a live profile call.
 
-    Must never raise: called from ``lifespan()`` at startup, where "not
-    logged in yet" is the ordinary case, not a failure -- an exception here
-    would crash server startup over it. Any failure, or a successful
-    response missing a usable ``user_id``, resolves to "no principal yet"
-    rather than propagating.
+    Must never raise: called from lifespan() at startup, where "not logged
+    in yet" is normal. Any failure degrades to None, never propagates.
     """
     try:
         profile = await client.get_profile()
@@ -158,14 +138,8 @@ async def _resolve_principal(client: WhoopClient) -> Principal | None:
             return None
         return Principal(user_id=int(user_id))
     except Exception:
-        # Deliberately broad: token-store read errors like UnicodeDecodeError
-        # or PermissionError, malformed JSON responses (json.JSONDecodeError),
-        # a client not entered as a context manager (RuntimeError), network
-        # failures, auth failures (AuthError), and user_id coercion failures
-        # (ValueError/TypeError from int()) must all degrade to None, never
-        # propagate, since this runs inside lifespan() and an exception there
-        # crashes the whole server at startup over what is usually just "not
-        # logged in yet".
+        # Deliberately broad: must degrade to None, never propagate -- this
+        # runs inside lifespan(), where an exception crashes server startup.
         return None
 
 
@@ -173,38 +147,14 @@ async def _resolve_principal(client: WhoopClient) -> Principal | None:
 async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
     """Build the config, auth and HTTP client once, and tear them down cleanly.
 
-    Under streamable-http (#27) with more than one worker, each process gets
-    its own independent Authenticator, so the plain asyncio.Lock inside the
-    default InProcessRefreshLock no longer serialises refreshes across them.
-    A cross-process RefreshLock was deliberately NOT wired in here -- see the
-    "Known limitation" note on create_streamable_http_app() below for why a
-    lock alone (without changing Authenticator.refresh()'s internals, which
-    this issue's own acceptance criteria forbid) cannot actually prevent two
-    workers from both completing a refresh with the same soon-to-rotate
-    token. stdio keeps InProcessRefreshLock, unchanged, since it is always
-    exactly one process and this doesn't apply to it.
+    Under streamable-http with multiple workers, each process gets its own
+    Authenticator, so refreshes aren't serialised across them; a cross-process
+    lock was deliberately not added here (see create_streamable_http_app).
 
-    Opens the store (#13) -- issue #29's principal<->member join and audit
-    log need it on every request, not only when webhooks are enabled, so
-    opening it is not gated on `config.webhooks_enabled` the way the webhook
-    consumer task below still is. But *where* it opens follows
-    `Config.store_is_ephemeral` (#74): in default local stdio mode -- no
-    `WHOOPMCP_CACHE`, no webhooks -- the store lives in memory only, because
-    PRIVACY.md promises that mode persists nothing but the token, and an
-    unconditionally-created `cache.sqlite3` broke that promise. Every other
-    mode (hosted, `WHOOPMCP_CACHE=true`, or webhooks enabled) still opens
-    `config.cache_path` on disk, unchanged. Also starts the webhook
-    consumer (#18), when there is one to start: `build_server()` stashes the
-    queue `register_webhook_routes` returns on `_server._webhook_queue` (see
-    that function's own call site for why) -- an ad hoc attribute rather than
-    a new constructor parameter, since `lifespan` is handed to `MCPServer(...)`
-    and then called back by the SDK itself with exactly one argument, the
-    server it belongs to; `_server` is the only channel available to get
-    anything from `build_server()`'s scope into this function without
-    changing that call shape. Absent (a server built by a test that never
-    called `register_webhook_routes`) or `webhooks_enabled` false: no
-    consumer task runs, matching `register_webhook_routes`'s own "off unless
-    configured" default -- the store itself is unaffected either way.
+    Opens the store (#13): in-memory for default stdio (no WHOOPMCP_CACHE, no
+    webhooks -- PRIVACY.md promises nothing but the token persists), on disk
+    otherwise (#74). Starts the webhook consumer task (#18) when
+    webhooks_enabled and a queue was stashed on the server by build_server().
     """
     config = Config.from_env()
     auth = Authenticator(config)
@@ -215,20 +165,8 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
         ephemeral = config.store_is_ephemeral
         store_conn = open_store(":memory:" if ephemeral else config.cache_path)
         if ephemeral and principal is not None:
-            # Seed the principal<->member link the ephemeral store cannot
-            # have inherited from a previous process. `resolve_member_id`
-            # requires a real `principal_members` row and has no fallback to
-            # `app.principal` -- deliberately, since #29 depends on that
-            # contract -- so without this every data tool would raise
-            # UnresolvedPrincipalError after a restart even though the token
-            # on disk is perfectly valid. `_principal_key(None)` is exactly
-            # the key those tools will look under: there is no request at
-            # lifespan time, and this branch is stdio-only, so the local
-            # sentinel is the only principal that can ever call in here.
-            # This is a real row from the live grant, not a fallback: the
-            # profile call above already proved the token authorises this
-            # member. `principal is None` (not logged in) seeds nothing, so
-            # tools correctly say "run whoop_login".
+            # Seed the principal<->member link an ephemeral store can't
+            # inherit across restarts; without it every tool raises (#29).
             client_id, issuer, subject = _principal_key(None)
             store.link_principal_to_member(
                 store_conn,
@@ -250,14 +188,8 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
             if consumer_task is not None:
                 consumer_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    # Awaited for its side effect (blocking until the task
-                    # has actually finished cancelling), not its result --
-                    # assigned to make that discard explicit rather than a
-                    # bare expression statement. mypy's func-returns-value
-                    # check misfires on any assignment of an
-                    # asyncio.Task[None]'s await result, regardless of the
-                    # assignment target's own type -- verified in isolation,
-                    # not assumed.
+                    # Awaited for the side effect (blocks until cancellation
+                    # finishes); mypy misfires on this assignment.
                     _ = await consumer_task  # type: ignore[func-returns-value]
             store_conn.close()
 
@@ -265,12 +197,9 @@ async def lifespan(_server: MCPServer[Any]) -> AsyncIterator[AppContext]:
 def _ensure_principal(app: AppContext) -> Principal:
     """Gate a data/analysis tool on an already-resolved identity.
 
-    Deliberately not a resolver: a lazy per-call resolve would cost an extra
-    ``get_profile()`` request on every data/analysis tool invocation whenever
-    the principal happens to be unset, which fights issue #11's whole point
-    (conserving WHOOP's rate-limit budget). Resolution happens only in
-    ``lifespan()`` and after ``whoop_complete_login`` -- this just checks the
-    result.
+    Not a resolver: a lazy per-call resolve would cost an extra get_profile()
+    request per invocation, fighting #11's rate-limit budget. Resolution
+    happens only in lifespan() and after whoop_complete_login.
     """
     if app.principal is None:
         raise AuthError("no WHOOP identity resolved; run whoop_login to authenticate")
@@ -278,40 +207,26 @@ def _ensure_principal(app: AppContext) -> Principal:
 
 
 class UnresolvedPrincipalError(RuntimeError):
-    """The calling MCP principal has no WHOOP member linked to it.
+    """A known principal has no WHOOP member linked to it.
 
-    Distinct from ``AuthError`` ("nobody is logged in to WHOOP at all"):
-    this means a principal is known -- a bearer token's identity, or the
-    local stdio sentinel -- but no completed WHOOP authorisation has ever
-    linked it to a member via ``store.link_principal_to_member``. Raised by
-    ``resolve_member_id`` (and by ``_ensure_matches_live_grant`` for the
-    "resolves to a real member, but not this process's live grant" case).
-    Never resolved by defaulting to some other member -- see both
-    functions' own docstrings.
+    Distinct from ``AuthError`` ("nobody is logged in"). Raised by
+    ``resolve_member_id`` and ``_ensure_matches_live_grant``; never
+    resolved by defaulting to some other member.
     """
 
 
-#: Fixed principal key for stdio / no-bearer-auth-wired deployments (today's
-#: only real deployment shape): one completed login links this one sentinel
-#: to a member, rather than inventing per-connection identity that #28's
-#: resource-server layer doesn't produce in that mode.
+#: Fixed principal key for stdio/no-bearer-auth deployments: one login links
+#: this sentinel to a member rather than inventing per-connection identity.
 _LOCAL_PRINCIPAL_CLIENT_ID = "__local__"
 
 
 def _principal_key(request: Any | None) -> tuple[str, str | None, str | None]:
     """The (client_id, issuer, subject) triple identifying `request`'s caller.
 
-    Reads only `request.user` -- the `AuthenticatedUser` a verified bearer
-    token resolves to under streamable-http with #28's auth wired -- via the
-    SDK's own `principal_components()`, the single source `authorization
-    _context`/session-ownership binding already use for "who is this token's
-    principal". Never reads `request.query_params` or `request.headers`:
-    those are caller-supplied and are exactly the smuggling vector #28's own
-    `list_tools_protected` and this function both refuse to consult for
-    identity. `request` is `None` under stdio, or before #28's resource
-    server is wired into a deployment's transport -- both degrade to the
-    fixed local sentinel below, never to inventing a per-request identity
-    from anything the caller could control.
+    Reads only request.user (a verified bearer token's identity), never
+    query_params or headers -- those are caller-supplied smuggling vectors.
+    `request` is None under stdio or before auth is wired; both fall back
+    to the fixed local sentinel.
     """
     user = getattr(request, "user", None) if request is not None else None
     if isinstance(user, AuthenticatedUser):
@@ -322,14 +237,9 @@ def _principal_key(request: Any | None) -> tuple[str, str | None, str | None]:
 def _tool_name(ctx: Context[AppContext, Any]) -> str:
     """The name of the tool or resource this call is invoking, for the audit log.
 
-    ``ctx.request_context.params`` is a plain ``Mapping`` in production (the
-    raw ``tools/call``/``resources/read`` JSON-RPC params, read before typed
-    validation) but a real ``CallToolRequestParams``/``ReadResourceRequestParams``
-    in tests that build one directly -- both carry a ``name`` (tools) or a
-    ``uri`` (resources), just via a different access pattern. A resource read
-    has no ``name`` at all, so falling back to ``name`` alone would silently
-    audit every resource read as ``"<unknown>"``; fall back to ``uri`` before
-    giving up.
+    params is a plain Mapping in production but a typed request object in
+    tests; both carry "name" (tools) or "uri" (resources) via a different
+    access pattern. Falls back to uri since a resource read has no name.
     """
     params = ctx.request_context.params
     if isinstance(params, Mapping):
@@ -342,29 +252,18 @@ def _tool_name(ctx: Context[AppContext, Any]) -> str:
 def resolve_member_id(ctx: Context[AppContext, Any]) -> int:
     """Resolve the calling MCP principal to a WHOOP member id, once, at the edge.
 
-    The one join point between an MCP principal (#28's bearer token, or the
-    local stdio sentinel) and a WHOOP member (#8's ``Principal``): every
-    data/analysis tool calls this exactly once, as its first line via
-    ``_ensure_matches_live_grant``, and threads the returned id through
-    rather than re-resolving. Reads only the ``principal_members`` mapping
-    table (via ``_principal_key``, never a caller-supplied parameter, header,
-    or query string) and audits the call (``store.record_tool_call``) in the
-    same step resolution succeeds, so a tool that resolves but "forgets" to
-    audit is structurally impossible -- there is only one call site for
-    either.
-
-    Requires a persistent store (``AppContext.store_conn``). The store is
-    always opened by ``lifespan()``, so only deployments or tests that
-    construct ``AppContext`` outside ``lifespan()`` encounter an error here.
+    The one join point between an MCP principal and a WHOOP member: every
+    data/analysis tool calls this once via ``_ensure_matches_live_grant`` and
+    threads the id through rather than re-resolving. Reads only
+    principal_members (via ``_principal_key``, never caller-supplied data)
+    and audits the call in the same step, so resolving without auditing is
+    structurally impossible.
 
     Raises:
-        RuntimeError: ``AppContext.store_conn`` is None. The persistent store
-            is required for principal-to-member resolution. This is always
-            opened by ``lifespan()``, so this error only occurs if ``AppContext``
-            is constructed outside that context.
-        UnresolvedPrincipalError: no ``principal_members`` row links the
-            calling principal to a member. Never a default, never a
-            fallback to some other member.
+        RuntimeError: store_conn is None (only if AppContext is built
+            outside lifespan()).
+        UnresolvedPrincipalError: no principal_members row links this
+            caller to a member.
     """
     app = ctx.request_context.lifespan_context
     if app.store_conn is None:
@@ -392,14 +291,9 @@ def _ensure_matches_live_grant(ctx: Context[AppContext, Any]) -> int:
     """Gate a live-WHOOP-client tool on the resolved identity matching this
     process's one live grant, and return the resolved member id.
 
-    Every data/analysis tool today calls the single process-wide live
-    ``WhoopClient`` -- #13's store isn't read by any tool yet, so there is
-    no per-member live client to route a resolved identity to.
-    ``resolve_member_id`` must still answer truthfully even when the
-    resolved member is not this grant (see its own tests, e.g. a spoofed
-    hint must never be adopted) -- the refusal for that mismatch belongs
-    one layer up, here, in the one place that actually knows "the live
-    client can only ever speak for one member".
+    Every tool calls the single process-wide WhoopClient; there is no
+    per-member routing yet, so a mismatched resolved member is refused here
+    rather than silently served by the wrong grant.
     """
     app = ctx.request_context.lifespan_context
     whoop_user_id = resolve_member_id(ctx)
@@ -416,34 +310,11 @@ def _ensure_matches_live_grant(ctx: Context[AppContext, Any]) -> int:
 async def _check_token_store_reachable() -> tuple[bool, str]:
     """Readiness check: the configured token store can be read without raising.
 
-    Builds its own ``Config.from_env()`` rather than reaching into the live
-    AppContext: a ``custom_route`` handler gets a plain Starlette ``Request``,
-    not the ``ctx.request_context.lifespan_context`` every MCP tool gets, and
-    under streamable-http the SDK keeps the resolved AppContext only on
-    ``StreamableHTTPSessionManager``'s own private ``_lifespan_state``
-    (`mcp/server/streamable_http_manager.py`, `StreamableHTTPSessionManager.run`)
-    -- there is no public accessor for it (`MCPServer.session_manager` exposes
-    the session manager itself, per its own docstring, "to enable advanced use
-    cases like mounting multiple MCPServer instances", but not that private
-    attribute). ``Config.from_env()`` is a pure, uncached read of the same
-    environment ``lifespan()`` itself reads, so this reconstructs an equal
-    ``Config`` rather than depending on SDK internals outside its public
-    contract.
-
-    A clean "not logged in yet" is not an infrastructure failure:
-    ``FileTokenStore.load()`` already returns ``None`` for that case rather
-    than raising, so it reports ready here exactly like a valid token would.
-    Only a genuine read failure -- a corrupt token file, a permissions error,
-    anything ``build_store(...).load()`` actually raises -- counts as not
-    ready.
-
-    Runs the (synchronous, possibly-blocking -- a local file read, or under
-    the keyring backend a real OS keychain call) store read in a thread, so
-    a contended or slow store can't stall the event loop this handler shares
-    with every other in-flight request. The detail string reports only the
-    exception's type, not its message: ``FileTokenStore``'s own error text
-    includes the token file's absolute path, which this endpoint has no
-    business handing to an unauthenticated caller polling /ready.
+    Builds its own Config.from_env() since a custom_route handler has no
+    access to the lifespan-resolved AppContext. A clean "not logged in yet"
+    (None) counts as ready; only a genuine read failure does not. Runs in a
+    thread so a slow store can't stall the event loop. Reports only the
+    exception's type, never its message (may leak the token file's path).
     """
     try:
         await asyncio.to_thread(build_store(Config.from_env()).load)
@@ -452,9 +323,8 @@ async def _check_token_store_reachable() -> tuple[bool, str]:
     return True, "ok"
 
 
-#: Named, independent readiness checks: add a ``(name, check)`` pair here
-#: (e.g. a sync-freshness check once #13/#15 land) rather than restructuring
-#: the /ready handler itself.
+#: Named, independent readiness checks: add a (name, check) pair here rather
+#: than restructuring the /ready handler.
 _READINESS_CHECKS: list[tuple[str, Callable[[], Awaitable[tuple[bool, str]]]]] = [
     ("token_store_reachable", _check_token_store_reachable),
 ]
@@ -463,23 +333,15 @@ _READINESS_CHECKS: list[tuple[str, Callable[[], Awaitable[tuple[bool, str]]]]] =
 def _register_health_routes(server: MCPServer[AppContext]) -> None:
     """Liveness and readiness for the streamable-http transport (#27).
 
-    Plain HTTP via ``custom_route``, not MCP tools: an operator's load
-    balancer or orchestrator polls these the same way it would for any other
-    service, without needing an MCP client to do it. Not reachable under
-    stdio -- there is no HTTP surface there -- so only streamable-http
-    deployments see these at all. Deliberately just liveness/readiness: no
-    OAuth-callback route belongs here, and the webhook receiver (#17) is
-    registered separately by ``register_webhook_routes`` -- see that
-    function's own docstring for why it reads ``Config`` fresh per request
-    rather than once at server-build time, the same shape of problem
-    ``_check_token_store_reachable`` below already solves the same way.
+    Plain HTTP via custom_route, not MCP tools, so a load balancer can poll
+    without an MCP client. Only reachable under streamable-http. Just
+    liveness/readiness -- the OAuth callback and webhook receiver (#17) are
+    registered elsewhere.
     """
 
     @server.custom_route("/health", methods=["GET"])
     async def health(_request: Request) -> Response:
-        # Liveness means "the process can respond", not "everything
-        # downstream works" -- must not touch AppContext/lifespan, so a
-        # problem inside the lifespan can't take this down too.
+        # Liveness = "process can respond"; must not touch AppContext/lifespan.
         return JSONResponse({"status": "ok"})
 
     @server.custom_route("/ready", methods=["GET"])
@@ -499,50 +361,25 @@ def _register_health_routes(server: MCPServer[AppContext]) -> None:
 def _register_metrics_route(server: MCPServer[AppContext]) -> None:
     """``GET /metrics``: Prometheus exposition for issue #31.
 
-    Same shape of problem ``_check_token_store_reachable`` and
-    ``register_webhook_routes`` already solve: a ``custom_route`` handler
-    gets a plain Starlette ``Request``, never the lifespan-resolved
-    ``AppContext``, so ``Config`` is read fresh per request rather than
-    captured once at server-build time, and the store connection is opened
-    and closed here rather than reused from ``AppContext.store_conn``.
-
-    Fails closed on both axes the issue's Notes and decision D2/D3 require:
-
-    - No ``WHOOPMCP_METRICS_TOKEN`` configured -> ``404``, byte-for-byte the
-      plain-text ``Not Found`` Starlette itself returns for an unregistered
-      path, so this route's existence isn't advertised either. Per the SDK's
-      own docstring, a ``@custom_route``
-      "will not require authorization" on its own -- unlike every MCP tool,
-      which goes through the SDK's auth middleware -- so this handler is
-      the only thing standing between the internet and per-member health
-      data once a token *is* configured.
-    - Token configured but the request's ``Authorization`` header is
-      missing or doesn't match -> ``401``. Compared with
-      ``hmac.compare_digest``, never ``==``, the same discipline
-      ``webhooks.py`` already applies to its own signature check.
-    - The token itself, the ``member_ref`` salt, and the WHOOP client
-      secret never appear in the response body -- ``metrics.render`` is
-      what actually enforces that; this handler adds nothing to the body
-      beyond what it returns.
+    Reads Config fresh per request (no lifespan AppContext available in a
+    custom_route handler), opening/closing its own store connection. Fails
+    closed: no WHOOPMCP_METRICS_TOKEN -> 404 (byte-for-byte Starlette's own
+    404, so the route isn't advertised); token set but Authorization
+    missing/wrong -> 401, compared with hmac.compare_digest.
     """
 
     @server.custom_route("/metrics", methods=["GET"])
     async def metrics_endpoint(request: Request) -> Response:
         config = Config.from_env()
         if not config.metrics_token:
-            # Plain text, matching Starlette's own 404 body byte-for-byte: a
-            # JSON {"error": ...} body here would differ from what an
-            # unregistered path returns and so would confirm the route exists.
+            # Matches Starlette's own 404 body byte-for-byte so this route's
+            # existence isn't confirmed by a differing response.
             return PlainTextResponse("Not Found", status_code=404)
 
         provided = request.headers.get("Authorization", "")
         expected = f"Bearer {config.metrics_token}"
-        # The isascii() guard is not redundant: hmac.compare_digest raises
-        # TypeError on a str containing any non-ASCII character, and Starlette
-        # decodes raw header bytes as latin-1, so any caller can put one there
-        # -- turning what should be a 401 into an unhandled 500. A non-ASCII
-        # header cannot match a token this handler built itself, so failing it
-        # here is the same answer, arrived at without the exception.
+        # isascii() guard: hmac.compare_digest raises TypeError on non-ASCII,
+        # which a caller could send since Starlette decodes headers as latin-1.
         if not (provided.isascii() and hmac.compare_digest(provided, expected)):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
@@ -571,12 +408,8 @@ def build_server() -> MCPServer[AppContext]:
     _register_resources(server)
     _register_health_routes(server)
     _register_metrics_route(server)
-    # Stashed on the server instance, not returned or discarded: `lifespan`
-    # (already handed to MCPServer(...) above, and called back by the SDK
-    # with only the server itself as an argument) reads it back via
-    # `getattr(_server, "_webhook_queue", None)` to start #18's consumer
-    # task. See `lifespan`'s own docstring for why this attribute, rather
-    # than a constructor parameter, is the wiring point.
+    # Stashed on the server instance so lifespan() can read it back via
+    # getattr to start the webhook consumer task (#18).
     server._webhook_queue = register_webhook_routes(server)  # type: ignore[attr-defined]
     return server
 
@@ -584,40 +417,14 @@ def build_server() -> MCPServer[AppContext]:
 def create_streamable_http_app() -> Starlette:
     """ASGI app factory for running whoopmcp under multiple uvicorn workers (#27).
 
-    __main__.py's own ``build_server().run(transport="streamable-http", ...)``
-    is one uvicorn.Server in one process -- fine for a single worker. An
-    operator wanting multiple workers points uvicorn directly at this
-    factory instead of through __main__.py, e.g.::
+    Usage: ``uvicorn "whoopmcp.server:create_streamable_http_app" --factory
+    --workers 4 --port 8000``. Only ``config.http_host`` feeds in here; port
+    is a uvicorn concern, passed via ``--port``.
 
-        uvicorn "whoopmcp.server:create_streamable_http_app" --factory --workers 4 --port 8000
-
-    Note: only ``config.http_host`` feeds into this call -- the installed SDK's
-    ``MCPServer.streamable_http_app()`` takes a ``host`` (used for its
-    DNS-rebinding-protection allowlist) but no ``port`` kwarg at all; a port is
-    a uvicorn-server concern, not an ASGI-app one, so ``config.http_port`` has
-    no equivalent here and the operator passes ``--port`` to uvicorn directly,
-    same as ``--workers``.
-
-    **Known limitation, deliberately not papered over**: each worker process
-    gets its own independent ``AppContext``/``Authenticator``, and nothing in
-    this codebase currently serialises a token refresh across them. A
-    cross-process ``RefreshLock`` was prototyped for this (SQLite-file-lock
-    backed) and then removed before merge: ``Authenticator.refresh()``
-    releases its lock before the network call completes, coordinating
-    within one process via a private ``asyncio.Future`` (issue #12's
-    single-flight design) that has no cross-process equivalent. A lock that
-    only covers the "am I already refreshing" check -- not the request
-    itself -- cannot stop two separate workers from each independently
-    reaching WHOOP with the same about-to-be-rotated refresh token, which
-    reproduces exactly the credential-destroying race #12 exists to prevent,
-    just across processes instead of within one. Actually closing this gap
-    means either changing ``Authenticator.refresh()`` to hold a lock across
-    the network call (a change to ``Authenticator`` itself) or a
-    compare-and-swap against a shared store (needs #13, not yet merged) --
-    a decision outside this issue's own scope, reported on #27 rather than
-    guessed at. Until resolved, run exactly one worker for token refresh, or
-    accept that a concurrent refresh under multiple workers can force a
-    re-login.
+    **Known limitation**: each worker gets its own Authenticator, and no
+    token refresh is serialised across them -- two workers can each refresh
+    the same about-to-rotate token, forcing a re-login. Run one worker for
+    token refresh until resolved (#12/#27).
     """
     config = Config.from_env()
     return build_server().streamable_http_app(host=config.http_host)
@@ -695,9 +502,8 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
         token = await app.auth.exchange_code(code)
         app.principal = await _resolve_principal(app.client)
         if app.principal is not None and app.store_conn is not None:
-            # The only writer of principal_members (#29): a completed WHOOP
-            # authorisation, and nothing else -- never a header, a hostname,
-            # or a caller-supplied member id.
+            # The only writer of principal_members (#29): a completed
+            # authorisation only, never a header or caller-supplied id.
             client_id, issuer, subject = _principal_key(ctx.request_context.request)
             store.link_principal_to_member(
                 app.store_conn,
@@ -723,12 +529,8 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
         under Settings, or with the CLI-only `whoopmcp delete-member`, which
         cannot be called as a tool.
         """
-        # This docstring is the tool description sent on every `tools/list`,
-        # so it pays context on every request and is kept to the two facts a
-        # model needs: logout is local-only, and revocation has two routes
-        # neither of which it can invoke. The fuller wording -- why the CLI
-        # command is operator-only, and that it needs --whoop-user-id -- lives
-        # in the return value below, which costs nothing until called.
+        # Docstring kept short: it is sent on every tools/list. Fuller detail
+        # lives in the return value below, which costs nothing until called.
         app = ctx.request_context.lifespan_context
         app.auth.logout()
         app.principal = None
@@ -748,44 +550,18 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
 _DEFAULT_LOOKBACK = timedelta(days=7)
 
 
-#: Response-shape convention every repointed data/analysis tool below
-#: follows (#16), stated once here rather than re-derived per tool:
-#:
-#: - Every response carries a top-level "coverage" dict, keyed by the
-#:   entity name(s) the tool drew from -- "recoveries"/"sleeps"/"cycles"/
-#:   "workouts" (the store's own table names, including for the
-#:   metric-sourced analysis tools, which key by entity table name rather
-#:   than the singular friendly collection name) or "profile"/
-#:   "body_measurement" for the two singletons. Collection entities get
-#:   ``_entity_coverage``'s shape; singletons get ``_singleton_coverage``'s.
-#: - Every range-taking tool (the 4 list_* tools, plus summarize_period/
-#:   metric_trend/correlate_metrics/compare_periods) additionally carries a
-#:   "range_coverage" dict, entity-keyed the same way, each a flat
-#:   ``_range_coverage_entry``: comparing the tool's own resolved request
-#:   range against that entity's coverage window. compare_periods has two
-#:   ranges (baseline/comparison) but still reports one flat entry per
-#:   entity -- see ``_merge_range_coverage``.
-#: - get_sleep/get_workout/get_profile/get_body_measurement are point/
-#:   singleton lookups, not ranges: they carry "coverage" but no
-#:   "range_coverage". A miss is never a live fetch -- ``{"error":
-#:   "not_synced", ...}`` when the entity has no coverage at all, or (for
-#:   get_sleep/get_workout only, since the singletons have no "which id"
-#:   question) ``{"error": "not_found_in_store", ...}`` when the entity has
-#:   *some* coverage but not this particular id.
-#:
-#: This is a deliberate, chosen convention -- the issue's own text calls the
-#: exact field shape a normal implementation detail, not something it
-#: resolves -- applied consistently across all 12 repointed tools plus
-#: whoop_data_coverage.
+#: Response-shape convention (#16): every response carries "coverage" keyed
+#: by entity name(s); every range-taking tool also carries "range_coverage"
+#: (same keys, each a flat {status, message} entry). Point/singleton lookups
+#: (get_sleep, get_workout, get_profile, get_body_measurement) carry
+#: "coverage" only, never "range_coverage".
 
 
 def _require_store(app: AppContext) -> sqlite3.Connection:
-    """The persistent store every repointed data/analysis tool reads from.
+    """The persistent store every data/analysis tool reads from.
 
-    ``_ensure_matches_live_grant`` (via ``resolve_member_id``) already raises
-    before this is ever reached if ``app.store_conn`` is ``None`` -- this
-    exists so mypy can narrow the type at each tool's own call site, not
-    because this branch is actually reachable in practice.
+    ``_ensure_matches_live_grant`` already raises before this is reached if
+    store_conn is None; this exists only so mypy can narrow the type.
     """
     if app.store_conn is None:
         raise RuntimeError(
@@ -799,34 +575,10 @@ def _require_store(app: AppContext) -> sqlite3.Connection:
 def _iso(value: datetime | str | None) -> str | None:
     """``value`` as one canonical ISO 8601 UTC string: ``...THH:MM:SS.mmmZ``.
 
-    A ``datetime`` (from ``_default_range``) and a caller-supplied string both
-    have to come out in *the same shape*, because the store compares range
-    bounds against stored timestamps **as text** (``store.py`` -- ``created_at
-    >= ?``, ``start <= ?`` and friends). Text comparison only agrees with
-    chronological order when both sides share a format, and stored values are
-    WHOOP's own verbatim, e.g. ``2026-07-03T06:30:00.000Z``.
-
-    Before #174 this function returned a caller's string untouched, so an
-    offset form was compared byte-wise against a ``Z`` form. ``+`` (0x2B) and
-    ``.`` (0x2E) both sort below ``Z`` (0x5A), which is wrong in both
-    directions and by as much as the offset:
-
-        stored 2026-07-03T06:30:00.000Z
-        end    2026-07-03T06:30:00+00:00   -- the same instant, EXCLUDED
-        end    2026-07-03T09:00:00+03:00   -- 06:00Z, i.e. earlier, INCLUDED
-
-    Converting to UTC and emitting WHOOP's own millisecond form makes the text
-    comparison mean what the caller asked for. The docstring this replaces
-    already claimed both inputs became "one consistent string shape"; it just
-    was not true of the string branch.
-
-    **The assumption this rests on**, stated because it is the same one #140
-    was filed about: stored timestamps are uniformly WHOOP's millisecond ``Z``
-    form. If WHOOP ever emits a different precision, a same-instant boundary
-    can mis-sort again -- ``...00Z`` against ``...00.000Z`` differs at ``Z``
-    versus ``.``. That residue is far smaller than the offset bug (sub-second,
-    only exactly on a boundary) and is pinned by a test rather than left to be
-    rediscovered.
+    The store compares range bounds against stored timestamps as TEXT, so a
+    caller's string and a datetime must come out in the exact shape WHOOP's
+    own millisecond ``Z`` form uses -- an offset form (e.g. ``+00:00``) sorts
+    wrong against it, off by as much as the offset itself (#174).
     """
     if value is None:
         return None
@@ -835,11 +587,8 @@ def _iso(value: datetime | str | None) -> str | None:
     return f"{moment.strftime('%Y-%m-%dT%H:%M:%S')}.{moment.microsecond // 1000:03d}Z"
 
 
-#: Every collection entity a repointed tool can consult, mapped to the
-#: store's own (earliest, latest) coverage query for it. Keys are the
-#: store's own table names -- what every coverage/range_coverage envelope in
-#: this module is keyed by, per this file's own response-shape convention
-#: (see ``_entity_coverage``'s docstring).
+#: Collection entity -> the store's (earliest, latest) coverage query. Keys
+#: are the store's table names, matching every coverage envelope's keys.
 _COLLECTION_COVERAGE_FN: dict[
     str, Callable[[sqlite3.Connection, int], tuple[str | None, str | None]]
 ] = {
@@ -849,10 +598,8 @@ _COLLECTION_COVERAGE_FN: dict[
     "workouts": store.get_workout_coverage,
 }
 
-#: Friendly analysis-tool collection name (``_METRIC_COLLECTION``'s own
-#: values) -> the store's table name it corresponds to. Every coverage/
-#: range_coverage envelope in this module keys by the table name, never the
-#: singular friendly collection name -- see this module's response-shape note.
+#: Friendly collection name (_METRIC_COLLECTION's values) -> store table
+#: name; coverage envelopes key by table name, never the friendly name.
 _COLLECTION_TO_ENTITY: dict[str, str] = {
     "recovery": "recoveries",
     "sleep": "sleeps",
@@ -870,19 +617,9 @@ def _entity_coverage(conn: sqlite3.Connection, whoop_user_id: int, entity: str) 
     """The coverage envelope for one of the four collection entities.
 
     ``{"earliest": iso|None, "latest": iso|None, "backfill": {...},
-    "incremental_sync": {...}}`` -- earliest/latest come from the entity's
-    own activity-date columns (``created_at``, or ``start``/``end`` -- see
-    store.py's schema comment and its own coverage-query docstrings), never
-    ``updated_at``. ``backfill`` reads ``sync_state``'s bare entity-name row
-    (backfill.py's own key, ``_EntitySpec.name``); ``incremental_sync`` reads
-    the ``f"{entity}:incremental"`` row (sync.py's own
-    ``_incremental_entity_key`` format, inlined here rather than imported
-    since that helper is private to sync.py -- see its own module docstring
-    for why the two keys must never collide). ``last_successful_at`` is only
-    populated when the incremental row's own outcome is "complete": an
-    "in_progress" row's ``last_run_at`` is that run's own timestamp, not a
-    prior completion's, and reporting it as if it were one would be exactly
-    the kind of confidently-wrong answer this issue exists to prevent.
+    "incremental_sync": {...}}``. earliest/latest come from the entity's own
+    activity-date columns, never ``updated_at``. ``last_successful_at`` is
+    only set when the incremental row's own outcome is "complete".
     """
     earliest, latest = _COLLECTION_COVERAGE_FN[entity](conn, whoop_user_id)
     backfill_state = store.get_sync_state(conn, whoop_user_id, entity)
@@ -908,26 +645,18 @@ def _entity_coverage(conn: sqlite3.Connection, whoop_user_id: int, entity: str) 
 
 
 def _singleton_coverage(updated_at: str | None) -> dict[str, Any]:
-    """The coverage envelope for a singleton entity (profile, body
-    measurement): ``{"synced": bool, "last_updated_at": iso|None}`` --
-    deliberately not the earliest/latest shape ``_entity_coverage`` returns,
-    since neither singleton has an activity range to report."""
+    """Coverage envelope for a singleton (profile/body measurement):
+    ``{"synced": bool, "last_updated_at": iso|None}`` -- neither has an
+    activity range to report, unlike ``_entity_coverage``."""
     return {"synced": updated_at is not None, "last_updated_at": updated_at}
 
 
 def _parse_iso(value: str) -> datetime:
-    """Parse a stored or requested timestamp, accepting the trailing ``Z``
-    WHOOP's own payloads use, the ``+00:00`` offset this store's ``_now()``
-    writes, and a bare offset-less string.
+    """Parse a timestamp, accepting a trailing Z, a +00:00 offset, or a bare
+    offset-less string.
 
-    Every tool docstring in this module asks for "ISO 8601 UTC" and shows a
-    ``Z``-suffixed example, but a model that drops the offset and sends a
-    naive string is a plausible, not a malicious, input -- treated as UTC
-    (the documented convention) rather than raised as a comparison error
-    against this function's always-aware stored values. Without this, two
-    naive/aware ``datetime`` objects compared in ``_range_status`` raise an
-    unstructured ``TypeError`` that surfaces as an opaque tool error instead
-    of a coverage-status response.
+    A naive string (no offset) is treated as UTC rather than raised, since a
+    model dropping the offset is plausible input, not malicious.
     """
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
@@ -936,11 +665,9 @@ def _parse_iso(value: str) -> datetime:
 def _range_status(
     earliest: str | None, latest: str | None, start: str | None, end: str | None
 ) -> tuple[str, str | None]:
-    """Compare a requested ``[start, end]`` against a held ``[earliest,
-    latest]`` coverage window, returning one of four statuses and, for
-    every status but ``"within_coverage"``, an explicit human-readable
-    message -- see this module's own response-shape note for the full
-    convention every range tool follows.
+    """Compare a requested [start, end] against a held [earliest, latest]
+    coverage window, returning one of four statuses plus a message for any
+    status but "within_coverage".
     """
     if earliest is None or latest is None:
         return "no_data_synced_yet", (
@@ -1014,13 +741,7 @@ def _range_coverage_entry(
     return entry
 
 
-#: Worst-to-best ordering ``_merge_range_coverage`` picks the worse status
-#: from -- lower is worse. A tool with more than one range to reconcile into
-#: one flat entry (compare_periods' baseline vs. comparison) surfaces the
-#: worse of the two rather than picking one arbitrarily or inventing a
-#: nested shape the generic "every range tool's range_coverage is
-#: entity -> {status, message}" convention (see this module's own
-#: response-shape note) doesn't otherwise have.
+#: Worst-to-best ordering _merge_range_coverage picks from; lower is worse.
 _RANGE_STATUS_PRIORITY: dict[str, int] = {
     "no_data_synced_yet": 0,
     "wholly_outside_coverage": 1,
@@ -1045,27 +766,16 @@ def _merge_range_coverage(entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def _with_created_at_fallback(record: dict[str, Any]) -> dict[str, Any]:
     """``record``, guaranteed to carry a ``created_at`` key.
 
-    Every real WHOOP payload -- recovery, sleep, cycle and workout alike --
-    carries ``created_at`` (analysis.py has always assumed this uniformly;
-    see e.g. its own ``_dated_means`` docstring), so a genuine sync's raw_json
-    already has it. This only matters for a record that was written some
-    other way without one; falling back to the entity's own ``start`` (the
-    nearest thing sleep/cycle/workout rows have to an activity timestamp)
-    keeps analysis.py itself unchanged rather than teaching it a second,
-    per-collection date field.
+    Real WHOOP payloads always have it; this only matters for a record
+    written some other way, falling back to ``start``.
     """
     if record.get("created_at") is not None:
         return record
     return {**record, "created_at": record.get("start")}
 
 
-#: Maximum value for a cursor offset. This is SQLite's own signed-64-bit parameter
-#: limit, not a product decision. Unlike ``limit`` (capped at 1000 because a response
-#: should stay pageable), an offset legitimately grows without bound as a member
-#: accumulates history, so there is no smaller defensible ceiling -- the only real
-#: constraint is what the driver can bind. Above it, ``sqlite3`` raises
-#: ``OverflowError: Python int too large to convert to SQLite INTEGER`` from inside
-#: parameter binding.
+#: SQLite's signed-64-bit parameter limit, not a product decision; above it
+#: sqlite3 raises OverflowError from inside parameter binding.
 _MAX_CURSOR_OFFSET = 2**63 - 1
 
 #: The single message every rejected cursor gets. A constant so the "identical
@@ -1074,39 +784,12 @@ _CURSOR_REJECTED = "next_token is not a valid pagination cursor"
 
 
 def _decode_store_cursor(next_token: str | None) -> tuple[int, str | None, str | None]:
-    """This module's own opaque store-pagination cursor: ``(offset, start,
-    end)``. Bounds are baked into the cursor at the page that created it,
-    not re-derived from whatever the caller resends as ``start``/``end`` on
-    a continuation call -- an offset is only valid against the exact same
-    WHERE clause that produced it, so the bounds must travel with it, not be
-    re-guessed. No cursor (a first page) is ``(0, None, None)``.
+    """This module's opaque store-pagination cursor: ``(offset, start, end)``.
 
-    base64-encoded, not a bare JSON string: every ``next_token`` parameter
-    in this module is typed ``str | None``, and the MCP SDK's own
-    ``FuncMetadata.pre_parse_json`` helpfully (and, here, wrongly) attempts
-    ``json.loads`` on any string argument whose field annotation is not
-    exactly ``str`` -- a bare ``{"offset": ...}`` token would silently arrive
-    at this function as an already-parsed ``dict``, not the string this
-    signature (and pydantic's own arg validation) expects. Realistic base64 is
-    not valid JSON, so a real cursor survives that pre-parse untouched.
-
-    "Not valid JSON" is very nearly true rather than exactly true, which is worth
-    stating precisely since the guarantee below is absolute. The bare literals
-    ``null``/``true`` and any digit-only string are both legal base64 text and
-    legal JSON, so the SDK does parse those: ``true`` and ``1234`` become a bool
-    and an int, which pydantic then rejects against ``str | None``, while
-    ``null`` becomes ``None`` and is read here as "no cursor", i.e. the first
-    page. Harmless in each case, and unreachable from a token this module
-    issues -- every real one is far longer than four characters.
-
-    Every malformed or out-of-range cursor raises one identical, caller-opaque
-    ``ValueError`` (#179). Identical because the distinctions a caller could draw
-    between "not base64", "missing key" and "offset too large" tell them only
-    about a token they forged themselves; and opaque because the token is
-    caller-controlled input, so neither it nor the underlying exception text is
-    reflected back into the message. The original is chained with ``raise ...
-    from exc``, which keeps it on the traceback for a developer without putting
-    it in front of a caller.
+    base64-encoded (not bare JSON) because the SDK's ``pre_parse_json``
+    would otherwise try ``json.loads`` on a plain string field. No cursor
+    (first page) is ``(0, None, None)``. Every malformed or out-of-range
+    cursor raises one identical, caller-opaque ``ValueError`` (#179).
     """
     if next_token is None:
         return 0, None, None
@@ -1115,31 +798,16 @@ def _decode_store_cursor(next_token: str | None) -> tuple[int, str | None, str |
         payload = json.loads(base64.urlsafe_b64decode(next_token.encode("ascii")).decode("utf-8"))
         offset, start, end = payload["offset"], payload["start"], payload["end"]
     except (
-        # binascii.Error, UnicodeDecodeError and json.JSONDecodeError are all
-        # ValueError subclasses, so ValueError alone covers the whole decode.
-        # KeyError is a missing field; TypeError is indexing a payload that
-        # decoded to a list, string or number, which is why no isinstance check
-        # on the container is needed.
+        # ValueError covers binascii/Unicode/JSON decode errors; KeyError is a
+        # missing field; TypeError is indexing a non-dict decoded payload.
         KeyError,
         TypeError,
         ValueError,
     ) as exc:
         raise ValueError(_CURSOR_REJECTED) from exc
 
-    # Check the decoded types rather than coercing them. `int(payload["offset"])`
-    # looked equivalent and was not: `json.loads` accepts the non-standard
-    # literals `Infinity`/`-Infinity` and overflows any too-large float literal
-    # to `float("inf")`, and `int(float("inf"))` raises OverflowError -- which is
-    # an ArithmeticError, not a ValueError, so it sailed past the handler above
-    # and reached the caller as exactly the driver-level failure this function
-    # exists to prevent. Coercion also quietly accepted `"12"`, `2.9` and `true`.
-    #
-    # `start`/`end` are checked for the same reason: they are decoded from the
-    # same untrusted token and passed to the same query, where a dict or list
-    # raises `sqlite3.ProgrammingError: Error binding parameter`.
-    #
-    # bool is excluded explicitly because it is an int subclass, so `true` would
-    # otherwise satisfy the offset check as 1.
+    # Types checked, not coerced: int(payload["offset"]) would accept
+    # Infinity/"12"/2.9/true, and bool must be excluded (an int subclass).
     if isinstance(offset, bool) or not isinstance(offset, int):
         raise ValueError(_CURSOR_REJECTED)
     if not 0 <= offset <= _MAX_CURSOR_OFFSET:
@@ -1147,9 +815,6 @@ def _decode_store_cursor(next_token: str | None) -> tuple[int, str | None, str |
     if not all(bound is None or isinstance(bound, str) for bound in (start, end)):
         raise ValueError(_CURSOR_REJECTED)
 
-    # Nothing here over-rejects a cursor this module issues: _encode_store_cursor
-    # emits exactly {"offset": int, "start": str|None, "end": str|None}, and JSON
-    # round-trips each of those to the same Python type.
     return offset, start, end
 
 
@@ -1158,41 +823,18 @@ def _encode_store_cursor(offset: int, start: str | None, end: str | None) -> str
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
 
 
-#: Ceiling on a list tool's ``limit``.
-#:
-#: Its own constant rather than a reuse of ``_ANALYSIS_MAX_RECORDS``, though both
-#: are 1000: they bound different things -- response size here, computation cost
-#: there -- and sharing one would let a future change to the analysis cap
-#: silently move the list-tool API with it.
+#: Ceiling on a list tool's limit. Its own constant (not shared with
+#: _ANALYSIS_MAX_RECORDS) since they bound different things.
 _MAX_LIST_LIMIT = 1000
 
 
 def _require_positive_limit(limit: int) -> None:
     """Bound a list tool's ``limit`` at both ends before it reaches a store query.
 
-    ``limit=0`` is not merely "return nothing": every list tool's
-    ``next_token`` encodes ``offset + limit``, so a zero limit produces a
-    cursor identical to the one that led to it -- an empty page whose own
-    continuation token loops back to itself forever, never resolving to
-    "no more data." Raising here surfaces one clear error instead of a
-    silent infinite-continuation trap.
-
-    The upper bound arrived later (#173). Until then this module bounded every
-    read it *computed* over -- ``_TIMESERIES_MAX_POINTS``,
-    ``_ANALYSIS_MAX_RECORDS``, ``_OUTLIERS_MAX_POINTS`` and ``_STREAKS_MAX_DAYS``
-    are all 1000 -- while the four tools that *return* history directly bounded
-    nothing, an asymmetry that reads as oversight rather than intent. An
-    unbounded ``limit`` also defeats the pagination the rest of the module is
-    built around: ``limit`` exists so a caller pages, and an unbounded one with
-    ``include_raw=True`` materialises a member's whole stored history into a
-    single response -- precisely what the ``next_token`` machinery avoids.
-
-    It also keeps this function's own promise. List tools pass ``limit + 1`` to
-    the store as pagination lookahead, so ``2**63 - 1`` -- a value sqlite binds
-    without complaint on its own -- becomes ``2**63`` and dies inside the
-    driver's parameter binding with ``OverflowError: Python int too large to
-    convert to SQLite INTEGER``. Surfacing a driver's overflow is the opposite
-    of the one clear error this function exists to give.
+    ``limit=0`` would produce a next_token identical to the one that led to
+    it -- an infinite-continuation loop. The upper bound (#173) keeps a list
+    tool pageable and prevents overflow at the store: limit + 1 must still
+    fit SQLite's bind range.
     """
     if limit <= 0:
         raise ValueError(f"limit must be a positive integer, got {limit}")
@@ -1235,11 +877,9 @@ def _trim_recovery(record: dict[str, Any]) -> dict[str, Any]:
 def _trim_sleep(record: dict[str, Any], *, detail: str = "full") -> dict[str, Any]:
     """Trim a raw sleep record.
 
-    ``detail="summary"`` (used by list_sleeps' default) drops the nested
-    stage-duration breakdown; ``detail="full"`` (get_sleep's only mode, and
-    list_sleeps' opt-in) keeps it under "stage_durations" -- the caller is
-    responsible for adding the sibling "units" key documenting it, since
-    that lives at the envelope level, not on the record itself.
+    detail="summary" (default) drops the stage-duration breakdown;
+    detail="full" keeps it under "stage_durations" -- caller adds the
+    sibling "units" key at the envelope level.
     """
     trimmed: dict[str, Any] = {
         "id": record.get("id"),
@@ -1283,8 +923,8 @@ def _trim_cycle(record: dict[str, Any]) -> dict[str, Any]:
 def _trim_workout(record: dict[str, Any], *, detail: str = "full") -> dict[str, Any]:
     """Trim a raw workout record.
 
-    See ``_trim_sleep`` for the ``detail`` contract; the analogous nested
-    field here is "zone_durations".
+    See _trim_sleep for the detail contract; the analogous nested field
+    here is "zone_durations".
     """
     trimmed: dict[str, Any] = {
         "id": record.get("id"),
@@ -1316,10 +956,8 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def get_profile(ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Return the user's WHOOP profile: user id, email, first and last name.
 
-        Served from the local store, never a live call -- a miss is reported
-        as ``{"error": "not_synced", ...}``, never a live fetch. Every
-        response (success or miss) carries a "coverage" key: ``{"synced":
-        bool, "last_updated_at": iso|None}``.
+        Served from the local store, never a live call. A miss returns
+        {"error": "not_synced", ...}. Every response carries a "coverage" key.
         """
         app = ctx.request_context.lifespan_context
         whoop_user_id = _ensure_matches_live_grant(ctx)
@@ -1684,18 +1322,10 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def whoop_data_coverage(ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Report, per entity, what the local store holds and how fresh it is.
 
-        This is the way to check whether "no records" means "nothing
-        happened" or "nothing has been imported yet" -- every other data and
-        analysis tool's own "coverage"/"range_coverage" fields are built from
-        exactly the same underlying state this tool reports directly. Call
-        this first when in doubt, and before assuming a range tool's result
-        is complete.
-
-        For recoveries, sleeps, cycles and workouts: the earliest and latest
-        activity date held, the last backfill outcome, and the last
-        successful incremental sync time. For the profile and body
-        measurement (which have no date range of their own): whether each
-        has ever been synced, and when.
+        Distinguishes "no records" (nothing happened) from "not imported
+        yet". For recoveries/sleeps/cycles/workouts: earliest/latest date
+        held, backfill outcome, last incremental sync. For profile/body
+        measurement: whether synced, and when.
         """
         app = ctx.request_context.lifespan_context
         whoop_user_id = _ensure_matches_live_grant(ctx)
@@ -1714,27 +1344,17 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
     async def whoop_sync(ctx: Context[AppContext, Any]) -> dict[str, Any]:
         """Pull every recovery, sleep, cycle and workout changed since the last sync.
 
-        Walks each collection forward from its own high-water ``updated_at``
-        mark (never ``created_at``, so a rescored recovery or sleep is
-        picked up, not just a newly-created one) and upserts every record
-        into the local store. Once caught up, this costs one request per
-        collection.
-
-        Deletions are invisible to this walk: a record removed upstream
-        keeps whatever was last synced for it. Only a WHOOP webhook reports
-        a delete, and reconciling one this tool missed is a separate,
-        not-yet-built job -- do not rely on this tool to notice one.
-
-        Requires the persistent store (``WHOOPMCP_CACHE=true``, off by
-        default -- see PRIVACY.md). When it is disabled this returns
-        ``{"synced": False, ...}`` explaining why, rather than raising.
+        Walks each collection from its own high-water updated_at mark (so a
+        rescored record is picked up too) and upserts into the local store;
+        once caught up, costs one request per collection. Deletions upstream
+        are invisible to this walk. Requires the persistent store
+        (WHOOPMCP_CACHE=true); returns {"synced": False, ...} rather than
+        raising when disabled.
         """
         app = ctx.request_context.lifespan_context
         whoop_user_id = _ensure_matches_live_grant(ctx)
         if app.store_conn is None:
-            # _ensure_matches_live_grant (via resolve_member_id) already
-            # requires a store to have resolved this far; this is here only
-            # so mypy can narrow the type below, not a reachable branch.
+            # Unreachable in practice; here only so mypy can narrow the type.
             raise RuntimeError("whoop_sync requires a persistent store")
 
         try:
@@ -1749,23 +1369,15 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 "count": result.count,
                 "cursor": result.high_water_mark,
                 "error": result.error,
-                # Surfaced so a run that refused a record as a cursor
-                # candidate does not read as a clean one (#186) -- both
-                # otherwise show the same count and the same cursor.
+                # Surfaced so a refused-cursor run doesn't read as clean (#186).
                 "skipped_implausible": result.skipped_implausible,
             }
-            # Only when there is something to say, the effect_size_note
-            # precedent: a `false` on every entity of every response would
-            # spend this tool's tight #25 ceiling explaining nothing. The
-            # key's presence is the machine-readable signal that this run
-            # abandoned a WHOOP-rejected resume cursor and re-walked (#201).
+            # Key present only when true, to save context (#25); signals the
+            # run abandoned a WHOOP-rejected resume cursor and re-walked (#201).
             if result.dropped_stale_cursor:
                 entities[name]["dropped_stale_cursor"] = True
         response: dict[str, Any] = {
-            # False when ANY entity failed, not only when the whole run was
-            # refused (#187). A caller that checks just this flag must not be
-            # able to read a partial run as a clean one, which is the whole
-            # point of isolating the entities in the first place.
+            # False when ANY entity failed, not just a wholly-refused run (#187).
             "synced": not failed,
             "entities": entities,
         }
@@ -1779,12 +1391,8 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
 
 # -- analysis --------------------------------------------------------------
 
-#: Largest sweep radius correlate_metrics accepts for lag_days. Unbounded
-#: would let a caller request an arbitrarily large sweep (each entry costs
-#: context, and #25's ceiling doesn't help here since this tool predates
-#: it) from a handful of days of input -- 14 (29 entries) comfortably
-#: covers the "does yesterday/last-week's X predict Y" questions this
-#: feature exists for.
+#: Largest sweep radius correlate_metrics accepts; unbounded would balloon
+#: context cost per entry. 14 (29 entries) covers realistic lag questions.
 _MAX_LAG_SWEEP_RADIUS = 14
 
 #: Friendly metric name -> the collection it is sourced from.
@@ -1806,20 +1414,8 @@ def _resolve_collection(metric: str) -> str:
         raise ValueError(f"unknown metric: {metric!r}") from None
 
 
-#: whoop_timeseries's (#20) own unit per metric, keyed by the same 6 names
-#: as _METRIC_COLLECTION. Declared once here and echoed in the response
-#: envelope's "unit" field, per the issue's own Scope ("the unit declared
-#: once in the envelope rather than repeated per point"). Direction (e.g.
-#: "lower is generally better" for resting_heart_rate) is NOT repeated in
-#: the envelope -- the issue's own Notes ask for it in "the tool
-#: description", which is this tool's docstring (see its Args section
-#: below), not a runtime payload field; keeping it out of every response
-#: matters here specifically because this tool's whole point is costing
-#: an order of magnitude fewer tokens than the equivalent list_* call
-#: (measured in tests/test_whoop_timeseries.py's own
-#: test_whoop_timeseries_is_cheaper_than_list_sleeps), and a repeated
-#: direction sentence is pure per-call overhead the model already has from
-#: the tool schema.
+#: whoop_timeseries's unit per metric, echoed once in the response envelope.
+#: Direction ("lower is better" etc.) lives in the tool docstring, not here.
 _METRIC_UNIT: dict[str, str] = {
     "recovery_score": "%",
     "hrv": "ms",
@@ -1831,20 +1427,12 @@ _METRIC_UNIT: dict[str, str] = {
 
 
 def _resolve_metric_timeseries_source(metric: str) -> tuple[str, str, str]:
-    """Resolve a friendly metric name to whoop_timeseries's own
-    ``(entity, value_column, date_column)`` -- the store table (keyed by
-    the store's own table name, matching every other coverage/range_coverage
-    envelope in this module), its SQL value column, and its SQL date column.
+    """Resolve a friendly metric name to (entity, value_column, date_column)
+    for whoop_timeseries.
 
-    Deliberately not a change to ``_resolve_collection`` above: that
-    function is used today by metric_trend/correlate_metrics/compare_periods
-    and its exact ``"unknown metric: {metric!r}"`` message is very likely
-    pinned by their own tests, so it stays as-is. This resolver instead
-    composes the already-existing mappings (#16's own
-    ``_METRIC_COLLECTION``/``_COLLECTION_TO_ENTITY``, analysis.py's own
-    ``_METRIC_PATHS``, store.py's own ``_METRIC_TIMESERIES_DATE_COLUMNS``)
-    without duplicating any of them, and raises its own helpful, name-listing
-    error rather than reusing (or widening) ``_resolve_collection``'s.
+    Separate from ``_resolve_collection`` (whose exact error message is
+    likely pinned by tests); composes the existing mappings without
+    duplicating them.
     """
     if metric not in _METRIC_COLLECTION:
         raise ValueError(
@@ -1882,23 +1470,10 @@ async def _fetch_collection(
     """Read one collection over a range from the local store.
 
     Repointed from ``WhoopClient.paginate()`` (#16): analysis tools need raw
-    WHOOP records (score_state, nested score dicts) -- the same shape
-    analysis.py's extract_metric/summarize/trend/correlate already know how
-    to read -- not the trimmed shapes the data tools return, so this reads
-    the store's own collection getter directly rather than going through
-    list_recoveries etc. Never falls through to the live API on a miss: an
-    empty or partial result here is a coverage gap, reported by the caller's
-    own "coverage"/"range_coverage" envelope, not retried against WHOOP.
-
-    Over-fetches by one row (``max_records + 1`` at the call site) to detect
-    ``truncated`` without a second query -- true if the store may hold more
-    than ``max_records`` matching the range requested.
-
-    Every record gets ``_with_created_at_fallback`` applied: analysis.py
-    indexes ``record["created_at"]`` unconditionally regardless of which
-    collection a record came from, and a genuine WHOOP payload always has
-    it, but this store read makes no assumption about how a record arrived
-    here.
+    WHOOP records, not the trimmed data-tool shapes. Never falls through to
+    the live API on a miss. Over-fetches by one row to detect truncation
+    without a second query. Applies ``_with_created_at_fallback`` to every
+    record.
     """
     getter = _COLLECTION_GETTER[collection]
     rows = getter(conn, whoop_user_id, start=start, end=end, limit=max_records + 1)
@@ -1923,45 +1498,19 @@ async def _summarize_window(
     """Read each of the 3 collections once from the store, then
     analysis.summarize per metric.
 
-    6 metrics share only 3 collections -- reading once per metric here would
-    be 6 store reads instead of 3, and summarize_period's whole point is not
-    doing that. A metric whose collection can't produce enough SCORED records
-    for analysis.summarize gets its own {"error": "insufficient_data", ...}
-    entry rather than failing the other 5 metrics that DID have enough data.
-
-    The returned ``truncated`` flag is true if ANY of the 3 collections hit
-    the per-fetch record cap -- one truncated collection is enough to make
-    the whole window's summary incomplete. ``expected_days`` is threaded into
-    every analysis.summarize call so each metric's ``days_missing`` reflects
-    the requested window, not just what happened to come back.
+    6 metrics share only 3 collections, so this reads once per collection
+    rather than per metric. A metric without enough SCORED records gets its
+    own {"error": "insufficient_data", ...} entry rather than failing the
+    whole window. truncated is true if any collection hit the fetch cap.
     """
-    # Count the distinct UTC calendar dates the window can hold a record on --
-    # the same unit `analysis.summarize` counts on the other side of the
-    # subtraction, where `unique_dates` is built from
-    # `datetime.fromisoformat(record["created_at"]).astimezone(UTC).date()`.
-    #
-    # Subtracting the timestamps and taking `.days` was neither (#181). It
-    # truncated the trailing partial day, so the inclusive whole-day window a
-    # caller naturally writes for "the last three days" --
-    # `T00:00:00Z`..`T23:59:59Z` -- measured 2. `days_missing` is clamped with
-    # `max(0, ...)`, so the undercount never surfaced as an error; it just
-    # reported better coverage than the member actually had, which is the one
-    # direction that hides a real gap from someone asking whether they missed a
-    # day. It also skipped the `astimezone(UTC)` that the other side applies, so
-    # a window expressed at a non-UTC offset counted dates in the caller's
-    # offset while the records counted theirs in UTC.
+    # Distinct UTC calendar dates in the window, matching how
+    # analysis.summarize counts unique_dates (#181: subtracting timestamps
+    # and taking .days undercounts the trailing partial day).
     start_dt = datetime.fromisoformat(start).astimezone(UTC)
     end_dt = datetime.fromisoformat(end).astimezone(UTC)
-    # Clamped because `expected_days` also divides the coverage ratios in
-    # `compare_periods`; an inverted window must reach them as 0 (falsy, and
-    # already special-cased there) rather than as a negative.
+    # Clamped: expected_days also divides compare_periods' coverage ratios.
     expected_days = max(0, (end_dt.date() - start_dt.date()).days + 1)
-    # Elapsed whole days, which is a different question and keeps its own name.
-    # `_period_length_note` asks whether a period spans whole *weeks*, to warn
-    # about weekday/weekend imbalance -- a duration, so a midnight-to-midnight
-    # Aug 1 -> Aug 8 window is 7 there while touching 8 calendar dates here.
-    # Feeding it dates-touched made every whole-week window look like a partial
-    # one and fired the warning on exactly the periods that are balanced.
+    # Elapsed whole days -- distinct from expected_days, used by _period_length_note.
     span_days = max(0, (end_dt - start_dt).days)
     fetched = {
         collection: await _fetch_collection(conn, whoop_user_id, collection, start, end)
@@ -1993,10 +1542,9 @@ async def _summarize_window(
 def _period_length_note(baseline_days: int, comparison_days: int) -> str | None:
     """Explain when a period's length isn't a whole number of weeks.
 
-    A period that doesn't span whole weeks can over- or under-represent
-    weekdays vs. weekends relative to the other period, which confounds a
-    delta between the two. Returns ``None`` when both periods are a multiple
-    of 7 days.
+    A non-week-multiple period can over/under-represent weekdays vs.
+    weekends relative to the other, confounding the delta. None when both
+    are multiples of 7.
     """
     baseline_ok = baseline_days % 7 == 0
     comparison_ok = comparison_days % 7 == 0
@@ -2014,30 +1562,21 @@ def _period_length_note(baseline_days: int, comparison_days: int) -> str | None:
     )
 
 
-#: The rolling window for whoop_outliers, in calendar days. 14, not 7 or
-#: 30: a rolling window's own mean absorbs a sustained level shift over
-#: roughly half its length, so a SHORTER window re-adapts to a genuine
-#: change (the "slow seasonal drift" acceptance test) faster than a
-#: longer one; 7 gives a noisier baseline from fewer points and doesn't
-#: span a full weekday+weekend cadence, so 14 is the smallest window
-#: that reliably covers that cadence twice over while still adapting
-#: quickly. Pinned by tests/test_whoop_outliers.py's own WINDOW_DAYS
-#: literal -- keep the two in sync.
+#: Rolling window for whoop_outliers, in days. 14 balances fast re-adaptation
+#: to genuine shifts against covering a full weekday+weekend cadence. Kept
+#: in sync with tests/test_whoop_outliers.py's own WINDOW_DAYS literal.
 _OUTLIERS_WINDOW_DAYS = 14
 
 #: Nearest-measured-neighbour context radius reported alongside each
-#: outlier ("the few days either side" -- the issue's own Scope). A
-#: fixed internal constant, not a tool parameter: the issue's own
-#: signature has none.
+#: outlier. A fixed internal constant, not a tool parameter.
 _OUTLIER_CONTEXT_DAYS = 3
 
 #: Cap on the day-series fetched from the store per call -- mirrors
 #: _TIMESERIES_MAX_POINTS's own role/magnitude.
 _OUTLIERS_MAX_POINTS = 1000
 
-#: Cap on outliers actually detailed (with context + other-metrics) in
-#: the response, independent of _OUTLIERS_MAX_POINTS: an adversarial
-#: series can flag most of its points as outliers.
+#: Cap on outliers detailed in the response, independent of
+#: _OUTLIERS_MAX_POINTS: an adversarial series can flag most points.
 _OUTLIERS_MAX_FLAGGED = 50
 
 #: Cap on compact warm-up entries listed in the response.
@@ -2051,38 +1590,14 @@ _STREAKS_MAX_DAYS = 1000
 def _local_neighborhood_z(
     daily: Sequence[RollingPoint], index: int, radius: int
 ) -> tuple[float, float | None, float | None]:
-    """One point's ``(mean, stdev, z_score)`` against a LOCAL
-    neighbourhood of up to ``radius`` measured points on EACH side
-    (``context_window``'s own point-count radius mechanic, not a
-    strictly causal calendar window) plus the point itself.
+    """One point's ``(mean, stdev, z_score)`` against a local neighbourhood
+    of up to ``radius`` measured points on each side, plus the point itself.
 
-    Exists alongside ``analysis.rolling_z_scores`` (the strictly
-    trailing, calendar-day-bounded definition ``whoop_outliers`` still
-    uses for warm-up tagging) because a causal-only trailing window can
-    starve on sparse coverage: two measured points 13 calendar days
-    apart, just inside a 14-day trailing window, produce a 2-point
-    trailing sample whose z-score can never exceed ~0.71 in magnitude,
-    regardless of how extreme the more recent value is -- a
-    mathematical property of a 2-point sample's own standard
-    deviation, not a tuning problem (tests/test_whoop_outliers.py's own
-    context-truncation fixture hits exactly this with sparse, 13-day
-    spaced history). Looking to both sides for the comparison sample
-    fixes this without widening the trailing window enough to make the
-    seasonal-drift acceptance test's own transition period over-flag
-    instead: a wider *trailing* window takes longer to forget an old
-    baseline once one exists, but a wider *radius-bounded*
-    neighbourhood only grows with however much data is actually
-    available nearby, not with elapsed calendar time, so it does not
-    carry that cost.
-
-    Returns ``stdev``/``z_score`` as ``None`` when the neighbourhood
-    (including the point itself) has fewer than 2 points -- a standard
-    deviation needs at least two values; this is only reachable in
-    practice for a pathologically small ``radius``, since a day that
-    clears ``rolling_z_scores``' own warm-up already has at least one
-    earlier point in its run. A neighbourhood whose stdev is exactly 0
-    defines ``z_score`` as ``0.0``, matching ``rolling_z_scores``' own
-    "no deviation to score against" convention.
+    Unlike a strictly-trailing window (``analysis.rolling_z_scores``), a
+    two-sided neighbourhood doesn't starve on sparse coverage: two points 13
+    days apart can't exceed ~0.71 z in a trailing-only window. Returns
+    ``(mean, None, None)`` if fewer than 2 points; ``z_score`` is 0.0 when
+    stdev is exactly 0.
     """
     before, after = context_window(daily, index, radius)
     neighborhood = [p.value for p in before] + [daily[index].value] + [p.value for p in after]
@@ -2102,16 +1617,9 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
     ) -> dict[str, Any]:
         """Summarise recovery, sleep and strain over a date range.
 
-        Returns mean, standard deviation, median, min and max for each
-        metric, along with the number of scored records behind each figure
-        and ``days_missing`` -- how many calendar days in the range have no
-        scored record for that metric, a coverage gap rather than a record
-        count.
-
-        Served from the local store. Every response carries "coverage" and
-        "range_coverage", each keyed by "recoveries"/"sleeps"/"cycles" (the
-        3 entities behind the 6 metrics), reporting what the store holds for
-        each and how the requested range compares to it.
+        Returns mean, stdev, median, min, max, record count and
+        days_missing (calendar days with no scored record) per metric.
+        Every response carries "coverage" and "range_coverage".
 
         Args:
             start: ISO 8601 start of the range.
@@ -2159,15 +1667,10 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             start: ISO 8601 start of the range.
             end: ISO 8601 end of the range.
 
-        Returns the least-squares slope in metric units per day. A slope is a
-        description of the window requested, not a forecast. Also returns an
-        r² fit-quality figure for that slope -- both as the number and as a
-        word ("strong"/"moderate"/"weak"/"negligible") -- and 7/30/90-day
-        rolling means of the metric over calendar days.
-
-        Served from the local store. Every response (including an
-        "insufficient_data" one) carries "coverage" and "range_coverage",
-        keyed by the metric's own entity ("recoveries"/"sleeps"/"cycles").
+        Returns the least-squares slope in metric units per day (not a
+        forecast), an r² fit-quality figure (as a number and as a word:
+        "strong"/"moderate"/"weak"/"negligible"), and 7/30/90-day rolling
+        means. Every response carries "coverage" and "range_coverage".
         """
         app = ctx.request_context.lifespan_context
         whoop_user_id = _ensure_matches_live_grant(ctx)
@@ -2181,8 +1684,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         try:
             result = trend(records, metric)
         except InsufficientDataError as exc:
-            # No records worth speaking of on this path -- truncated/note
-            # would be noise, not signal.
+            # truncated/note would be noise here; too few records to matter.
             return {
                 "error": "insufficient_data",
                 "message": str(exc),
@@ -2216,11 +1718,8 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
                 "narrow the date range for a complete trend."
             )
-        # #54: distinguishable from the record-count "truncated"/"note" pair
-        # above (fact #5) -- this is a *presentation* cap on how many rolling
-        # points come back, not a statement about how many source records
-        # were read, so it gets its own flag and its own note, legible even
-        # when both caps apply to the same response at once.
+        # Distinct from the record-count truncated/note pair above (#54): this
+        # is a presentation cap on rolling points, not source records read.
         if rolling_resolution != "daily":
             response["rolling_note"] = (
                 f"rolling_7d/rolling_30d/rolling_90d were downsampled to {rolling_resolution} "
@@ -2250,30 +1749,20 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
     ) -> dict[str, Any]:
         """Correlate two metrics over a range, sweeping a range of day-offsets.
 
-        Joins the two metrics by UTC calendar date rather than by cycle, and
-        reports Pearson's r and Spearman's rho at every lag from -lag_days to
-        +lag_days (inclusive), each with its own sample size. A positive lag
-        means metric_a's date precedes metric_b's by that many days --
-        metric_a "leads". A lag whose surviving pairs fall below 8 is
-        reported as refused rather than omitted.
-
-        Correlation here is descriptive, not causal: WHOOP daily samples are
-        autocorrelated (today's recovery is not independent of yesterday's),
-        so do not read a strong r at some lag as proof that one metric drives
-        the other, and do not treat a handful of weeks as a stable finding.
+        Joins by UTC calendar date, reporting Pearson's r and Spearman's rho
+        at every lag from -lag_days to +lag_days, each with its sample size.
+        A positive lag means metric_a leads. A lag with fewer than 8
+        surviving pairs is reported as refused. Descriptive, not causal --
+        WHOOP daily samples are autocorrelated.
 
         Args:
             metric_a: First metric name, as in metric_trend.
             metric_b: Second metric name.
             start: ISO 8601 start of the range.
             end: ISO 8601 end of the range.
-            lag_days: Sweep radius in days (default 3, capped at 14); the
-                sweep covers every integer lag from -lag_days to +lag_days.
+            lag_days: Sweep radius in days (default 3, capped at 14).
 
-        Served from the local store. Every response carries "coverage" and
-        "range_coverage", keyed by the entities metric_a/metric_b are sourced
-        from (one entry, or two when the metrics come from different
-        collections).
+        Every response carries "coverage" and "range_coverage".
 
         Raises:
             ValueError: if lag_days is negative.
@@ -2386,26 +1875,15 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             if "error" in b or "error" in c:
                 delta[metric] = {"error": "insufficient_data"}
                 continue
-            # The comparison itself survives a thin window; only the effect
-            # size is withheld (#183). Refusing the whole tool would remove the
-            # part that still works -- `delta_mean` is a difference of means and
-            # is interpretable at small n -- while Cohen's d divides by a pooled
-            # standard deviation that at two observations per group is nearly
-            # arbitrary. That is where the d = 16.26 came from, so the floor is
-            # applied to the unstable statistic rather than to the request.
+            # Only the effect size is withheld on a thin window (#183);
+            # delta_mean stays interpretable at small n, Cohen's d does not.
             effect_size_note: str | None = None
             effect_size: float | None
             if b["count"] < MIN_EFFECT_SAMPLES or c["count"] < MIN_EFFECT_SAMPLES:
-                # Checked here rather than by catching the error, so the note is
-                # attached to THIS refusal only. `standardized_effect_size` also
-                # refuses a zero pooled stdev, which is a different condition,
-                # predates #183, and already returned a bare `null` -- annotating
-                # it too would be scope creep, and measurably costly: the extra
-                # string on every such metric put this tool over #25's ceiling.
+                # Checked here, not via the exception, so the note attaches
+                # only to this refusal (a zero-stdev refusal stays a bare null).
                 effect_size = None
-                # Carried explicitly because a bare `null` is indistinguishable
-                # from "this tool does not compute that", and the caller is a
-                # model that would otherwise have to guess which.
+                # Explicit so a bare null isn't confused with "not computed".
                 effect_size_note = (
                     f"withheld: effect size needs at least {MIN_EFFECT_SAMPLES} "
                     f"observations per period, got {b['count']} and {c['count']}"
@@ -2430,11 +1908,8 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 "effect_size": effect_size,
                 "coverage_asymmetric": abs(coverage_b - coverage_c) > 0.5,
             }
-            # Only when there is something to say. Emitting `"effect_size_note":
-            # null` on every metric of every comparison costs context on every
-            # well-sampled call to explain nothing -- and measurably so: it put
-            # this tool over #25's own ceiling (1341 tokens against 1300). The
-            # key's presence is the machine-readable signal.
+            # Key present only when non-None, to avoid costing context on
+            # every well-sampled call for nothing (#25).
             if effect_size_note is not None:
                 delta[metric]["effect_size_note"] = effect_size_note
         response: dict[str, Any] = {
@@ -2455,10 +1930,8 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
                 f"Only records up to the {_ANALYSIS_MAX_RECORDS}-record cap were used; "
                 "narrow the date range for a complete comparison."
             )
-        # Two ranges, not one -- range_coverage still reports one flat entry
-        # per entity, like every other range tool (see this module's own
-        # response-shape note), by merging the baseline and comparison
-        # windows' own statuses into the worse of the two.
+        # Two ranges merged into one flat range_coverage entry per entity,
+        # like every other range tool (see response-shape note).
         coverage: dict[str, Any] = {}
         range_coverage: dict[str, Any] = {}
         for entity in dict.fromkeys(_COLLECTION_TO_ENTITY.values()):
@@ -2488,22 +1961,12 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
     ) -> dict[str, Any]:
         """One metric's trend as a flat ``[{date, value}, ...]`` series --
         the cheap alternative to a list_* call for "how has X trended"
-        questions: the model never needs to fetch whole records and average
-        them itself.
+        questions.
 
-        Aggregated in the database (SQL ``GROUP BY``, never pandas/numpy):
-        multiple records landing in the same bucket (e.g. two workouts'
-        strain the same day) are averaged (mean), not summed. A bucket with
-        no scored record for it is simply absent from "points" -- never a
-        zero-valued entry; a day you didn't wear the strap did not have a
-        resting heart rate of nought. Only records with ``score_state ==
-        "SCORED"`` are counted, the same rule ``metric_trend`` and every
-        other analysis tool in this module apply.
-
-        A "week" bucket's "date" is the Monday that starts it (not a week
-        number, and not the record's own date) -- unambiguous without a side
-        table, since this response is read by a model, not a spreadsheet. A
-        "month" bucket's "date" is the 1st of that month.
+        Aggregated in the database (SQL GROUP BY): multiple records in the
+        same bucket are averaged, not summed. A bucket with no scored
+        record is absent from "points", never a zero. A "week" bucket's
+        "date" is the Monday that starts it; a "month" bucket's is the 1st.
 
         Args:
             metric: One of:
@@ -2519,22 +1982,10 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             end: ISO 8601 end of the range.
             granularity: "day" (default), "week", or "month".
 
-        Served from the local store, never a live call. Carries a single
-        flat "range_coverage" ({"status": ..., "message": ...}, see
-        whoop_data_coverage's own convention) rather than the full
-        "coverage" envelope (earliest/latest, backfill status, incremental
-        sync status) metric_trend and the list_* tools carry: that fuller
-        envelope costs several hundred tokens of fixed bookkeeping
-        regardless of range size, which would defeat this tool's whole
-        reason to exist (an order of magnitude cheaper than the equivalent
-        list_* call -- see this module's own token-ratio test). This
-        lighter signal is the one that actually matters here: an absent
-        bucket paired with a non-"within_coverage" status means the range
-        may simply not be synced yet, never confidently reported as "no
-        activity". Call whoop_data_coverage for the fuller backfill/sync
-        status picture. The point count is capped; "truncated" and a
-        "note" report it when the cap is hit, rather than silently dropping
-        the tail of the range.
+        Served from the local store, never a live call. Carries a flat
+        "range_coverage" rather than the full "coverage" envelope, to stay
+        far cheaper than the equivalent list_* call. "truncated"/"note"
+        report when the point cap is hit.
         """
         if granularity not in ("day", "week", "month"):
             raise ValueError(f"granularity must be 'day', 'week' or 'month', got {granularity!r}")
@@ -2557,10 +2008,8 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         truncated = len(rows) > _TIMESERIES_MAX_POINTS
         page_rows = rows[:_TIMESERIES_MAX_POINTS]
 
-        # Cheap by construction: one indexed MIN/MAX query, never the
-        # backfill/incremental-sync sub-lookups _entity_coverage's own
-        # fuller envelope makes -- this tool intentionally reports only
-        # the range-comparison RESULT, not the full status picture.
+        # One indexed MIN/MAX query -- never _entity_coverage's fuller
+        # backfill/incremental-sync sub-lookups.
         earliest, latest = _COLLECTION_COVERAGE_FN[entity](conn, whoop_user_id)
         range_coverage = _range_coverage_entry(earliest, latest, start, end)
 
@@ -2594,38 +2043,13 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
     ) -> dict[str, Any]:
         """Find days whose value is a local outlier, with nearby context.
 
-        Outliers are found against a LOCAL baseline, not a global one, so a
-        genuine sustained shift in the metric does not read as a month of
-        anomalies -- see this tool's own acceptance test for a fixture that
-        would false-positive under a naive global z-score but correctly
-        stays quiet here.
-
-        Whether a day has enough trailing calendar history to be scored at
-        all ("warm-up") is decided by a strict, causal 14-calendar-day
-        window: a day is unscored until 14 calendar days have elapsed since
-        the start of its current run of coverage (a gap of >= 14 days
-        resets that clock), and is reported under "warmup_days" rather than
-        silently dropped -- a dropped day would read as a normal one. A day
-        that clears warm-up is scored against a LOCAL neighbourhood instead
-        (up to 14 measured points on each side, plus the day itself, via
-        nearest-measured-neighbour slicing) rather than that same trailing
-        window: a strictly-trailing window can starve on sparse coverage in
-        a way a neighbourhood-based one does not (see this module's own
-        ``_local_neighborhood_z`` docstring). Each outlier's "baseline_mean"/
-        "baseline_stdev" therefore reflect that two-sided neighbourhood, not
-        a strictly-historical trailing average -- a day near the end of the
-        requested range can be scored against measured points that come
-        after it in calendar time, so re-running this tool later, once more
-        recent days have been synced, can change a near-the-edge day's
-        z_score and flagged status. This does not affect "rolling, not
-        global": the baseline is still local to the day, never the whole
-        range's own mean/stdev.
-
-        Each outlier is reported with up to 3 nearest measured days either
-        side (truncated at the range's own edges, never an error) and,
-        for that day only, whichever of the other 5 friendly metrics have
-        a value -- "your HRV cratered on the 14th" is only useful alongside
-        what else happened that day.
+        Outliers are scored against a local neighbourhood (up to 14 measured
+        points either side), not a global baseline, so a sustained shift
+        doesn't read as a month of anomalies. A day needs 14 calendar days
+        of trailing history to be scored at all; unscored days are listed
+        under "warmup_days" rather than dropped. Each outlier includes up
+        to 3 nearest measured days either side and same-day values for the
+        other 5 metrics.
 
         Args:
             metric: One of "recovery_score", "hrv", "resting_heart_rate",
@@ -2635,10 +2059,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             z: The absolute z-score a day must cross to be an outlier
                 (default 2.0).
 
-        Served from the local store, never a live call. Never refuses on
-        an empty or single-day range -- both return a coherent, empty-but-
-        honest response rather than raising. Every response carries
-        "coverage" and "range_coverage" (metric_trend's own full envelope).
+        Every response carries "coverage" and "range_coverage".
         """
         app = ctx.request_context.lifespan_context
         whoop_user_id = _ensure_matches_live_grant(ctx)
@@ -2659,10 +2080,8 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         points_truncated = len(rows) > _OUTLIERS_MAX_POINTS
         daily = [RollingPoint(date=b, value=v) for b, v in rows[:_OUTLIERS_MAX_POINTS]]
 
-        # 5 extra, cheap SQL-aggregated queries total (never one per
-        # outlier) -- "the other metrics for that day", per this tool's own
-        # Scope. Applied only to the outlier day itself, never its context
-        # days, matching the issue's literal wording.
+        # 5 cheap SQL-aggregated queries total (never one per outlier),
+        # applied only to the outlier day itself, not its context days.
         other_metric_series: dict[str, dict[str, float]] = {}
         for other_metric in _METRIC_COLLECTION:
             if other_metric == metric:
@@ -2779,18 +2198,9 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
     ) -> dict[str, Any]:
         """Find maximal consecutive-day runs of one metric above or below a threshold.
 
-        Every calendar day in the requested range is enumerated in "days"
-        -- not just measured ones. A day absent from the store is
-        "missing" (unmeasured -- e.g. the strap wasn't worn); a day that
-        was measured but does not meet the threshold is "failing"; a day
-        that does is "passing". Both "missing" and "failing" end a streak,
-        with no bridging logic -- the simplest, most conservative
-        interpretation. Whether an unmeasured day *should* break a streak
-        is a judgement call this tool leaves to the caller (per the
-        issue's own Notes): "days" is returned in full alongside "streaks"
-        so a caller who disagrees can reconstruct the alternate
-        interpretation, e.g. by noticing two streaks are separated only by
-        "missing" days, never "failing" ones.
+        Every calendar day in range is enumerated in "days": "missing"
+        (unmeasured), "failing" (measured but off-threshold), or "passing".
+        Both "missing" and "failing" end a streak, with no bridging logic.
 
         Args:
             metric: One of "recovery_score", "hrv", "resting_heart_rate",
@@ -2798,16 +2208,10 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
             start: ISO 8601 start of the range.
             end: ISO 8601 end of the range.
             threshold: The value a day must cross to "pass".
-            direction: "above" (a day passes when value >= threshold) or
-                "below" (value <= threshold) -- both inclusive of the
-                threshold itself, so a value exactly at it is never
-                silently excluded from both directions.
+            direction: "above" (value >= threshold) or "below"
+                (value <= threshold), both inclusive.
 
-        Served from the local store, never a live call. Never refuses on
-        an empty or single-day range. Every response carries "coverage"
-        and "range_coverage" (metric_trend's own full envelope). Per-streak
-        entries omit "direction": it is constant across the whole response
-        and stated once at the top level.
+        Every response carries "coverage" and "range_coverage".
         """
         if direction not in ("above", "below"):
             raise ValueError(f"direction must be 'above' or 'below', got {direction!r}")
@@ -2873,19 +2277,11 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
 
 
 def _register_prompts(server: MCPServer[AppContext]) -> None:
-    """Register the prompts (#26): compositions of the *analysis* tools, not
-    the raw data tools, so the model sees a habit worth imitating rather than
-    an invitation to dump records.
+    """Register the prompts (#26): compositions of analysis tools, not raw
+    data tools, so the model imitates a habit rather than dumping records.
 
-    Every prompt here is a plain, argument-less function with no ``ctx``
-    parameter: a prompt states which tools to call and why, it does not call
-    them itself (see the issue's own Notes -- fetching or computing data
-    inside a prompt is exactly the "just dumps records" failure mode prompts
-    exist to avoid). Each returns ``list[str]``; the SDK turns each string
-    into its own user-role message.
-
-    Every prompt below stays consistent with ``INSTRUCTIONS``: no diagnosis,
-    and no correlation-over-a-few-weeks presented as causal.
+    Each prompt is an argument-less function returning list[str] -- it
+    states which tools to call and why, never calling them itself.
     """
 
     @server.prompt(
@@ -2978,25 +2374,10 @@ def _register_prompts(server: MCPServer[AppContext]) -> None:
 def _register_resources(server: MCPServer[AppContext]) -> None:
     """The four per-user resources (#26), as one ``whoop://user/{item}`` template.
 
-    One template rather than four static resources because a *static*
-    resource's read function in the installed SDK is structurally
-    incapable of receiving ``Context`` -- ``MCPServer.resource()`` rejects a
-    ``Context``-typed parameter on any URI with no ``{param}`` at
-    registration time -- so the ``_ensure_matches_live_grant`` identity gate
-    every one of these four requires would simply be unreachable behind a
-    static registration. A template *does* receive ``Context``,
-    and the four exact URIs the issue specifies --
-    ``whoop://user/profile``, ``whoop://user/latest-recovery``,
-    ``whoop://user/latest-sleep`` and ``whoop://user/latest-cycle`` -- still
-    resolve through it unchanged. The one visible consequence: they now
-    surface via ``resources/templates/list`` rather than ``resources/list``.
-
-    The template itself matches ANY single trailing segment -- both
-    ``whoop://user/`` (``item == ""``) and ``whoop://user/unknown-thing``
-    match just as readily as the four real items -- so the
-    ``ResourceNotFoundError`` at the end of the dispatch below is
-    load-bearing, not defensive: without it, every unrecognised item would
-    silently fall through instead of failing.
+    A template, not four static resources, because a static resource's read
+    function can't receive Context, and the identity gate needs it. Matches
+    any trailing segment, so the ResourceNotFoundError at dispatch's end is
+    load-bearing -- an unrecognised item must fail, not fall through silently.
     """
 
     @server.resource(
@@ -3009,34 +2390,15 @@ def _register_resources(server: MCPServer[AppContext]) -> None:
         ),
         mime_type="application/json",
     )
-    # ctx is deliberately typed as the bare `Context`, not the parametrized
-    # `Context[AppContext, Any]` every tool function above uses: a resource
-    # *template*'s function is wrapped whole in pydantic's `validate_call`
-    # (unlike a tool's, where the context parameter is stripped out before
-    # argument validation and injected directly) -- verified empirically,
-    # not assumed: a `Context[AppContext, Any]`-annotated parameter here
-    # forces pydantic to revalidate the incoming `Context` instance against
-    # that exact parametrized class, and since every caller in this
-    # codebase (including every test harness that reads a resource)
-    # constructs a plain, unparametrized `Context(...)`, that revalidation
-    # silently rebuilds a blank instance missing the private
-    # `_request_context`/`_mcp_server` attributes the object actually
-    # carried -- `ctx.request_context` then raises "Context is not
-    # available outside of a request" instead of ever reaching the
-    # identity gate. The bare annotation matches what every call site here
-    # actually constructs, so no such revalidation happens.
+    # Bare `Context`, not the parametrized form: pydantic's validate_call
+    # would revalidate it and drop private attrs, breaking ctx.request_context.
     async def whoop_user_resource(item: str, ctx: Context) -> dict[str, Any]:
-        # A `cast`, not a real parametrized annotation on `ctx` itself (see
-        # above) -- has no runtime effect, so it doesn't reintroduce the
-        # pydantic revalidation this function's bare `Context` annotation
-        # exists to avoid, while still giving `_ensure_matches_live_grant`/
-        # `_require_store` below the `AppContext`-typed value they declare.
+        # cast has no runtime effect, so it doesn't reintroduce the pydantic
+        # revalidation the bare `Context` annotation above avoids.
         typed_ctx = cast("Context[AppContext, Any]", ctx)
         app = typed_ctx.request_context.lifespan_context
-        # The identity gate runs before the item dispatch below, deliberately:
-        # an unauthenticated caller must not learn which items exist, and
-        # resolve_member_id's own audit write (store.record_tool_call) should
-        # record an attempted read of an unknown item rather than drop it.
+        # Gate runs before dispatch: an unauthenticated caller must not learn
+        # which items exist, and the audit write should record the attempt.
         whoop_user_id = _ensure_matches_live_grant(typed_ctx)
         conn = _require_store(app)
         if item == "profile":

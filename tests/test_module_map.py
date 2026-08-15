@@ -1,24 +1,4 @@
-"""Guards for CONTRIBUTING.md's "Where things go" map (issue #71).
-
-The map is the placement contract: which module a change belongs in, and
-which files may talk to the ``mcp`` SDK at all. It has gone stale silently
-twice already -- 4 of the package's modules missing when #71 was filed, 9 of
-18 by the time it was fixed -- because nothing enforced it against the real
-package. These two tests are that enforcement, not just a correction:
-
-- ``test_module_map_matches_src_whoopmcp``: every ``src/whoopmcp/*.py`` has a
-  map entry, and every entry names a file that actually exists.
-- ``test_no_module_outside_mcp_surface_imports_mcp``: the map's one
-  structural rule -- only ``server.py``, ``webhooks.py``, and ``mcpauth.py``
-  import ``mcp`` -- holds against every module's real AST.
-
-Both parse source text directly (``Path.read_text`` + ``ast.parse``), never
-``sys.modules`` or a module's ``__dict__``. That is the mechanism
-``test_mcpauth.py``'s own ``test_mcpauth_does_not_import_auth`` uses, and
-#71 explicitly warns it against: inspecting an already-imported module's
-namespace can pick up a transitive import from an unrelated code path, not
-just that module's own ``import`` statements.
-"""
+"""Guards for CONTRIBUTING."""
 
 from __future__ import annotations
 
@@ -38,13 +18,7 @@ MCP_SURFACE_MODULES = frozenset({"server.py", "webhooks.py", "mcpauth.py"})
 
 
 def _map_entries() -> list[str]:
-    """Every module name (``foo.py``) listed in the "Where things go" block.
-
-    Parses the fenced block right after the "## Where things go" heading. A
-    line counts as an entry only if it starts at column 0 with a
-    ``name.py`` token; a wrapped continuation line (e.g. ``mcpauth.py``'s
-    second line) is indented and so is skipped.
-    """
+    """Every module name (``foo."""
     text = CONTRIBUTING.read_text()
     block = re.search(r"## Where things go\n\n```\n(.*?)\n```", text, re.DOTALL)
     assert block is not None, "couldn't find the 'Where things go' fenced block in CONTRIBUTING.md"
@@ -74,13 +48,7 @@ def _imports_mcp(path: Path) -> bool:
 
 
 def test_module_map_matches_src_whoopmcp() -> None:
-    """CONTRIBUTING.md's map and ``src/whoopmcp/*.py`` name exactly the same files.
-
-    This is the completeness half of #71: at the time this test was
-    written the map named 8 files against 18 real ones. Checked in both
-    directions, so a future rename shows up either way -- as a real file
-    with no entry, or as an entry naming a file that no longer exists.
-    """
+    """CONTRIBUTING."""
     mapped = set(_map_entries())
     actual = {path.name for path in SRC_DIR.glob("*.py")}
 
@@ -92,15 +60,7 @@ def test_module_map_matches_src_whoopmcp() -> None:
 
 
 def test_no_module_outside_mcp_surface_imports_mcp() -> None:
-    """Only server.py, webhooks.py, and mcpauth.py import ``mcp``.
-
-    #71's other half: CONTRIBUTING.md used to claim server.py was "the
-    only" file that imports ``mcp``, which AST across all 18 modules
-    disproves -- webhooks.py and mcpauth.py both do too. This enforces the
-    corrected, three-file rule directly against source, so a future module
-    reaching for ``mcp`` fails CI instead of quietly widening the surface
-    the doc describes.
-    """
+    """Only server."""
     violations = [
         path.name
         for path in sorted(SRC_DIR.glob("*.py"))

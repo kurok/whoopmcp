@@ -1,19 +1,4 @@
-"""Every tool's worst-case response stays under its context-budget ceiling.
-
-Two distinct "worst case" regimes matter here, and conflating them would
-under-test the analysis tools while over-building the data-tool fixtures:
-
-- The 8 data tools only ever see one page at a time -- WHOOP caps a page at
-  25 records (``client.MAX_PAGE_SIZE``) no matter how wide a range is asked
-  for, so "two years of history" does not mean more records in one call, it
-  means the densest possible single page. Their worst-case fixture is one
-  respx-mocked page of 25 SCORED records with every optional/nested field
-  populated.
-- The 4 analysis tools walk every page over the requested range via
-  ``WhoopClient.paginate()``, so their worst case is a genuinely large
-  collection -- over the 1000-record ``max_records`` cap, spanning years --
-  not one page. Their fixture is 1,100+ records per collection.
-"""
+"""Every tool's worst-case response stays under its context-budget ceiling."""
 
 from __future__ import annotations
 
@@ -52,16 +37,7 @@ from whoopmcp.store import (
 
 
 def fast_forwarding_clock() -> Callable[[], float]:
-    """A clock that jumps far ahead on every call.
-
-    Since issue #11, WhoopClient._get sits behind a RateLimiter that (against
-    the default, real clock) genuinely waits out a per-minute/per-day window
-    rollover once its budget is exhausted -- and the analysis-tool fixtures
-    below page through 1,100+ records per collection, which is well past the
-    default 100/minute budget in a single test. This clock makes any such
-    wait resolve after one poll tick instead, exactly mirroring
-    tests/test_server.py's own helper of the same name.
-    """
+    """A clock that jumps far ahead on every call."""
     state = {"now": 0.0}
 
     def _clock() -> float:
@@ -74,11 +50,7 @@ def fast_forwarding_clock() -> Callable[[], float]:
 async def call_tool(
     server: MCPServer[AppContext], name: str, arguments: dict[str, Any], app_context: AppContext
 ) -> Any:
-    """Call a tool with proper context wiring, and unwrap its return value.
-
-    Same unwrap logic as tests/test_server.py's helper of the same name --
-    see that module's docstring for why it is needed.
-    """
+    """Call a tool with proper context wiring, and unwrap its return value."""
     request_context = ServerRequestContext(
         session=None,  # type: ignore[arg-type]
         lifespan_context=app_context,
@@ -303,12 +275,7 @@ def _analysis_cycle_records() -> list[dict[str, Any]]:
 def _mock_paginated_collection(
     path: str, records: list[dict[str, Any]], page_size: int = 25
 ) -> None:
-    """Mock a WHOOP list endpoint so WhoopClient.paginate() walks it via nextToken.
-
-    Ignores start/end filtering -- every test using this wants every record
-    reachable regardless of the range passed -- and only the nextToken cursor
-    selects the page, the same thing that actually drives client.paginate().
-    """
+    """Mock a WHOOP list endpoint so WhoopClient."""
 
     def _respond(request: httpx.Request) -> httpx.Response:
         params = parse_qs(urlparse(str(request.url)).query)
@@ -322,12 +289,7 @@ def _mock_paginated_collection(
 
 
 def _seed(conn: Any, whoop_user_id: int, upsert: Any, records: list[dict[str, Any]]) -> None:
-    """Bulk-seed the store for #16's own worst-case fixtures.
-
-    Every one of the 12 repointed tools (and whoop_data_coverage) reads
-    from the store, not the live API -- these fixtures no longer measure
-    anything by mocking WHOOP; they have to actually be written here.
-    """
+    """Bulk-seed the store for #16's own worst-case fixtures."""
     for record in records:
         upsert(conn, whoop_user_id, record)
 

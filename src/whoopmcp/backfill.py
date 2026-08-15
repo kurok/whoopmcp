@@ -1,31 +1,8 @@
 """Resumable, throttled history import (#14).
 
-A newly authorised user has years of history and none of it locally.
-``run_backfill`` walks every paginated collection (recoveries, sleeps,
-cycles, workouts) newest-first -- WHOOP's v2 collection endpoints return
-records descending by start when unbounded, so a plain ``nextToken`` walk
-already delivers the last week first while the rest is still arriving --
-upserts every record through the store, and checkpoints the API's own
-opaque cursor into ``sync_state`` only after a page has fully committed.
-An interrupted run resumes exactly where it stopped and never re-requests
-an already-committed page.
-
-Every page fetch is issued at ``RequestPriority.BACKFILL``, the low-priority
-class #11 built and nothing consumed until now: the import never starves an
-interactive question, and it can never bypass the rate limiter because it
-only ever talks to WHOOP through ``WhoopClient``'s own list methods.
-
-The whole thing is gated on ``Config.cache_enabled`` -- PRIVACY.md promises
-the persistent store is "off by default; only written if you set
-WHOOPMCP_CACHE=true", and backfill is the first bulk writer that would
-otherwise break that promise.
-
-Deliberately CLI-only (``whoopmcp backfill``, see ``__main__.py``), never an
-MCP tool -- a tool call that blocks for a minute is a broken tool call, and
-#30/#32 already established that operator-only capabilities live on the CLI.
-Progress needs no mechanism of its own: ``sync_state``'s (cursor,
-last_run_at, outcome) rows are the queryable progress surface, and record
-enough for #16 to later say what range the store holds.
+Walks collections newest-first, checkpointing ``sync_state`` only after a
+page fully commits (retries never redo a committed page). Gated on
+``cache_enabled``; CLI-only, never an MCP tool (blocking calls are broken).
 """
 
 from __future__ import annotations
@@ -56,10 +33,9 @@ class BackfillDisabledError(RuntimeError):
 class _EntitySpec:
     """One paginated collection the backfill walks.
 
-    ``name`` doubles as the ``sync_state`` entity key and is the store's own
-    table name, so #15/#16 can consume the same rows without translation.
-    ``list_method`` names the ``WhoopClient`` method rather than binding it,
-    since the client instance only exists at run time.
+    ``name`` is also the ``sync_state`` key and store table name (shared with
+    #15/#16). ``list_method`` names the client method since the client only
+    exists at run time.
     """
 
     name: str
@@ -67,9 +43,8 @@ class _EntitySpec:
     upsert: Callable[[sqlite3.Connection, int, dict[str, Any]], None]
 
 
-#: The four paginated collections, in the order they are walked. The
-#: profile/body-measurement singletons are deliberately absent: they are not
-#: paginated collections, and the profile is already written at login.
+#: The four paginated collections, walked in this order. Profile/body-
+#: measurement are excluded: not paginated, and profile is written at login.
 BACKFILL_ENTITIES: tuple[_EntitySpec, ...] = (
     _EntitySpec("recoveries", "list_recoveries", upsert_recovery),
     _EntitySpec("sleeps", "list_sleeps", upsert_sleep),
@@ -91,11 +66,10 @@ async def run_backfill(
 ) -> dict[str, int]:
     """Import ``whoop_user_id``'s full history into the persistent store.
 
-    Returns the number of records imported per entity. Raises
-    ``BackfillDisabledError`` -- before touching the network or the store --
-    unless ``config.cache_enabled`` is set. Any fetch or upsert failure
-    propagates without advancing the interrupted entity's checkpoint, so a
-    re-run resumes from the last fully-committed page.
+    Returns records imported per entity. Raises ``BackfillDisabledError``
+    before any I/O unless ``cache_enabled`` is set. A failure mid-entity
+    leaves its checkpoint unadvanced, so a re-run resumes from the last
+    committed page.
     """
     if not config.cache_enabled:
         raise BackfillDisabledError(
@@ -119,12 +93,9 @@ async def _backfill_entity(
 ) -> int:
     """Walk one collection to exhaustion (or ``floor``), checkpointing.
 
-    Per page: fetch (at BACKFILL priority, resuming from any stored cursor),
-    upsert every record (idempotent, each self-committing through the store),
-    and only then advance ``sync_state`` to the page's own ``next_token``.
-    A failure mid-page leaves the previous checkpoint in place -- the
-    interrupted page is re-fetched and re-upserted on the next run, which is
-    safe precisely because every write is an upsert.
+    Per page: fetch (BACKFILL priority, resuming from stored cursor), upsert
+    every record, then advance ``sync_state``. A failure mid-page leaves the
+    prior checkpoint in place; safe to retry since every write is an upsert.
     """
     state = get_sync_state(conn, whoop_user_id, spec.name)
     if state is not None and state["outcome"] == "complete":

@@ -1,13 +1,7 @@
 """Derived metrics over WHOOP records.
 
-These are pure functions on already-fetched records, kept apart from the API
-client so they can be tested without a network and reasoned about without an
-access token.
-
-A note on what belongs here: WHOOP data is health data, and a correlation
-over 30 nights of sleep is not a medical finding. Functions in this module
-return numbers and the sample size behind them; they do not return advice,
-and the tool descriptions in ``server`` say so.
+Pure functions on already-fetched records -- testable without network/token. WHOOP data is
+health data: these return numbers and sample sizes, never advice (see ``server``'s tool text).
 """
 
 from __future__ import annotations
@@ -24,22 +18,12 @@ MIN_CORRELATION_SAMPLES = 8
 #: The default lag sweep for correlate_lag_sweep: +/- 3 days.
 DEFAULT_LAG_SWEEP: tuple[int, ...] = tuple(range(-3, 4))
 
-#: Below this many observations, a trend/regression is not worth reporting --
-#: mirrors MIN_CORRELATION_SAMPLES's philosophy for this module's other
-#: "refuse below N" convention.
+#: Below this many observations, a trend/regression is not worth reporting -- mirrors
+#: MIN_CORRELATION_SAMPLES's "refuse below N" convention.
 MIN_TREND_SAMPLES = 8
 
-#: Below this many observations per group an effect size is not worth reporting
-#: (#183). The same 8 as its two siblings above, reused rather than newly
-#: invented: all three answer the same question -- how many observations before
-#: a coefficient describes the member instead of the sample -- and a third
-#: threshold would imply a distinction that does not exist.
-#:
-#: Cohen's d is the most misleading of the three when starved, which is why it
-#: needed a floor rather than only a caveat: it divides by a pooled standard
-#: deviation, and at two observations per group that denominator is nearly
-#: arbitrary. Two 2-point groups measured here produced d = 16.26, a number that
-#: reads as overwhelming evidence and is an artefact of the sample size.
+#: Below this many observations per group an effect size is not worth reporting (#183).
+#: Checked per group, not the total -- 13/1 tells as little as 1/1 (a 2/2 split gave d=16.26).
 MIN_EFFECT_SAMPLES = 8
 
 #: Friendly metric name -> key within record["score"].
@@ -52,9 +36,8 @@ _METRIC_PATHS: dict[str, str] = {
     "strain": "strain",
 }
 
-#: Metrics whose records are Cycle objects: a Cycle identifies itself via
-#: "id" and never carries a "cycle_id" (that field is a foreign key that
-#: Recovery/Sleep records use to point *at* the cycle they belong to).
+#: Metrics whose records are Cycle objects: a Cycle has no "cycle_id" of its own (that's the
+#: foreign key Recovery/Sleep use to point at their cycle) -- it identifies via "id" instead.
 _CYCLE_SOURCED_METRICS = frozenset({"strain"})
 
 
@@ -122,12 +105,10 @@ class LagResult:
 
 @dataclass(frozen=True, slots=True)
 class RollingStat:
-    """One day's rolling mean/stdev/z-score, or an explicit reason it could
-    not be scored -- see ``rolling_z_scores``. ``unscored_reason`` is
-    ``None`` if and only if ``rolling_mean``/``rolling_stdev``/``z_score``
-    are all populated (``rolling_stdev``/``z_score`` may still be ``None``
-    on their own when the window has fewer than 2 points -- see
-    ``rolling_z_scores`` -- in which case ``unscored_reason`` explains why).
+    """One day's rolling mean/stdev/z-score, or a reason it wasn't scored (``rolling_z_scores``).
+
+    ``unscored_reason`` is ``None`` iff ``rolling_mean``/``rolling_stdev``/``z_score`` are all
+    populated (the latter two may independently be ``None`` when the window has <2 points).
     """
 
     date: str
@@ -142,11 +123,8 @@ class RollingStat:
 class DayStatus:
     """One calendar day's streak status, per ``find_streaks``.
 
-    ``status`` is exactly one of "missing" (no measurement that day at
-    all), "failing" (measured, does not meet the threshold/direction), or
-    "passing" (measured, meets it). ``value`` is ``None`` if and only if
-    ``status == "missing"`` -- the structural distinction the "missing day
-    vs. failing day" acceptance criterion asks for.
+    ``status``: "missing" (no measurement), "failing" (measured, misses threshold), or
+    "passing" (measured, meets it). ``value`` is ``None`` iff ``status == "missing"``.
     """
 
     date: str
@@ -238,14 +216,10 @@ def standardized_effect_size(
     """Cohen's d between two groups, via pooled standard deviation.
 
     Raises:
-        InsufficientDataError: if either group has fewer than
-            ``MIN_EFFECT_SAMPLES`` observations, or when the pooled standard
-            deviation is exactly 0 (both groups perfectly constant and
-            identical -- undefined, not zero).
+        InsufficientDataError: if either group has fewer than ``MIN_EFFECT_SAMPLES``
+            observations, or pooled stdev is exactly 0 (both groups constant and identical).
 
-    Note the floor is checked per group, not on the total: 14 observations
-    split 13/1 tells you as little about the second group as 1/1 does, and a
-    check on the sum would let that through.
+    Floor is checked per group, not the total: a 13/1 split tells as little as 1/1 would.
     """
     if count_a < MIN_EFFECT_SAMPLES or count_b < MIN_EFFECT_SAMPLES:
         raise InsufficientDataError(
@@ -286,14 +260,12 @@ def _rank(values: Sequence[float]) -> list[float]:
 def spearman(xs: Sequence[float], ys: Sequence[float]) -> float:
     """Spearman's rank correlation coefficient.
 
-    Pearson's r computed over each series' average ranks (ties resolved by
-    the mean of the tied positions' ranks).
+    Pearson's r over each series' average ranks (ties resolved by mean rank).
 
     Raises:
         ValueError: if the sequences differ in length.
-        InsufficientDataError: with fewer than two pairs, or when either
-            series has zero rank-variance (all values tied) -- raised by
-            ``pearson`` itself on the ranked series.
+        InsufficientDataError: with fewer than two pairs, or zero rank-variance (raised by
+            ``pearson`` on the ranked series).
     """
     if len(xs) != len(ys):
         raise ValueError(f"length mismatch: {len(xs)} vs {len(ys)}")
@@ -323,11 +295,7 @@ def linear_slope(xs: Sequence[float], ys: Sequence[float]) -> float:
 
 
 # -- record shaping --------------------------------------------------------
-#
-# The functions below turn raw WHOOP records into the sequences the
-# primitives above consume. They are the part that has to know WHOOP's
-# response shapes, so they are the part most likely to break when the API
-# changes -- keep the schema knowledge concentrated here.
+# Turns raw WHOOP records into sequences the primitives above consume; keep schema knowledge here.
 
 
 def _metric_key(metric: str) -> str:
@@ -355,23 +323,8 @@ def _filtered_records(
         if not score or key not in score:
             continue
         value = score[key]
-        # `not score` catches a missing or empty score dict and `key not in
-        # score` catches an absent key, but neither catches the key being
-        # present and null -- which is the one case `extract_metric`'s docstring
-        # names, and the one that reached `float(None)` and raised (#182).
-        #
-        # One guard, not two: `float(None)` raises `TypeError`, so the null the
-        # docstring promises to skip is handled by the same conversion guard
-        # that handles every other unusable value -- a dict, a list, a
-        # non-numeric string. An explicit `if value is None: continue` above
-        # this reads well but is unreachable in effect; nothing can tell the two
-        # versions apart, which is a good reason not to carry both.
-        #
-        # Skipping rather than raising keeps one malformed record from taking
-        # down a whole window's analysis, and raising `TypeError`/`ValueError`
-        # out of a filter every analysis path shares is the same opaque,
-        # low-level failure #173 and #179 removed elsewhere. Numeric strings
-        # still convert, so nothing that worked before stops working.
+        # Missing dict/key and a present-but-null value both fall through to the `float()`
+        # guard below (#182) -- skipped, not raised, so one bad record can't break a window.
         try:
             pairs.append((record, float(value)))
         except (TypeError, ValueError):
@@ -380,14 +333,10 @@ def _filtered_records(
 
 
 def _join_key(record: dict[str, Any], metric: str) -> Any:
-    """The record's cycle_id if it has one, else its own id if it is a Cycle,
-    else its UTC calendar date.
+    """The record's cycle_id if it has one, else its own id if it's a Cycle, else its UTC date.
 
-    A Recovery or Sleep record carries ``cycle_id`` as a foreign key to the
-    cycle it belongs to, so that always wins. A Cycle record (e.g. the
-    source of ``strain``) has no ``cycle_id`` of its own -- it identifies
-    itself via ``id`` -- so metrics sourced from Cycle records join on their
-    own ``id`` instead of falling through to calendar-day matching.
+    Recovery/Sleep carry ``cycle_id`` pointing at their cycle (always wins). A Cycle record has
+    no ``cycle_id`` of its own, so Cycle-sourced metrics join on ``id`` instead of calendar-day.
     """
     cycle_id = record.get("cycle_id")
     if cycle_id is not None:
@@ -419,9 +368,8 @@ def summarize(records: Sequence[dict[str, Any]], metric: str, *, expected_days: 
     Args:
         records: Raw WHOOP records to summarize.
         metric: Friendly metric name, as in ``extract_metric``.
-        expected_days: How many calendar days the caller's window spans, used
-            to compute ``days_missing`` -- the coverage gap, not a record
-            count.
+        expected_days: Calendar days the window spans, for ``days_missing`` (coverage gap,
+            not a record count).
     """
     values = extract_metric(records, metric)
     result_mean = mean(values)
@@ -445,14 +393,8 @@ def summarize(records: Sequence[dict[str, Any]], metric: str, *, expected_days: 
 def _describe_fit(r_squared: float) -> str:
     """Describe a fit's strength in words, from its r-squared.
 
-    A slope is not safe to narrate without knowing how much of the variance
-    it actually explains -- this is the "describe the fit in words" half of
-    that requirement, alongside the numeric r_squared field it never
-    replaces. Bands are deliberately coarse and stated here rather than
-    hidden behind the word: r_squared >= 0.7 "strong", >= 0.4 "moderate",
-    >= 0.1 "weak", otherwise "negligible". These are common, not universal,
-    conventions -- the numeric r_squared is always reported alongside this
-    so nothing is lost if a caller judges the fit differently.
+    Bands: >=0.7 "strong", >=0.4 "moderate", >=0.1 "weak", else "negligible" -- common, not
+    universal conventions; the numeric r_squared is always reported alongside, never replaced.
     """
     if r_squared >= 0.7:
         return "strong"
@@ -474,25 +416,11 @@ def _daily_means(dated_values: Sequence[tuple[str, float]]) -> list[RollingPoint
 def _rolling_means(daily: Sequence[RollingPoint], window_days: int) -> list[RollingPoint]:
     """Rolling mean over a trailing window of ``window_days`` calendar days.
 
-    ``daily`` must already be day-deduplicated and sorted by date. A date only
-    gets a point once at least ``window_days`` calendar days have elapsed
-    since the start of the *current run of coverage*; the window itself is
-    every day-deduplicated point whose date falls within the trailing
-    ``window_days``-day span, with no gap-filling for days that have no
-    observation.
-
-    "Current run of coverage" matters because a gap between two consecutive
-    daily points that is itself >= ``window_days`` resets the minimum-periods
-    clock: no point from before such a gap could ever land inside a window
-    that only looks back ``window_days - 1`` days in the first place, so
-    without the reset, the first point after a long gap would silently be
-    reported as a full ``window_days``-day mean while actually being an
-    average of whatever handful of points the gap happened to leave nearby --
-    the exact "spurious swing" the leading-edge rule exists to prevent, just
-    triggered mid-series instead of only at the very start. Each window size
-    resets independently (a gap can be big enough to reset the 7-day window
-    while leaving the 90-day window's own coverage intact), which falls out
-    for free from this function being called once per window size.
+    ``daily`` must be day-deduplicated and sorted. A date gets a point only once
+    ``window_days`` have elapsed since the start of its *current run of coverage* -- a gap
+    >= ``window_days`` between consecutive points resets that run's clock, so a point right
+    after a long gap is never reported as a full-window mean built from a sparse handful of
+    points. Each window size resets independently since this is called once per window size.
     """
     dates = [datetime.fromisoformat(point.date).date() for point in daily]
     points: list[RollingPoint] = []
@@ -511,50 +439,22 @@ def _rolling_means(daily: Sequence[RollingPoint], window_days: int) -> list[Roll
     return points
 
 
-#: rolling_z_scores' warm-up reason: the calendar clock for the current run
-#: of coverage (see that function's docstring) has not yet reached
-#: window_days.
+#: rolling_z_scores' warm-up reason: the current run of coverage hasn't reached window_days yet.
 _UNSCORED_WARM_UP = "warm_up"
 
-#: rolling_z_scores' other unscored reason: past warm-up, but the trailing
-#: window still contains fewer than 2 points, so a standard deviation (and
-#: therefore a z-score) is undefined. Only reachable for window_days <= 1 --
-#: a run's own "gap < window_days between consecutive points" invariant
-#: otherwise guarantees the immediately preceding point falls in-window too.
+#: rolling_z_scores' other unscored reason: past warm-up but the trailing window still has
+#: <2 points, so stdev/z-score are undefined. Only reachable for window_days <= 1.
 _UNSCORED_INSUFFICIENT_VARIANCE = "insufficient_variance"
 
 
 def rolling_z_scores(daily: Sequence[RollingPoint], window_days: int) -> list[RollingStat]:
-    """One ``RollingStat`` per point in ``daily``, scored against a trailing
-    ``window_days``-day rolling mean/stdev -- a *rolling*, not global,
-    z-score, so a genuine sustained level shift ("a slow seasonal drift")
-    re-adapts the baseline instead of reading as a month of anomalies.
+    """One ``RollingStat`` per point in ``daily``, scored against a trailing ``window_days``-day
+    rolling mean/stdev (a *rolling*, not global, z-score).
 
-    Borrows ``_rolling_means``'s own "current run of coverage" gap-reset
-    rule verbatim (see that function's docstring for the full rationale): a
-    gap between two consecutive daily points that is itself >= ``window_days``
-    resets the warm-up clock. Unlike ``_rolling_means``, this function never
-    drops a day from its own return value -- every input day gets exactly
-    one ``RollingStat``, in the same order, whether or not it could be
-    scored. A day still within warm-up is tagged ``unscored_reason ==
-    "warm_up"`` with ``rolling_mean``/``rolling_stdev``/``z_score`` all
-    ``None`` -- reported, never silently dropped (issue #24's own Notes: "a
-    dropped day reads as a normal day"). A day past warm-up whose own
-    trailing window still has fewer than 2 points is tagged
-    ``"insufficient_variance"``: its ``rolling_mean`` is still reported (a
-    mean of one point is well-defined), but ``rolling_stdev``/``z_score``
-    stay ``None``.
-
-    A window whose stdev is exactly 0 (every value in it identical) defines
-    ``z_score`` as ``0.0`` -- no deviation to score against, not an outlier
-    by construction -- rather than raising or producing inf/NaN.
-
-    This project's own callers (server.py's ``whoop_outliers``) use a
-    14-calendar-day window: short enough to re-adapt to a genuine level
-    shift within roughly half that span, long enough to span a full
-    weekday+weekend cadence twice over. That choice lives in server.py, not
-    here -- this function takes ``window_days`` as a parameter and makes no
-    assumption about its value.
+    Borrows ``_rolling_means``'s gap-reset rule. Never drops a day -- every input gets exactly
+    one ``RollingStat``: tagged ``unscored_reason="warm_up"`` (all stats ``None``) or
+    ``"insufficient_variance"`` (window has <2 points, only ``rolling_mean`` set) when unscored.
+    A window with stdev exactly 0 defines ``z_score`` as ``0.0`` rather than raising or NaN/inf.
     """
     if not daily:
         return []
@@ -612,17 +512,11 @@ def rolling_z_scores(daily: Sequence[RollingPoint], window_days: int) -> list[Ro
 def context_window(
     daily: Sequence[RollingPoint], index: int, radius: int
 ) -> tuple[list[RollingPoint], list[RollingPoint]]:
-    """The up-to-``radius`` measured points immediately before/after
-    ``daily[index]``, via plain list slicing.
+    """The up-to-``radius`` measured points immediately before/after ``daily[index]``.
 
-    Because ``daily`` is already scoped to the caller's own requested
-    range, slicing truncates naturally at the range's own edges -- an
-    outlier on the first or last day of the range comes back with fewer
-    context points on that side, never an error and never padding.
-    "Before"/"after" are nearest *measured* neighbours in this
-    day-deduplicated series, not literal calendar-adjacent days: a day with
-    no scored record is already simply absent from ``daily`` (the same
-    "unmeasured, not zero" contract ``store.get_metric_series`` guarantees).
+    Truncates at the range's own edges (fewer points near an edge, never an error/padding).
+    "Before"/"after" are nearest *measured* neighbours, not calendar-adjacent days -- an
+    unmeasured day is simply absent from ``daily`` (same contract as ``store.get_metric_series``).
     """
     before = list(daily[max(0, index - radius) : index])
     after = list(daily[index + 1 : index + 1 + radius])
@@ -653,32 +547,16 @@ def find_streaks(
     range_start: str,
     range_end: str,
 ) -> tuple[list[DayStatus], list[Streak]]:
-    """Classify every calendar day in ``[range_start, range_end]`` and find
-    maximal above/below-threshold runs.
+    """Classify every calendar day in ``[range_start, range_end]`` and find maximal
+    above/below-threshold runs.
 
-    Every calendar day in the inclusive range is enumerated -- not just
-    measured ones -- as exactly one ``DayStatus``: "missing" when ``daily``
-    has no point for that date, "failing" when it has one that does not
-    meet the threshold, "passing" when it does. A streak is a maximal run of
-    consecutive "passing" days; both "failing" and "missing" days end the
-    current run, with no bridging logic -- the simplest, most conservative
-    interpretation, and a deliberate one: whether an unmeasured day *should*
-    break a streak (someone who didn't wear the strap did not fail a
-    recovery streak; they stopped measuring) is a judgement call this
-    function leaves to the caller, per issue #24's own Notes. The full
-    ``days`` list is returned alongside ``streaks`` specifically so a
-    caller who disagrees can reconstruct the alternate interpretation
-    themselves -- e.g. by noticing two streaks are separated only by
-    "missing" days, never "failing" ones.
+    Every day gets exactly one ``DayStatus``: "missing" (no point in ``daily``), "failing"
+    (measured, misses threshold), or "passing" (measured, meets it). A streak is a maximal run
+    of consecutive "passing" days; both "failing" and "missing" end a run, with no bridging --
+    deliberately conservative, left to the caller to reinterpret via the full ``days`` list (#24).
 
-    ``direction`` accepts exactly "above" (``value >= threshold``) or
-    "below" (``value <= threshold``) -- both inclusive of the threshold
-    itself, so a value exactly at the threshold is never silently excluded
-    from both directions.
-
-    ``range_start > range_end`` (an inverted range) returns ``([], [])``
-    rather than raising; ``range_start == range_end`` is a normal one-day
-    range. Neither ``daily`` nor the range being empty is an error.
+    ``direction``: "above" (``value >= threshold``) or "below" (``value <= threshold``), both
+    threshold-inclusive. ``range_start > range_end`` returns ``([], [])`` rather than raising.
 
     Raises:
         ValueError: if ``direction`` is not "above" or "below".
@@ -738,18 +616,8 @@ def trend(records: Sequence[dict[str, Any]], metric: str) -> Trend:
     xs = [day for day, _ in pairs]
     ys = [value for _, value in pairs]
     slope = linear_slope(xs, ys)
-    # A perfectly constant series is not exotic for bounded metrics --
-    # sleep_performance pinned at 100 for a good week, strain identical
-    # across rest days -- and it has a well-defined trend: the slope is
-    # exactly 0 (linear_slope already returns it; the covariance term is
-    # zero). Only the correlation coefficient is undefined, so calling
-    # pearson unguarded raised InsufficientDataError out of a function whose
-    # caller had plenty of observations, and metric_trend then reported
-    # "insufficient_data" with a message about correlation for a request
-    # about a trend (#199). r_squared is defined as 0.0 by convention: a
-    # flat line explains none of the variance because there is no variance
-    # to explain, and 0.0 maps to the honest "negligible" band rather than
-    # the r_squared -> 1 a "perfect fit" reading would imply.
+    # A constant series has a defined slope (0) but undefined pearson r -- guard avoids
+    # raising InsufficientDataError on a data-rich request (#199); r_squared=0.0 by convention.
     r_squared = 0.0 if all(y == ys[0] for y in ys) else pearson(xs, ys) ** 2
 
     dated_values = [
@@ -777,9 +645,7 @@ def _correlation_from_pairs(
 ) -> Correlation:
     """Build a Correlation from already-matched pairs, refusing too few.
 
-    Shared by ``correlate`` (cycle_id-joined pairs) and
-    ``correlate_lag_sweep`` (date-joined pairs) so the refusal threshold and
-    message are defined in exactly one place.
+    Shared by ``correlate`` and ``correlate_lag_sweep`` so the refusal threshold is defined once.
     """
     if len(pairs) < MIN_CORRELATION_SAMPLES:
         raise InsufficientDataError(
@@ -818,17 +684,11 @@ def correlate(
 
 
 def _dated_means(records: Sequence[dict[str, Any]], metric: str) -> dict[str, float]:
-    """One value per unique UTC calendar date for ``metric``, averaging
-    same-date duplicates.
+    """One value per unique UTC calendar date for ``metric``, averaging same-date duplicates.
 
-    Uses the same ``created_at``-based date derivation as ``_join_key``'s
-    calendar-day fallback, uniformly for every record -- including
-    cycle-sourced metrics like strain, which carry ``created_at`` too.
-
-    A metric with more than one scored record on the same date (e.g. a nap
-    alongside a main sleep) collapses to one averaged value for that date,
-    so a ``LagResult.correlation.count`` downstream counts distinct dates,
-    not raw records.
+    Same ``created_at``-based date derivation as ``_join_key``'s calendar-day fallback, applied
+    uniformly (including cycle-sourced metrics). Same-date duplicates (e.g. a nap + main sleep)
+    collapse to one mean, so downstream counts are distinct dates, not raw records.
     """
     groups: dict[str, list[float]] = {}
     for record, value in _filtered_records(records, metric):
@@ -847,28 +707,15 @@ def correlate_lag_sweep(
 ) -> list[LagResult]:
     """Correlate two metrics at each of several day offsets ("lags").
 
-    ``lag_days = L`` pairs metric_a's value on calendar date D with
-    metric_b's value on calendar date D + L: a positive lag means
-    metric_a's date precedes metric_b's by that many days -- metric_a
-    "leads".
+    ``lag_days = L`` pairs metric_a's value on date D with metric_b's value on D + L (positive
+    lag: metric_a "leads"). Joins on calendar date, not cycle_id like ``correlate()`` -- the two
+    can disagree (a Recovery is created on the *next* calendar date after midnight), so a
+    physiologically-aligned pairing at lag=0 in ``correlate()`` may show up here at lag=+1/+2.
+    Treat a lag value as approximate day alignment, not physiological alignment.
 
-    This joins purely on calendar date (derived from ``created_at``), which
-    is a deliberate departure from ``correlate()``'s cycle_id-based join --
-    lag arithmetic is fundamentally a date operation. The two do NOT
-    coincide in general: a Recovery is created hours after the Cycle it
-    belongs to (often after midnight, so on the *next* calendar date), so
-    the "physiologically aligned" pairing that correlate()'s cycle_id join
-    finds at lag=0 can show up here at lag=+1 (or +2) instead. Treat a lag
-    value from this sweep as an approximate day-to-day alignment, not a
-    physiological-cycle one -- callers reasoning about "yesterday's X vs
-    today's Y" should expect the peak near the lag they'd predict, not
-    necessarily at exactly that lag.
-
-    Raises nothing from the pairing/correlation logic itself: every lag in
-    ``lags`` produces exactly one ``LagResult``, with a refusal reason in
-    place of a Correlation when too few pairs survive the shift. Malformed
-    input (a record missing ``created_at``, or an unparseable timestamp)
-    still propagates, same as every other function in this module.
+    Never raises from pairing/correlation: each lag yields one ``LagResult``, with a refusal
+    reason in place of a Correlation when too few pairs survive. Malformed input (missing/
+    unparseable ``created_at``) still propagates.
     """
     dated_a = _dated_means(records_a, metric_a)
     dated_b = _dated_means(records_b, metric_b)

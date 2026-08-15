@@ -1,46 +1,4 @@
-"""Tests for issue #54: ``metric_trend`` downsamples its rolling series.
-
-``analysis.trend()``'s ``rolling_7d``/``rolling_30d``/``rolling_90d`` return
-one point per calendar day of coverage with no cap, so a multi-year range
-measures ~20,760 tokens against peers of 700-1,300. #54's chosen fix is
-*downsampling at the response layer*: pick the finest of ``daily`` (step 1
-day) / ``weekly`` (7) / ``monthly`` (30) whose series fits within
-``ROLLING_MAX_POINTS_PER_SERIES`` points, decimate to it, and say so in the
-response.
-
-Written before the implementation exists -- every test in this file is
-expected to fail (a ``KeyError``/``AssertionError`` on the not-yet-present
-``rolling_resolution``, or an ``ImportError`` on the not-yet-present
-``context_budget`` helper) until #54 lands. Nothing here touches the network:
-every tool call is served from the local store, exactly as
-tests/test_store_backed_tools.py's own fixtures are.
-
-The invariant this file exists to protect is #54's D1: **decimation, never
-averaging**. Every value returned must be a rolling mean that
-``analysis.trend()`` actually computed for that actual date. Averaging the
-daily rolling means inside a bucket would produce a mean of means over
-overlapping windows -- a number that is no window's mean at all -- so
-``test_every_returned_point_is_a_real_computed_rolling_mean`` compares the
-returned ``(date, value)`` pairs against the exact daily series rather than
-merely counting points.
-
-Response shape assumed below (on top of metric_trend's existing fields):
-
-    {
-        ...,
-        "rolling_7d": [{"date": ..., "value": ...}, ...],   # decimated
-        "rolling_30d": [...], "rolling_90d": [...],
-        "rolling_resolution": "daily" | "weekly" | "monthly",  # always present
-        "rolling_truncated": True,   # only in the monthly-overflow case
-        "truncated": bool,           # pre-existing record-count cap (unrelated)
-        "note": str,                 # pre-existing, record-count cap only
-    }
-
-The downsampling explanation (D4) is asserted loosely -- any top-level
-``*note*`` string may carry it -- so that whether it lands in its own key or
-alongside the record-count ``note`` stays an implementation choice, while
-"both are legible when both apply" stays a test.
-"""
+"""Tests for issue #54: ``metric_trend`` downsamples its rolling series."""
 
 from __future__ import annotations
 
@@ -155,27 +113,12 @@ RANGE_ARGS = {"start": "2020-01-01T00:00:00Z", "end": "2030-01-01T00:00:00Z"}
 
 
 def daily_value(index: int) -> float:
-    """A deliberately non-linear, non-repeating daily value.
-
-    Non-linear on purpose: over a perfectly linear ramp the average of an
-    odd-sized bucket of rolling means happens to *equal* the bucket's middle
-    real value, which would let an averaging implementation slip past a
-    value-only assertion. The ``index % 11`` sawtooth plus a slow drift keeps
-    every bucket's average observably away from the real rolling mean for that
-    bucket's own date, which
-    ``test_every_returned_point_is_a_real_computed_rolling_mean`` asserts
-    about this fixture directly rather than assuming.
-    """
+    """A deliberately non-linear, non-repeating daily value."""
     return 45.0 + (index % 11) * 3.1 + index * 0.005
 
 
 def daily_recoveries(days: int) -> list[dict[str, Any]]:
-    """``days`` contiguous SCORED recovery records, one per calendar day.
-
-    Contiguous (no gaps) so that decimation by index and decimation by
-    calendar day coincide: a returned series can then be checked for an exact
-    step-in-days spacing, which is what ``rolling_resolution`` claims.
-    """
+    """``days`` contiguous SCORED recovery records, one per calendar day."""
     return [
         {
             "cycle_id": index,
@@ -192,12 +135,7 @@ def daily_recoveries(days: int) -> list[dict[str, Any]]:
 
 
 def exact_series(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """The undecimated rolling series, straight from ``analysis.trend()``.
-
-    The analysis layer stays exact under #54 (fact #4), so this is both
-    "what metric_trend returned before" and "the set of real computed
-    values" a decimated response must be drawn from.
-    """
+    """The undecimated rolling series, straight from ``analysis."""
     result = trend(records, "recovery_score")
     return {
         "rolling_7d": [{"date": p.date, "value": p.value} for p in result.rolling_7d],
@@ -221,12 +159,7 @@ async def trend_over(
 
 
 def note_texts(response: dict[str, Any]) -> list[str]:
-    """Every top-level note-ish string in a response.
-
-    Deliberately key-name-agnostic: #54's D4 requires the downsampling
-    explanation to be legible and distinguishable from the pre-existing
-    record-count note, not to live under one particular key.
-    """
+    """Every top-level note-ish string in a response."""
     return [value for key, value in response.items() if "note" in key and isinstance(value, str)]
 
 
@@ -240,13 +173,7 @@ def dates_of(points: list[dict[str, Any]]) -> list[Any]:
 async def test_short_range_returns_daily_resolution_unchanged(
     app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """A short range is byte-for-byte what it was before #54.
-
-    100 days of coverage puts the longest series (rolling_7d, 94 points)
-    well inside the cap, so this change has to be invisible here: daily
-    resolution, no downsampling note, no rolling_truncated flag, and exactly
-    the same points ``analysis.trend()`` computes.
-    """
+    """A short range is byte-for-byte what it was before #54."""
     records = daily_recoveries(100)
     expected = exact_series(records)
 
@@ -314,17 +241,7 @@ async def test_multi_year_range_becomes_monthly(
 async def test_every_returned_point_is_a_real_computed_rolling_mean(
     app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """#54's D1, the one mistake that would quietly misreport the metric.
-
-    Every returned ``(date, value)`` pair must appear verbatim in the exact
-    daily series -- i.e. be a rolling mean actually computed for that actual
-    date. A bucket *average* would return a mean of means over overlapping
-    windows: a number that is no window's mean at all.
-
-    The assertion is only meaningful if averaging would in fact produce
-    something different here, so this test proves that about its own fixture
-    first, rather than assuming it.
-    """
+    """#54's D1, the one mistake that would quietly misreport the metric."""
     records = daily_recoveries(200)
     expected = exact_series(records)
 
@@ -395,17 +312,7 @@ async def test_most_recent_point_is_always_present(
 async def test_all_three_series_share_one_resolution(
     app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """``rolling_resolution`` describes the whole response, so all three
-    series must actually be at that step -- not rolling_7d weekly beside
-    rolling_90d daily.
-
-    The fixture is contiguous, so the declared step in days is directly
-    observable as the spacing between consecutive returned dates: every gap
-    is that step, except that at most one may be shorter (whichever end an
-    incomplete bucket falls on -- decimating from the most recent point
-    backwards puts it at the start, aligning buckets to the calendar would
-    put it at the end; #54 fixes neither, and this test does not either).
-    """
+    """``rolling_resolution`` describes the whole response, so all three"""
     records = daily_recoveries(200)
     expected = exact_series(records)
 
@@ -428,15 +335,7 @@ async def test_all_three_series_share_one_resolution(
 
 
 def test_monthly_overflow_truncates_and_keeps_the_most_recent_points() -> None:
-    """Beyond ~10 years of daily points even monthly overflows the cap: keep
-    the most recent points and flag it.
-
-    Tested against the ``context_budget`` helper directly rather than through
-    the tool, because it is unreachable through the tool: metric_trend's own
-    1000-record store cap bounds a response at ~1000 daily points, which
-    monthly resolution comfortably fits. The helper still has to be correct
-    for it -- that is what makes the new ceiling hold for *any* input.
-    """
+    """Beyond ~10 years of daily points even monthly overflows the cap: keep"""
     from whoopmcp.context_budget import (
         ROLLING_MAX_POINTS_PER_SERIES,
         shape_rolling_series,
@@ -476,14 +375,7 @@ def test_monthly_overflow_truncates_and_keeps_the_most_recent_points() -> None:
 async def test_record_truncation_and_downsampling_announce_themselves_separately(
     app_context: AppContext, server: MCPServer[AppContext]
 ) -> None:
-    """A response can be record-truncated *and* downsampled (fact #5).
-
-    1,200 daily records is over the 1000-record store cap and long enough to
-    need coarser-than-daily buckets, so both apply here. ``truncated`` keeps
-    meaning "records were dropped before analysis" and must not be
-    overloaded for the rolling cap; the two explanations must both be
-    readable.
-    """
+    """A response can be record-truncated *and* downsampled (fact #5)."""
     records = daily_recoveries(1200)
 
     response = await trend_over(server, app_context, records)

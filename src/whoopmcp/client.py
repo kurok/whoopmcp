@@ -1,9 +1,7 @@
 """Thin async client over the WHOOP API v2.
 
-Read-only by design: the only non-GET endpoint WHOOP exposes to an OAuth
-client is ``DELETE /v2/user/access``, and this client deliberately does not
-call it -- revoking a grant is something a user should do from WHOOP's own
-settings, not something an LLM should be able to trigger.
+Read-only by design: never calls ``DELETE /v2/user/access`` -- revoking a
+grant is the user's job via WHOOP's own settings, not an LLM's.
 
 Docs: https://developer.whoop.com/api/
 """
@@ -31,11 +29,8 @@ BASE_URL = "https://api.prod.whoop.com/developer"
 #: WHOOP caps a page at 25 records regardless of what you ask for.
 MAX_PAGE_SIZE = 25
 
-#: Documented default limits: 100 requests/minute and 10,000/day, signalled
-#: by X-RateLimit-* headers and a 429 on breach. Confirmed with WHOOP (#9)
-#: to be per application (this client_id), shared across every member who
-#: has authorised it, not a separate budget per member -- so RateLimiter's
-#: bucket is correctly process-wide rather than keyed per user.
+#: Default limits: 100/min, 10,000/day (X-RateLimit-* headers, 429 on breach).
+#: Confirmed per-application (#9), shared across members -- process-wide bucket.
 RATE_LIMIT_PER_MINUTE = 100
 RATE_LIMIT_PER_DAY = 10_000
 
@@ -46,27 +41,23 @@ _BACKOFF_MAX_SECONDS = 30.0
 
 
 class RequestPriority(enum.Enum):
-    """Two priority classes. BACKFILL's first (and so far only) consumer is
-    the history import in ``backfill.py`` (#14); every other caller defaults
-    to INTERACTIVE.
+    """Two priority classes: BACKFILL (only ``backfill.py``, #14) and
+    INTERACTIVE (the default for everyone else).
     """
 
     INTERACTIVE = "interactive"
     BACKFILL = "backfill"
 
 
-#: How often a blocked acquire()/wait rechecks the clock. Bounded and small
-#: so a test using an injected clock (advanced instantly, no real waiting)
-#: still completes in well under a second -- production callers just see a
-#: slightly-delayed, but still prompt, grant once a window rolls over, a
-#: header reveals more room, or a 429's wait elapses.
+#: Poll interval for blocked acquire()/wait. Small so fake-clock tests finish
+#: fast; production sees only a brief delay.
 _POLL_INTERVAL_SECONDS = 0.02
 
 
 @dataclass(frozen=True, slots=True)
 class RateLimitBudget:
     """A point-in-time snapshot of `RateLimiter`'s budget, for `metrics.py`
-    (#31) -- see `RateLimiter.budget_snapshot`."""
+    (#31); see `RateLimiter.budget_snapshot`."""
 
     minute_remaining: int
     minute_limit: int
@@ -75,12 +66,11 @@ class RateLimitBudget:
 
 
 class RateLimiter:
-    """An async token bucket in front of every request. Per-minute and
-    per-day counters; the daily one resets on a UTC calendar boundary, not
-    a rolling 24h window. Reconciled against WHOOP's own X-RateLimit-*
-    headers on every response -- local accounting is an optimisation, the
-    headers are the truth, and the budget may be shared with callers this
-    process doesn't know about (#9).
+    """Async token bucket in front of every request: per-minute + per-day
+    counters (daily resets at UTC midnight, not a rolling 24h window).
+    Reconciled against WHOOP's own X-RateLimit-* headers each response --
+    headers are the source of truth; budget may be shared with other
+    callers (#9).
     """
 
     def __init__(
@@ -124,8 +114,8 @@ class RateLimiter:
                 async with self._lock:
                     self._replenish_locked()
                     capacity_available = self._minute_remaining > 0 and self._day_remaining > 0
-                    # A BACKFILL caller must never consume a freed slot while
-                    # any INTERACTIVE caller is still waiting for one.
+                    # BACKFILL must never take a slot while an INTERACTIVE
+                    # caller is still waiting for one.
                     may_take = capacity_available and (
                         priority is RequestPriority.INTERACTIVE or self._interactive_waiting == 0
                     )
@@ -140,9 +130,8 @@ class RateLimiter:
                 self._interactive_waiting -= 1
 
     def reconcile(self, headers: httpx.Headers) -> None:
-        """WHOOP's own header values replace local accounting outright --
-        not just a downward clamp -- since the header is the one source of
-        truth for a budget that may be shared across other callers.
+        """WHOOP's headers replace local accounting outright (not just a
+        clamp) -- they're the source of truth for a budget that may be shared.
         """
         remaining = headers.get("X-RateLimit-Remaining")
         if remaining is not None:
@@ -154,18 +143,14 @@ class RateLimiter:
                 self._per_minute_limit = int(limit)
         reset_seconds = _reset_seconds(headers)
         if reset_seconds is not None:
-            # X-RateLimit-Reset is seconds until the per-minute window rolls
-            # over (the convention #2 already established for this header).
-            # Back the window's start out from that so a local timer that has
-            # drifted from WHOOP's own doesn't grant early, or make an
-            # already-refilled bucket wait longer than it has to.
+            # X-RateLimit-Reset = seconds until window rollover (#2). Back
+            # the window start out from that to correct for clock drift.
             self._minute_window_start = self._clock() + reset_seconds - 60.0
         self._publish_budget()
 
     def _publish_budget(self) -> None:
-        """Push the current budget into `metrics.py` (#31) -- see
-        `metrics.publish_rate_budget`'s own docstring for why this is a push
-        rather than the exporter reaching in here.
+        """Push the current budget to `metrics.py` (#31); see
+        `publish_rate_budget` for why push, not pull.
         """
         metrics.publish_rate_budget(
             minute_remaining=self._minute_remaining,
@@ -175,8 +160,8 @@ class RateLimiter:
         )
 
     def budget_snapshot(self) -> RateLimitBudget:
-        """Public accessor for `metrics.py` (#31, item C) -- so it never
-        reaches into `_minute_remaining` and friends directly."""
+        """Public accessor for `metrics.py` (#31), so it never reaches into
+        `_minute_remaining` and friends directly."""
         return RateLimitBudget(
             minute_remaining=self._minute_remaining,
             minute_limit=self._per_minute_limit,
@@ -186,10 +171,8 @@ class RateLimiter:
 
 
 async def _wait_seconds(clock: Callable[[], float], seconds: float) -> None:
-    """Wait `seconds` of the given clock's time, polling briefly rather than
-    a single long asyncio.sleep -- so a test using a fake clock (advanced
-    instantly) completes in a bounded, small amount of real time instead of
-    the full logical duration.
+    """Wait `seconds` of clock time, polling briefly rather than one long
+    sleep -- so fake-clock tests finish quickly in real time.
     """
     deadline = clock() + seconds
     while clock() < deadline:
@@ -262,9 +245,9 @@ def _iso(value: datetime | str) -> str:
 def _error_message(response: httpx.Response) -> str:
     """Build a human-readable error message from a failed response body.
 
-    Only WHOOP's own ``error``/``message`` JSON fields are echoed back --
-    never the request or response headers/body verbatim, since that is where
-    a bearer token would end up in a bug report.
+    Echoes only WHOOP's ``error``/``message`` fields -- never the raw
+    request/response, which is where a bearer token would leak into a bug
+    report.
     """
     try:
         payload = response.json()
@@ -278,11 +261,8 @@ def _error_message(response: httpx.Response) -> str:
 
 
 def _reset_seconds(headers: httpx.Headers) -> float | None:
-    """Extract ``retry_after`` from ``X-RateLimit-Reset``, if present and
-    parseable. Existing, established (if ambiguous) convention from #2:
-    kept exactly as-is, just factored out so the final-429 path, the
-    ``RateLimitedError`` it raises, and ``RateLimiter.reconcile`` can all
-    share it.
+    """Extract ``retry_after`` from ``X-RateLimit-Reset``, if present/parseable
+    (convention from #2), shared by the final-429 path and `RateLimiter.reconcile`.
     """
     retry_after: float | None = None
     reset_header = headers.get("X-RateLimit-Reset")
@@ -366,14 +346,11 @@ class WhoopClient:
         )
 
     async def _force_refresh(self) -> str:
-        """Refresh regardless of the cached token's apparent expiry.
+        """Force a real network refresh, ignoring the cached token's apparent expiry.
 
-        access_token() only refreshes when its own clock says expired; a 401
-        means WHOOP revoked the grant, which the clock can't know. Loading the
-        persisted token and calling Authenticator.refresh() on it directly
-        forces a real network refresh -- and refresh() already updates
-        Authenticator's own cache, so the next ordinary access_token() call
-        sees the result too.
+        access_token() only refreshes on clock-expiry; a 401 means WHOOP
+        revoked the grant, which the clock can't detect. Also updates
+        Authenticator's own cache, so the next access_token() call sees it.
         """
         store = build_store(self._config)
         token = store.load()
@@ -444,9 +421,8 @@ class WhoopClient:
     ) -> AsyncIterator[dict[str, Any]]:
         """Walk a collection, following ``nextToken`` until it runs out.
 
-        Default cap of 1000: at MAX_PAGE_SIZE (25) records/page that's 40
-        requests, comfortably inside the 100/minute budget for a single tool
-        call.
+        Default cap 1000 records = 40 requests at MAX_PAGE_SIZE, well inside
+        the 100/minute budget for one tool call.
         """
         fetched = 0
         current_params = dict(params)
