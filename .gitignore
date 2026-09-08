@@ -28,3 +28,7 @@ coverage.xml
 .idea/
 .vscode/
 .DS_Store
+
+# No lockfile by design: CI installs with `uv pip install -e .` against the
+# declared ranges so a dependency release that breaks the server is caught.
+uv.lock
