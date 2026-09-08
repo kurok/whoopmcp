@@ -22,7 +22,7 @@ from typing import Any, Literal, cast
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import principal_components
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.server.mcpserver.exceptions import ResourceNotFoundError
+from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -202,11 +202,30 @@ def _ensure_principal(app: AppContext) -> Principal:
     happens only in lifespan() and after whoop_complete_login.
     """
     if app.principal is None:
-        raise AuthError("no WHOOP identity resolved; run whoop_login to authenticate")
+        raise NotAuthenticatedError("no WHOOP identity resolved; run whoop_login to authenticate")
     return app.principal
 
 
-class UnresolvedPrincipalError(RuntimeError):
+class ToolInputError(ToolError, ValueError):
+    """An argument the caller can read and correct.
+
+    mcp 2.2.0 treats every exception other than ``ToolError`` as a crash and
+    hands the model only ``Error executing tool <name>``; the text of a plain
+    ``ValueError`` no longer reaches it. Argument validation raises this so the
+    message still does, while ``except ValueError`` callers keep working. Only
+    for messages that are safe to show: no token bytes, paths or upstream text.
+    """
+
+
+class NotAuthenticatedError(ToolError, AuthError):
+    """Nobody is logged in; the model should run whoop_login.
+
+    A ``ToolError`` so the instruction reaches the model, and an ``AuthError``
+    so the CLI's ``except AuthError`` sites keep working unchanged.
+    """
+
+
+class UnresolvedPrincipalError(ToolError, RuntimeError):
     """A known principal has no WHOOP member linked to it.
 
     Distinct from ``AuthError`` ("nobody is logged in"). Raised by
@@ -498,7 +517,12 @@ def _register_auth_tools(server: MCPServer[AppContext]) -> None:
                 verified against the pending login before the code is used.
         """
         app = ctx.request_context.lifespan_context
-        app.auth.verify_state(state)
+        try:
+            app.auth.verify_state(state)
+        except AuthError as exc:
+            # Anticipated ("no login in progress" / "state mismatch"), and neither
+            # message carries anything the caller supplied.
+            raise ToolError(str(exc)) from exc
         token = await app.auth.exchange_code(code)
         app.principal = await _resolve_principal(app.client)
         if app.principal is not None and app.store_conn is not None:
@@ -804,16 +828,16 @@ def _decode_store_cursor(next_token: str | None) -> tuple[int, str | None, str |
         TypeError,
         ValueError,
     ) as exc:
-        raise ValueError(_CURSOR_REJECTED) from exc
+        raise ToolInputError(_CURSOR_REJECTED) from exc
 
     # Types checked, not coerced: int(payload["offset"]) would accept
     # Infinity/"12"/2.9/true, and bool must be excluded (an int subclass).
     if isinstance(offset, bool) or not isinstance(offset, int):
-        raise ValueError(_CURSOR_REJECTED)
+        raise ToolInputError(_CURSOR_REJECTED)
     if not 0 <= offset <= _MAX_CURSOR_OFFSET:
-        raise ValueError(_CURSOR_REJECTED)
+        raise ToolInputError(_CURSOR_REJECTED)
     if not all(bound is None or isinstance(bound, str) for bound in (start, end)):
-        raise ValueError(_CURSOR_REJECTED)
+        raise ToolInputError(_CURSOR_REJECTED)
 
     return offset, start, end
 
@@ -837,9 +861,9 @@ def _require_positive_limit(limit: int) -> None:
     fit SQLite's bind range.
     """
     if limit <= 0:
-        raise ValueError(f"limit must be a positive integer, got {limit}")
+        raise ToolInputError(f"limit must be a positive integer, got {limit}")
     if limit > _MAX_LIST_LIMIT:
-        raise ValueError(f"limit must be at most {_MAX_LIST_LIMIT}, got {limit}")
+        raise ToolInputError(f"limit must be at most {_MAX_LIST_LIMIT}, got {limit}")
 
 
 def _default_range(
@@ -1089,7 +1113,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 "raw" key with the complete stored record.
         """
         if detail not in ("summary", "full"):
-            raise ValueError(f"detail must be 'summary' or 'full', got {detail!r}")
+            raise ToolInputError(f"detail must be 'summary' or 'full', got {detail!r}")
         app = ctx.request_context.lifespan_context
         whoop_user_id = _ensure_matches_live_grant(ctx)
         conn = _require_store(app)
@@ -1222,7 +1246,7 @@ def _register_data_tools(server: MCPServer[AppContext]) -> None:
                 "raw" key with the complete stored record.
         """
         if detail not in ("summary", "full"):
-            raise ValueError(f"detail must be 'summary' or 'full', got {detail!r}")
+            raise ToolInputError(f"detail must be 'summary' or 'full', got {detail!r}")
         app = ctx.request_context.lifespan_context
         whoop_user_id = _ensure_matches_live_grant(ctx)
         conn = _require_store(app)
@@ -1411,7 +1435,7 @@ def _resolve_collection(metric: str) -> str:
     try:
         return _METRIC_COLLECTION[metric]
     except KeyError:
-        raise ValueError(f"unknown metric: {metric!r}") from None
+        raise ToolInputError(f"unknown metric: {metric!r}") from None
 
 
 #: whoop_timeseries's unit per metric, echoed once in the response envelope.
@@ -1435,7 +1459,7 @@ def _resolve_metric_timeseries_source(metric: str) -> tuple[str, str, str]:
     duplicating them.
     """
     if metric not in _METRIC_COLLECTION:
-        raise ValueError(
+        raise ToolInputError(
             f"unknown metric: {metric!r}; valid metrics are: "
             f"{', '.join(sorted(_METRIC_COLLECTION))}"
         )
@@ -1765,10 +1789,10 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         Every response carries "coverage" and "range_coverage".
 
         Raises:
-            ValueError: if lag_days is negative.
+            ToolInputError: if lag_days is negative.
         """
         if lag_days < 0:
-            raise ValueError(f"lag_days must be >= 0, got {lag_days}")
+            raise ToolInputError(f"lag_days must be >= 0, got {lag_days}")
         lag_days = min(lag_days, _MAX_LAG_SWEEP_RADIUS)
 
         app = ctx.request_context.lifespan_context
@@ -1988,7 +2012,9 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         report when the point cap is hit.
         """
         if granularity not in ("day", "week", "month"):
-            raise ValueError(f"granularity must be 'day', 'week' or 'month', got {granularity!r}")
+            raise ToolInputError(
+                f"granularity must be 'day', 'week' or 'month', got {granularity!r}"
+            )
         app = ctx.request_context.lifespan_context
         whoop_user_id = _ensure_matches_live_grant(ctx)
         conn = _require_store(app)
@@ -2214,7 +2240,7 @@ def _register_analysis_tools(server: MCPServer[AppContext]) -> None:
         Every response carries "coverage" and "range_coverage".
         """
         if direction not in ("above", "below"):
-            raise ValueError(f"direction must be 'above' or 'below', got {direction!r}")
+            raise ToolInputError(f"direction must be 'above' or 'below', got {direction!r}")
         app = ctx.request_context.lifespan_context
         whoop_user_id = _ensure_matches_live_grant(ctx)
         conn = _require_store(app)
