@@ -566,12 +566,13 @@ async def test_whoop_complete_login_state_mismatch(
 ) -> None:
     """Test whoop_complete_login fails when state doesn't match.
 
-    MCPServer.call_tool() (Tool.run(), specifically) catches any exception
-    raised by a tool body and re-raises it wrapped as ToolError -- it does
-    NOT surface as a CallToolResult with is_error=True. That conversion
-    happens one layer up, in the protocol-level request handler, which this
-    test harness bypasses entirely. So the mismatch (Authenticator.verify_state
-    raising AuthError) must be asserted as a raised ToolError here.
+    MCPServer.call_tool() (Tool.run(), specifically) re-raises a tool body's
+    ToolError with its message intact -- it does NOT surface as a
+    CallToolResult with is_error=True. That conversion happens one layer up,
+    in the protocol-level request handler, which this test harness bypasses
+    entirely. Since mcp 2.2.0 any other exception is a crash whose text is
+    withheld, so whoop_complete_login translates verify_state's AuthError
+    into a ToolError, and the mismatch is asserted as that ToolError here.
     """
     # Step 1: Call whoop_login to set up a pending state
     await call_tool(server, "whoop_login", {}, app_context)
